@@ -1,155 +1,150 @@
 # Constant
 
-One conversation. Any agent runtime.
+**One conversation. Any agent runtime.**
 
-Constant is a local-first dev tool for carrying conversation continuity across agent CLIs like Codex, Claude Code, OpenCode, Aider, and future runtimes.
-
-The core idea is simple:
+Constant is a local-first terminal harness that hosts an agent CLI (Codex, Claude
+Code) and lets you **switch the active runtime mid-conversation** — the room moves,
+the work doesn't reset.
 
 ```text
 Codex changes.
 Claude changes.
-OpenCode changes.
 The conversation stays constant.
 ```
 
-Constant does not try to merge the private native memory of every agent. That is not the real primitive. Instead, Constant owns a neutral outer thread state, reads local session artifacts from each runtime, compiles a continuation packet, and gives that packet to the next runtime so it can continue coherently.
+You're talking to Codex. You hit `Ctrl-B c`. You're now in Claude Code, continuing
+the *same* conversation — it has the whole thread, no re-explaining. Hit `Ctrl-B x`
+and you're back in Codex. One conversation, two (or more) interchangeable minds.
+
+---
+
+## How it works
+
+Constant is the outer process; the agent CLI runs *inside* it in a PTY, fully
+native (colors, TUI, keys all pass through). A tmux-style prefix key drops you into
+Constant's control layer to switch runtimes.
 
 ```text
-~/.codex/sessions/**/*.jsonl        ~/.claude/projects/**/*.jsonl
-~/.codex/state_5.sqlite             ~/.claude/sessions/*.json
-              \                     /
-               \                   /
-             runtime readers / adapters
-                       |
-               neutral thread model
-                       |
-             continuation packet compiler
-                       |
-           claude -p / codex exec / opencode
+        ┌──────────────── constant host ─────────────────┐
+          you type ─▶ [interceptor] ─▶ PTY ─▶ codex (native)
+          screen   ◀──────────────────── PTY ◀── codex
+        └─────────────────────────────────────────────────┘
+                    Ctrl-B c  → switch to claude
+                    Ctrl-B x  → switch to codex
+
+   on switch:  read the session the runtime is in
+               │  distill → neutral IR → sanitize → target's native format
+               ▼
+               resume the target natively (claude -r / codex resume)
 ```
 
-## Why This Exists
+The switch doesn't paste a summary or a briefing — it **transcodes the actual
+session into the target's native format and resumes it**, so the next runtime
+reads the conversation as its own scrollback. The agents are stateless between
+launches; their "memory" is just a transcript file on disk, and Constant writes
+that file. (See [PRODUCT.md](./PRODUCT.md) for the vision and [AGENTS.md](./AGENTS.md)
+for the design spine.)
 
-Right now, switching from Codex to Claude Code means starting a new conversation and re-explaining the state by hand. The real work is trapped inside each agent's local mansion: transcript files, session IDs, summaries, tool history, cwd, branch, changed files, and the emotional/thread texture of the conversation.
+The distillation layer is named **alembic** — it distills a session down to the
+pure conversation: runtime scaffold stripped, secrets redacted, tool/reasoning
+noise dropped, then re-crystallized in the target's format.
 
-Constant turns that into a portable room state.
+## Quickstart
 
-The first goal is not a multi-agent dashboard. It is not a model router. It is not another wrapper that merely runs several CLIs.
+Requires Rust, plus `codex` and/or `claude` on your `PATH`.
 
-The first goal is:
+```bash
+cargo build --release
+./target/release/constant host codex      # host codex inside Constant
+```
+
+Inside a hosted session, the prefix is **`Ctrl-B`** (like tmux):
+
+| Keys            | Action                                            |
+| --------------- | ------------------------------------------------- |
+| `Ctrl-B` `c`    | switch to **claude**, carrying the conversation   |
+| `Ctrl-B` `x`    | switch to **codex**, carrying the conversation    |
+| `Ctrl-B` `:`    | command line (`switch claude`, `quit`)            |
+| `Ctrl-B` `d`    | detach (exit the harness cleanly)                 |
+| `Ctrl-B` `Ctrl-B` | send a literal `Ctrl-B` to the child            |
+
+Inside tmux (which also uses `Ctrl-B`), pick another prefix:
+
+```bash
+constant host codex --prefix C-t       # or: CONSTANT_PREFIX=C-t constant host codex
+```
+
+## Commands
+
+```bash
+constant host [codex|claude] [--prefix C-t]   # the harness (default: codex)
+constant distill --from codex --to claude     # transcode the latest convo (no launch)
+constant distill --session <file> --to codex  #   …or a specific session file
+constant keys                                  # raw key probe (debug input encodings)
+```
+
+`constant distill` is the codec on its own — handy for inspecting what a switch
+would carry, with no TTY and no model calls.
+
+## What carries (and what doesn't)
+
+- **Carries cleanly:** the conversation — every user and assistant turn — verbatim.
+- **Stripped on purpose:** runtime scaffold (system prompts, skill/plugin lists,
+  memory blocks) and secrets (API keys, tokens, emails are redacted).
+- **Dropped (lossy across runtimes):** tool calls, tool results, and reasoning.
+  The *narrative* of a coding session survives; the agentic tool history does not —
+  tool schemas aren't 1:1 between runtimes.
+
+Each conversation lives as a **stable pair** of ids — one per runtime — that a
+switch reuses and keeps in sync, so ping-ponging doesn't spawn a pile of new
+sessions. Both incarnations show up in each CLI's own `/resume`.
+
+## Honest limits
+
+- **Not read-only.** Constant writes synthetic sessions into `~/.claude` and
+  `~/.codex` (and codex's `state_5.sqlite`). It never displays raw secrets and
+  redacts them from carried text, but it does author sessions in the runtime homes.
+- **Private formats, version-fragile.** Session schemas are undocumented and move
+  between releases. Verified against `codex 0.137.x` / `claude 2.1.x`; a runtime
+  update can require a codec refresh.
+- **Mid-turn switches** carry up to the last *persisted* turn — if you switch while
+  a runtime is still generating, that in-flight turn isn't on disk yet.
+- **Conversation-only.** Tool/reasoning history is intentionally not carried (yet).
+
+## What Constant is not
+
+- Not a claim that the runtimes share hidden native memory — it reads visible local
+  session evidence and re-authors it for the next runtime.
+- Not a multi-agent dashboard, model router, or API proxy.
+- Not a terminal multiplexer — it hosts *one* runtime at a time and passes its
+  output through untouched (no compositing), which is why it stays small.
+
+## Architecture
 
 ```text
-Take an active conversation from one agent runtime and continue it in another without manually explaining everything again.
+src/
+  main.rs              CLI: host / distill / keys
+  runtime.rs           runtime defs + fresh/resume launch commands
+  host.rs              the PTY harness: raw-input FSM, prefix interception,
+                       switch orchestration, stable-pair thread map, terminal restore
+  alembic/
+    mod.rs             distill: find active session, sanitize (strip + redact),
+                       transcode, native resume, codex /resume visibility
+    ir.rs              neutral session model
+    formats/{claude,codex}.rs   per-runtime readers + writers
+    LICENSE.transession
+legacy-node/           the original Node packet-exporter prototype (reference)
 ```
 
-## Product Promise
+## Attribution
 
-```bash
-constant latest --from codex --to claude --dry-run
-constant packet --from claude --session latest > continuation.md
-constant run --from codex --to claude
-```
+The low-level session codecs in `src/alembic/formats/` and the neutral IR are
+vendored from [transession](https://github.com/inmzhang/transession) (MIT — see
+`src/alembic/LICENSE.transession`). Alembic adds the sanitize/redact pass, the
+native-resume schema matching, and the stable-pair switching the harness needs.
 
-The output is a continuation packet:
+## Status
 
-```md
-# Constant Continuation Packet
-
-You are continuing a conversation that began in Codex.
-
-## Current Goal
-...
-
-## What Happened So Far
-...
-
-## Recent Raw Turns
-...
-
-## Decisions
-...
-
-## Workspace State
-cwd:
-branch:
-changed files:
-
-## Runtime Notes
-The prior runtime was Codex. You are now Claude Code.
-Continue from this packet faithfully.
-```
-
-## What Constant Is
-
-- A cross-runtime conversation continuity layer.
-- A packet compiler for agent handoff.
-- A local reader for `.claude`, `.codex`, and later other runtime state folders.
-- A neutral thread model above provider-specific session formats.
-- A safe bridge that starts read-only and makes every injected packet auditable.
-
-## What Constant Is Not
-
-- Not a claim that Claude and Codex literally share hidden session memory.
-- Not a replacement for Claude Code, Codex, OpenCode, or Aider.
-- Not an API proxy.
-- Not a multi-model voting dashboard.
-- Not a usage tracker, though it reuses some of the same local substrate Burnrate studied.
-
-## First Milestone
-
-Build the smallest proof:
-
-```bash
-constant packet --from codex --latest
-```
-
-It should:
-
-1. Find the latest Codex session.
-2. Read `~/.codex/state_5.sqlite` for metadata.
-3. Read the matching rollout JSONL for user/assistant/tool events.
-4. Normalize the useful thread state.
-5. Write `.constant/packets/<timestamp>-codex-to-claude.md`.
-
-Then manually run:
-
-```bash
-claude -p "$(cat .constant/packets/<timestamp>-codex-to-claude.md)"
-```
-
-If Claude can accurately say where the prior Codex conversation left off, the primitive works.
-
-## Current Prototype
-
-The first local proof is now a dependency-free Node CLI.
-
-```bash
-npm exec -- constant doctor
-npm exec -- constant list --runtime codex
-npm exec -- constant packet --from codex --latest --to claude
-```
-
-Direct Node invocation works too:
-
-```bash
-node ./bin/constant.js doctor
-node ./bin/constant.js list --runtime codex
-node ./bin/constant.js packet --from codex --latest --to claude
-```
-
-The packet command writes:
-
-```text
-.constant/packets/<timestamp>-codex-to-claude.md
-```
-
-The implementation stays read-only against runtime homes. It reads Codex rollout JSONL, joins `state_5.sqlite` metadata through the local `sqlite3` binary when available, normalizes user/assistant/tool events, and writes Constant-owned artifacts under `.constant/`.
-
-Manual continuation is still the V0 path:
-
-```bash
-claude -p "$(cat .constant/packets/<timestamp>-codex-to-claude.md)"
-```
-
-Start with [PRODUCT.md](./PRODUCT.md) before expanding the implementation.
+Early. The codex ↔ claude live switch works end to end — verified carrying real
+conversations both directions, resumable from each CLI's own `/resume`. More
+runtimes (OpenCode, Aider, Gemini) and carrying tool history are next.
