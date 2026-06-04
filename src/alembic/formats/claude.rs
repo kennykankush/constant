@@ -380,15 +380,14 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .filter_map(SessionEvent::timestamp)
             .min()
     });
-    let version = if session.metadata.source_format == Some(SessionFormat::Claude) {
-        session
-            .metadata
-            .platform_version
-            .clone()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
-    } else {
-        env!("CARGO_PKG_VERSION").to_string()
-    };
+    // Use the real Claude version when known (alembic sets platform_version to
+    // the installed `claude --version`). A foreign/old `version` makes
+    // `claude -r` reject the session as incompatible.
+    let version = session
+        .metadata
+        .platform_version
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     let mut file = File::create(&materialization.session_file).with_context(|| {
         format!(
@@ -396,6 +395,16 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             materialization.session_file.display()
         )
     })?;
+
+    // Leading meta record that real Claude sessions begin with.
+    write_json_line(
+        &mut file,
+        &json!({
+            "type": "permission-mode",
+            "permissionMode": "default",
+            "sessionId": session_id,
+        }),
+    )?;
 
     let mut previous_uuid: Option<String> = None;
     let mut tool_call_to_uuid = BTreeMap::new();
@@ -420,6 +429,8 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "sessionId": session_id,
                         "version": version,
                         "gitBranch": git_branch,
+                        "entrypoint": "cli",
+                        "requestId": format!("req_{}", Uuid::new_v4().simple()),
                         "message": assistant_message,
                         "type": "assistant",
                         "uuid": event_uuid,
@@ -434,14 +445,14 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "sessionId": session_id,
                         "version": version,
                         "gitBranch": git_branch,
+                        "entrypoint": "cli",
                         "type": "user",
                         "message": {
                             "role": "user",
-                            "content": content,
+                            "content": user_text_content(&projected_blocks),
                         },
                         "uuid": event_uuid,
                         "timestamp": event_timestamp(message.timestamp),
-                        "permissionMode": "default",
                     })
                 };
 
@@ -642,6 +653,22 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
     Value::Array(encoded)
 }
 
+/// Real Claude user turns store the prompt as a plain string, not a blocks
+/// array. After alembic's sanitize, user messages are text-only, so emit a
+/// string to match the native shape `claude -r` expects.
+fn user_text_content(blocks: &[ContentBlock]) -> Value {
+    if !blocks.is_empty() && blocks.iter().all(|b| b.text.is_some()) {
+        let text = blocks
+            .iter()
+            .filter_map(|b| b.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Value::String(text)
+    } else {
+        encode_message_blocks(blocks)
+    }
+}
+
 fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
     let mut message = Map::new();
     message.insert(
@@ -650,9 +677,24 @@ fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
     );
     message.insert("type".to_string(), Value::String("message".to_string()));
     message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert(
+        "model".to_string(),
+        Value::String("claude-opus-4-8".to_string()),
+    );
     message.insert("content".to_string(), content);
     message.insert("stop_reason".to_string(), stop_reason);
     message.insert("stop_sequence".to_string(), Value::Null);
+    message.insert("stop_details".to_string(), Value::Null);
+    message.insert(
+        "usage".to_string(),
+        json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "service_tier": null,
+        }),
+    );
     Value::Object(message)
 }
 

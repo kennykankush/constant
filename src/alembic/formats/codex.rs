@@ -375,7 +375,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     session_meta_payload.insert(
         "originator".to_string(),
         extra_string(&session.metadata, "codex_originator")
-            .unwrap_or_else(|| "transession".to_string())
+            .unwrap_or_else(|| "codex-tui".to_string())
             .into(),
     );
     session_meta_payload.insert(
@@ -389,7 +389,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .extra
             .get("codex_source")
             .cloned()
-            .unwrap_or_else(|| Value::String("import".to_string())),
+            .unwrap_or_else(|| Value::String("cli".to_string())),
     );
     session_meta_payload.insert(
         "model_provider".to_string(),
@@ -763,14 +763,12 @@ fn codex_session_id(candidate: &str) -> String {
 }
 
 fn codex_cli_version(metadata: &SessionMetadata) -> String {
-    if metadata.source_format == Some(SessionFormat::Codex) {
-        metadata
-            .platform_version
-            .clone()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
-    } else {
-        env!("CARGO_PKG_VERSION").to_string()
-    }
+    // Prefer the real installed codex version (alembic sets platform_version),
+    // so session_meta looks native and codex's /resume backfill keeps it.
+    metadata
+        .platform_version
+        .clone()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 fn local_timezone_name_or_offset() -> String {
@@ -785,7 +783,8 @@ fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> S
 }
 
 fn exported_codex_model_provider() -> String {
-    "imported".to_string()
+    // Native value so codex's sqlite backfill keeps the session in /resume.
+    "openai".to_string()
 }
 
 fn exported_codex_collaboration_mode() -> Value {

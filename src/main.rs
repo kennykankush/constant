@@ -83,10 +83,14 @@ fn run_distill(rest: &[String]) -> Result<()> {
 
     let to = Runtime::parse(&to.context("distill requires --to codex|claude")?)?;
     let (id, cwd) = match session {
-        Some(path) => alembic::distill_path(&path, to)?,
+        Some(path) => {
+            let (id, _written, cwd) = alembic::distill_path(&path, to, None)?;
+            (id, cwd)
+        }
         None => {
             let from = Runtime::parse(&from.context("distill requires --from or --session")?)?;
-            alembic::distill(from, to)?
+            let here = std::env::current_dir().ok();
+            alembic::distill(from, to, here.as_deref())?
         }
     };
 

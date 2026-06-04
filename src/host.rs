@@ -19,8 +19,9 @@
 use anyhow::{bail, Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
@@ -411,7 +412,12 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
         let _ = f.flush();
     }
 
+    let host_cwd = std::env::current_dir().ok();
     let mut tokenizer = Tokenizer::new(prefix);
+    // Per-thread map: runtime -> (session id, file). A switch syncs back into
+    // this conversation's existing counterpart instead of minting a new session
+    // every time, so the pair of ids stays stable as you ping-pong.
+    let mut thread: HashMap<Runtime, (String, PathBuf)> = HashMap::new();
     let mut session = spawn_session(initial, None, None, cols, rows, tx.clone())?;
     banner(&mut out, session.runtime, &prefix_label)?;
 
@@ -452,36 +458,63 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                     // The cartridge: distill the outgoing conversation into the
                     // target's native format and resume it. Fall back to a fresh
                     // session if there's nothing to carry or distillation fails.
-                    match crate::alembic::distill(from, target) {
-                        Ok((id, session_cwd)) => {
-                            if let Some(f) = dbg.as_mut() {
-                                let _ = writeln!(
-                                    f,
-                                    "[alembic] {} -> {} resumed as {id}",
-                                    from.label(),
-                                    target.label()
-                                );
-                                let _ = f.flush();
+                    // Source: trust this thread's tracked incarnation for `from`
+                    // (robust ping-pong); else detect what the user is in (first
+                    // switch / after a /resume inside the child).
+                    let src = match thread.get(&from) {
+                        Some((id, path)) if path.exists() => Some((path.clone(), id.clone())),
+                        _ => crate::alembic::active_session(from, host_cwd.as_deref()),
+                    };
+
+                    match src {
+                        Some((src_path, src_id)) => {
+                            thread.insert(from, (src_id, src_path.clone()));
+                            // Reuse this thread's existing id+file in the target,
+                            // overwriting that one session in place instead of
+                            // forking a new file every switch.
+                            let reuse_owned = thread.get(&target).cloned();
+                            let reuse = reuse_owned
+                                .as_ref()
+                                .map(|(id, p)| (id.as_str(), p.as_path()));
+                            match crate::alembic::distill_path(&src_path, target, reuse) {
+                                Ok((id, written, session_cwd)) => {
+                                    if let Some(f) = dbg.as_mut() {
+                                        let _ = writeln!(
+                                            f,
+                                            "[alembic] {} -> {} as {id} (reused={})",
+                                            from.label(),
+                                            target.label(),
+                                            reuse_owned.is_some()
+                                        );
+                                        let _ = f.flush();
+                                    }
+                                    thread.insert(target, (id.clone(), written));
+                                    session = spawn_session(
+                                        target,
+                                        Some(&id),
+                                        session_cwd.as_deref(),
+                                        c,
+                                        r,
+                                        tx.clone(),
+                                    )?;
+                                }
+                                Err(e) => {
+                                    if let Some(f) = dbg.as_mut() {
+                                        let _ = writeln!(f, "[alembic] failed: {e:#}");
+                                        let _ = f.flush();
+                                    }
+                                    out.write_all(
+                                        format!("\x1b[2m  (couldn't carry — {e}; starting fresh)\x1b[0m\r\n")
+                                            .as_bytes(),
+                                    )?;
+                                    out.flush()?;
+                                    session = spawn_session(target, None, None, c, r, tx.clone())?;
+                                }
                             }
-                            session = spawn_session(
-                                target,
-                                Some(&id),
-                                session_cwd.as_deref(),
-                                c,
-                                r,
-                                tx.clone(),
-                            )?;
                         }
-                        Err(e) => {
-                            if let Some(f) = dbg.as_mut() {
-                                let _ = writeln!(f, "[alembic] failed: {e:#}");
-                                let _ = f.flush();
-                            }
+                        None => {
                             out.write_all(
-                                format!(
-                                    "\x1b[2m  (couldn't carry the conversation — {e}; starting fresh)\x1b[0m\r\n"
-                                )
-                                .as_bytes(),
+                                b"\x1b[2m  (no conversation here to carry; starting fresh)\x1b[0m\r\n",
                             )?;
                             out.flush()?;
                             session = spawn_session(target, None, None, c, r, tx.clone())?;

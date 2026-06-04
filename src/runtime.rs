@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use portable_pty::CommandBuilder;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Runtime {
     Codex,
     Claude,
