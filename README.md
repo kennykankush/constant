@@ -1,6 +1,24 @@
-# Constant
+<h1 align="center">Constant</h1>
 
-**One conversation. Any agent runtime.**
+<p align="center">
+  <strong>One conversation. Any agent runtime.</strong>
+</p>
+
+<p align="center">
+  <img alt="status: alpha" src="https://img.shields.io/badge/status-alpha-f59e0b?style=flat-square">
+  <img alt="built with Rust" src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square&logo=rust&logoColor=white">
+  <img alt="runtimes: Codex and Claude Code" src="https://img.shields.io/badge/runtimes-Codex%20%2B%20Claude-111827?style=flat-square">
+  <img alt="local first" src="https://img.shields.io/badge/local--first-no%20API%20proxy-10b981?style=flat-square">
+  <img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-2563eb?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#trust-boundary">Trust Boundary</a> ·
+  <a href="#how-it-works">How It Works</a> ·
+  <a href="#development">Development</a>
+</p>
 
 Constant is a local-first host for agent CLIs. Start a thread in Codex, switch to
 Claude Code mid-conversation, then switch back without re-explaining the work.
