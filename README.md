@@ -15,13 +15,15 @@
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#quickstart">Quickstart</a> ·
+  <a href="#headless-cli">Headless CLI</a> ·
   <a href="#trust-boundary">Trust Boundary</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="#development">Development</a>
 </p>
 
-Constant is a local-first host for agent CLIs. Start a thread in Codex, switch to
-Claude Code mid-conversation, then switch back without re-explaining the work.
+Constant is a local-first continuity tool for agent CLIs. Start a thread in
+Codex, carry it to Claude Code, then carry it back without re-explaining the
+work.
 
 ```text
 Codex changes.
@@ -34,10 +36,16 @@ files, so read the trust boundary below before using it on important sessions.
 
 ## What It Is
 
-Constant runs one agent CLI at a time inside a native PTY. The child keeps its
-normal terminal UI, colors, keybindings, and resume behavior. Constant only sits
-outside it, watches for a tmux-style prefix key, and swaps the active runtime when
-you ask.
+Constant has two surfaces:
+
+- `constant host`: run one agent CLI at a time inside a native PTY and switch the
+  live runtime with a tmux-style prefix key.
+- `constant carry`: headless carry into a target runtime's native session and
+  print the resume command.
+
+In host mode, the child keeps its normal terminal UI, colors, keybindings, and
+resume behavior. Constant sits outside it, watches for a prefix key, and swaps
+the active runtime when you ask.
 
 ```text
 constant host codex
@@ -51,6 +59,14 @@ The switch is not a pasted summary. Constant reads the source runtime's local
 session, distills it to the conversation, writes a target-native session, and
 starts the target runtime with its own resume command.
 
+The same carry path is available without opening a hosted terminal:
+
+```bash
+constant carry --from codex --to claude
+# carried -> claude session <id>
+# resume with: claude -r <id>
+```
+
 ## Install
 
 Requires Rust, plus `codex` and/or `claude` on your `PATH`.
@@ -60,6 +76,7 @@ From this repository:
 ```bash
 cargo install --path . --locked
 constant --version
+constant doctor
 ```
 
 From GitHub:
@@ -67,6 +84,7 @@ From GitHub:
 ```bash
 cargo install --git https://github.com/kennykankush/constant --locked
 constant --version
+constant doctor
 ```
 
 Or build a local release binary:
@@ -79,6 +97,12 @@ cargo build --release
 Homebrew and prebuilt release binaries are planned, but not published yet.
 
 ## Quickstart
+
+Check your local runtime setup:
+
+```bash
+constant doctor
+```
 
 Host Codex:
 
@@ -110,6 +134,50 @@ constant trail
 constant trail --all
 ```
 
+## Headless CLI
+
+Use the headless commands when you want continuity without hosting an interactive
+terminal.
+
+List carryable sessions:
+
+```bash
+constant sessions
+constant sessions --from codex --titles
+constant sessions --all --json
+```
+
+By default, `sessions` scopes to the current directory. `--all` scans all known
+runtime stores. `--titles` reads transcripts to derive a preview title, so it is
+slower on large stores. In text output, `·` marks a session known to be empty
+when titles were requested.
+
+Preview a carry without writing anything:
+
+```bash
+constant carry --from codex --to claude --dry-run
+constant carry --session <path-or-session-id> --to codex --dry-run --json
+```
+
+Carry into the target runtime's native session and print the resume command:
+
+```bash
+constant carry --from codex --to claude
+constant carry --session <path-or-session-id> --to codex
+```
+
+`distill` is kept as an alias for `carry`, but `carry` is the public verb.
+
+Export the distilled, redacted neutral IR:
+
+```bash
+constant export --from codex --out thread.constant.json
+constant export --session <path-or-session-id>
+```
+
+`export` writes to `--out` when provided, otherwise it prints JSON to stdout. It
+refuses to overwrite the source session.
+
 ## Trust Boundary
 
 Constant does not claim shared native memory between agent CLIs. It reads visible
@@ -132,6 +200,19 @@ projections in sync as you switch back and forth.
 Constant redacts common secrets from carried text and strips runtime scaffold, but
 it still moves conversation content across a trust boundary. Do not use it on a
 session if you are not comfortable with the target runtime reading that thread.
+
+F1 invariant: original runtime sessions are seeds, not targets. `host` and
+`carry` write or update Constant-owned projection sessions, then resume those
+projections. They do not overwrite the original source session.
+
+Command write behavior:
+
+- `constant doctor`: reads CLI/version/store presence only
+- `constant sessions`: reads session metadata; `--titles` also reads transcripts
+- `constant carry --dry-run`: reads and distills, writes nothing
+- `constant carry`: writes a target-native projection and updates the trail
+- `constant host`: writes only when you switch runtimes
+- `constant export`: writes only the requested `--out` file, or stdout
 
 ## What Carries
 
@@ -186,6 +267,10 @@ Public commands:
 
 ```bash
 constant host [codex|claude] [--prefix C-t]
+constant carry --to codex|claude [--from codex|claude | --session <path-or-id>] [--json] [--dry-run]
+constant sessions [--from codex|claude] [--all] [--titles] [--json]
+constant export (--from codex|claude | --session <path-or-id>) [--out FILE]
+constant doctor [--json]
 constant trail [--all]
 constant --version
 ```
@@ -194,12 +279,12 @@ Debug and inspection commands:
 
 ```bash
 constant distill --from codex --to claude
-constant distill --session <file> --to codex
 constant keys
 ```
 
-`constant distill` runs the codec without opening a hosted terminal. It still
-writes a target-native session, so treat it as a write operation.
+`constant distill` is the older name for `constant carry`; the internal cartridge
+still calls this step distillation. `constant keys` prints raw key bytes for
+debugging prefix behavior.
 
 ## Supported Runtimes
 
