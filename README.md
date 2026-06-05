@@ -133,7 +133,6 @@ src/
     ir.rs              neutral session model
     formats/{claude,codex}.rs   per-runtime readers + writers
     LICENSE.transession
-legacy-node/           the original Node packet-exporter prototype (reference)
 ```
 
 ## Attribution
