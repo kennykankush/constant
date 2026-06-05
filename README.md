@@ -257,15 +257,6 @@ vendored from [transession](https://github.com/inmzhang/transession) (MIT; see
 native-resume hardening, stable runtime projections, trail naming, and the live
 host.
 
-## Documentation
-
-- [Product vision](./PRODUCT.md)
-- [Architecture](./docs/architecture.md)
-- [How it works](./docs/how-it-works.md)
-- [The alembic cartridge](./docs/the-cartridge.md)
-- [Decisions and tradeoffs](./docs/decisions-and-tradeoffs.md)
-- [Changelog](./CHANGELOG.md)
-
 ## License
 
-MIT. See [LICENSE](./LICENSE).
+MIT.
