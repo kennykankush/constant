@@ -32,6 +32,10 @@ const M_NORMAL: u8 = 0;
 const M_PREFIX: u8 = 1;
 const M_COMMAND: u8 = 2;
 
+// Largest escape sequence we'll buffer before giving up and flushing it as-is,
+// so a malformed/never-terminating stream can't grow the buffer forever (M8).
+const MAX_ESC: usize = 256;
+
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
 /// terminal sends in legacy mode (Ctrl-<L> == <L> & 0x1f), plus a human label.
 pub fn parse_prefix(spec: &str) -> Result<(u8, String)> {
@@ -105,6 +109,10 @@ impl Tokenizer {
                 self.esc.push(b);
                 if let Some(seq) = self.take_if_complete() {
                     self.classify(seq, out);
+                } else if self.esc.len() > MAX_ESC {
+                    // Runaway/malformed escape: flush as-is and reset instead of
+                    // buffering without bound (M8).
+                    out.push(Token::Seq(std::mem::take(&mut self.esc)));
                 }
                 continue;
             }
@@ -152,6 +160,27 @@ impl Tokenizer {
             }
         }
         out.push(Token::Seq(seq)); // everything else passes through verbatim
+    }
+}
+
+/// The command key a prefix-mode token represents, decoded from EITHER a legacy
+/// control/byte input OR a Kitty CSI-u press — so `c`/`x`/`d`/`:` work whatever
+/// keyboard protocol the child negotiated (M7).
+fn command_key(tok: &Token) -> Option<u8> {
+    match tok {
+        Token::Byte(b) => Some(*b),
+        Token::Seq(s) => {
+            let (cp, mods, event) = parse_kitty_u(s)?;
+            // Ignore key releases (event 3) and any MODIFIED key (mods != 1): a
+            // plain c/x/d/: only. Without this, Ctrl-C/Alt-C (cp=99, mods!=1)
+            // would decode to bare `c` and trigger a switch — which the legacy
+            // byte path never does (Ctrl-C is 0x03, not 'c').
+            if event == 3 || mods != 1 {
+                return None;
+            }
+            u8::try_from(cp).ok()
+        }
+        Token::Prefix => None,
     }
 }
 
@@ -229,12 +258,31 @@ fn spawn_session(
     })
 }
 
+/// Stop a child gracefully: SIGTERM first so it can flush state and restore its
+/// own terminal modes, then SIGKILL as a fallback if it ignores us (S2). Either
+/// way the child exits, closing the pty and driving the switch/quit flow.
+fn terminate(child: &mut Box<dyn Child + Send + Sync>) {
+    #[cfg(unix)]
+    if let Some(pid) = child.process_id() {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        for _ in 0..15 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    let _ = child.kill();
+}
+
 fn request_switch(target: Runtime, session: &mut Session, switching_to: &mut Option<Runtime>) {
     if session.runtime == target || switching_to.is_some() {
         return;
     }
     *switching_to = Some(target);
-    let _ = session.child.kill();
+    terminate(&mut session.child);
 }
 
 #[derive(PartialEq)]
@@ -257,28 +305,27 @@ fn execute_command(line: &str, session: &mut Session, switching_to: &mut Option<
     }
 }
 
-fn bottom_overlay(out: &mut impl Write, text: &str) -> Result<()> {
+// Terminal chrome is best-effort (M3): a cosmetic write failure must never tear
+// down a live session, matching how writes to the child are already swallowed.
+fn bottom_overlay(out: &mut impl Write, text: &str) {
     let (_, rows) = size().unwrap_or((80, 24));
-    write!(out, "\x1b7\x1b[{rows};1H\x1b[7m{text}\x1b[0m\x1b[K\x1b8")?;
-    out.flush()?;
-    Ok(())
+    let _ = write!(out, "\x1b7\x1b[{rows};1H\x1b[7m{text}\x1b[0m\x1b[K\x1b8");
+    let _ = out.flush();
 }
 
-fn clear_bottom(out: &mut impl Write) -> Result<()> {
+fn clear_bottom(out: &mut impl Write) {
     let (_, rows) = size().unwrap_or((80, 24));
-    write!(out, "\x1b7\x1b[{rows};1H\x1b[2K\x1b8")?;
-    out.flush()?;
-    Ok(())
+    let _ = write!(out, "\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
+    let _ = out.flush();
 }
 
-fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) -> Result<()> {
-    write!(
+fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
+    let _ = write!(
         out,
         "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  :=command  d=detach\x1b[0m\r\n",
         runtime.label(),
-    )?;
-    out.flush()?;
-    Ok(())
+    );
+    let _ = out.flush();
 }
 
 /// Escape sequences that undo every terminal mode a hosted child might have
@@ -306,6 +353,7 @@ impl Drop for TerminalGuard {
 }
 
 /// Describe a raw input byte for the key probe.
+#[allow(clippy::match_overlapping_arm)] // specific bytes handled before the ranges, on purpose
 fn describe_byte(b: u8) -> String {
     match b {
         0x1b => "ESC".to_string(),
@@ -414,12 +462,21 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
 
     let host_cwd = std::env::current_dir().ok();
     let mut tokenizer = Tokenizer::new(prefix);
-    // Per-thread map: runtime -> (session id, file). A switch syncs back into
-    // this conversation's existing counterpart instead of minting a new session
-    // every time, so the pair of ids stays stable as you ping-pong.
-    let mut thread: HashMap<Runtime, (String, PathBuf)> = HashMap::new();
+    // Constant-owned projections: runtime -> (session id, file). We ONLY ever
+    // write/resume these; the user's original sessions are read but NEVER
+    // overwritten (F1). The pair stays stable as you ping-pong (no
+    // proliferation). The read source for `from` is its projection if we have
+    // one, else whatever session the user is currently in (the original seed on
+    // the first switch, or after a `/resume` inside the child).
+    let mut owned: HashMap<Runtime, (String, PathBuf)> = HashMap::new();
+    // Trail: a switch counter, the conversation's stable key (its root source
+    // session id, for grouping), and a readable handle (its first user message,
+    // for naming `constant·tNN·from-<src>·<root-slug>`).
+    let mut trail_n: u32 = 0;
+    let mut root_id: Option<String> = None;
+    let mut root_slug: Option<String> = None;
     let mut session = spawn_session(initial, None, None, cols, rows, tx.clone())?;
-    banner(&mut out, session.runtime, &prefix_label)?;
+    banner(&mut out, session.runtime, &prefix_label);
 
     let mut mode = M_NORMAL;
     let mut cmd_buf = String::new();
@@ -433,8 +490,8 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                 if mode == M_COMMAND {
                     pending_out.extend_from_slice(&bytes);
                 } else {
-                    out.write_all(&bytes)?;
-                    out.flush()?;
+                    let _ = out.write_all(&bytes);
+                    let _ = out.flush();
                 }
             }
 
@@ -444,39 +501,87 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                     let _ = session.child.wait();
                     let (c, r) = size().unwrap_or((cols, rows));
                     write_reset(&mut out); // undo outgoing child's terminal modes
-                    out.write_all(b"\x1b[2J\x1b[H")?;
-                    out.write_all(
-                        format!(
-                            "\x1b[2m  constant · carrying {} \u{2192} {} \u{2026}\x1b[0m\r\n",
-                            from.label(),
-                            target.label()
-                        )
-                        .as_bytes(),
-                    )?;
-                    out.flush()?;
+                    let _ = out.write_all(b"\x1b[2J\x1b[H");
 
-                    // The cartridge: distill the outgoing conversation into the
-                    // target's native format and resume it. Fall back to a fresh
-                    // session if there's nothing to carry or distillation fails.
-                    // Source: trust this thread's tracked incarnation for `from`
-                    // (robust ping-pong); else detect what the user is in (first
-                    // switch / after a /resume inside the child).
-                    let src = match thread.get(&from) {
-                        Some((id, path)) if path.exists() => Some((path.clone(), id.clone())),
-                        _ => crate::alembic::active_session(from, host_cwd.as_deref()),
+                    // Read source for `from`. Prefer our tracked projection — it's
+                    // the established ping-pong pair, positively tied to the child
+                    // we spawned — so an unrelated newer session in the same cwd is
+                    // NOT adopted (another codex/claude process must not hijack the
+                    // carry). Use the live active session when it's the child's OWN
+                    // session (same id — e.g. codex wrote a fresh rollout file for
+                    // the resumed id) so we still capture the latest turns, or as
+                    // the seed on the very first switch.
+                    // NB: a `/resume` to a *different* conversation inside the child
+                    // is deliberately not auto-followed — it's indistinguishable
+                    // from an unrelated same-cwd session (documented limitation).
+                    let active = crate::alembic::active_session(from, host_cwd.as_deref());
+                    let tracked = owned
+                        .get(&from)
+                        .and_then(|(id, p)| p.exists().then(|| (p.clone(), id.clone())));
+                    let src = match (tracked, active) {
+                        (Some((tpath, tid)), Some((apath, aid))) => {
+                            if aid == tid {
+                                Some((apath, aid)) // child's own session, freshest file
+                            } else {
+                                Some((tpath, tid)) // ignore unrelated newer session
+                            }
+                        }
+                        (Some(t), None) => Some(t),
+                        (None, Some(a)) => Some(a), // first switch / seed
+                        (None, None) => None,
                     };
 
                     match src {
                         Some((src_path, src_id)) => {
-                            thread.insert(from, (src_id, src_path.clone()));
-                            // Reuse this thread's existing id+file in the target,
-                            // overwriting that one session in place instead of
-                            // forking a new file every switch.
-                            let reuse_owned = thread.get(&target).cloned();
+                            // Which conversation does the LIVE source belong to?
+                            // Re-resolved every switch (via the ledger), not just
+                            // the first — so if the user `/resume`d a *different*
+                            // conversation inside the child, we detect the change
+                            // instead of overwriting the old pair's projection with
+                            // an unrelated thread and mis-recording the trail (M6).
+                            let (cid, last_n, projs) =
+                                crate::trail::resume(&src_path, &src_id);
+                            if root_id.as_deref() != Some(cid.as_str()) {
+                                // New conversation (first switch, or a /resume-away):
+                                // adopt it, reseed the projection map from the
+                                // ledger, and DROP the previous conversation's
+                                // projections so they're never reused as a target.
+                                root_id = Some(cid.clone());
+                                trail_n = last_n;
+                                owned.clear();
+                                for (rt, id, path) in projs {
+                                    owned.insert(rt, (id, path));
+                                }
+                                let name = crate::alembic::root_name(&src_path, from)
+                                    .unwrap_or_else(|| "conversation".to_string());
+                                root_slug = Some(crate::trail::slug(&name));
+                            }
+                            let conv_id = cid;
+                            let slug = root_slug.clone().unwrap_or_default();
+                            // Candidate trail number; committed only on a successful
+                            // carry, so a failed carry consumes no t-number.
+                            let n = trail_n + 1;
+                            let title = crate::trail::title(n, from, &slug);
+
+                            let _ = out.write_all(
+                                format!(
+                                    "\x1b[2m  trail · {} · {} \u{2192} {}\x1b[0m\r\n",
+                                    title,
+                                    from.label(),
+                                    target.label()
+                                )
+                                .as_bytes(),
+                            );
+                            let _ = out.flush();
+
+                            // Never write to the user's originals: reuse only our
+                            // own projection for `target`, else mint a fresh one.
+                            let reuse_owned = owned.get(&target).cloned();
                             let reuse = reuse_owned
                                 .as_ref()
                                 .map(|(id, p)| (id.as_str(), p.as_path()));
-                            match crate::alembic::distill_path(&src_path, target, reuse) {
+                            match crate::alembic::distill_path(&src_path, target, reuse, Some(&title))
+                            {
                                 Ok((id, written, session_cwd)) => {
                                     if let Some(f) = dbg.as_mut() {
                                         let _ = writeln!(
@@ -488,7 +593,19 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                         );
                                         let _ = f.flush();
                                     }
-                                    thread.insert(target, (id.clone(), written));
+                                    trail_n = n; // commit only on success
+                                    owned.insert(target, (id.clone(), written.clone()));
+                                    crate::trail::record(
+                                        n,
+                                        &conv_id,
+                                        &slug,
+                                        host_cwd.as_deref(),
+                                        from,
+                                        target,
+                                        &id,
+                                        &written,
+                                        &title,
+                                    );
                                     session = spawn_session(
                                         target,
                                         Some(&id),
@@ -503,24 +620,31 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                         let _ = writeln!(f, "[alembic] failed: {e:#}");
                                         let _ = f.flush();
                                     }
-                                    out.write_all(
+                                    // Fresh fallback: abandon recovered state so the
+                                    // new session starts a clean conversation and
+                                    // never reuses a prior projection. trail_n is
+                                    // left un-advanced.
+                                    owned.clear();
+                                    root_id = None;
+                                    root_slug = None;
+                                    let _ = out.write_all(
                                         format!("\x1b[2m  (couldn't carry — {e}; starting fresh)\x1b[0m\r\n")
                                             .as_bytes(),
-                                    )?;
-                                    out.flush()?;
+                                    );
+                                    let _ = out.flush();
                                     session = spawn_session(target, None, None, c, r, tx.clone())?;
                                 }
                             }
                         }
                         None => {
-                            out.write_all(
+                            let _ = out.write_all(
                                 b"\x1b[2m  (no conversation here to carry; starting fresh)\x1b[0m\r\n",
-                            )?;
-                            out.flush()?;
+                            );
+                            let _ = out.flush();
                             session = spawn_session(target, None, None, c, r, tx.clone())?;
                         }
                     }
-                    banner(&mut out, session.runtime, &prefix_label)?;
+                    banner(&mut out, session.runtime, &prefix_label);
                 } else {
                     break;
                 }
@@ -559,30 +683,37 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                     passthrough.clear();
                                 }
                                 mode = M_PREFIX;
-                                bottom_overlay(&mut out, &prefix_hint)?;
+                                bottom_overlay(&mut out, &prefix_hint);
                             }
                             Token::Byte(b) => passthrough.push(b),
                             Token::Seq(s) => passthrough.extend_from_slice(&s),
                         },
 
                         M_PREFIX => {
-                            clear_bottom(&mut out)?;
+                            clear_bottom(&mut out);
                             mode = M_NORMAL;
-                            match tok {
-                                Token::Byte(b'c') => {
-                                    request_switch(Runtime::Claude, &mut session, &mut switching_to)
+                            if matches!(tok, Token::Prefix) {
+                                passthrough.push(prefix); // literal prefix to child
+                            } else {
+                                match command_key(&tok) {
+                                    Some(b'c') => request_switch(
+                                        Runtime::Claude,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'x') => request_switch(
+                                        Runtime::Codex,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'd') => quitting = true,
+                                    Some(b':') => {
+                                        mode = M_COMMAND;
+                                        cmd_buf.clear();
+                                        bottom_overlay(&mut out, " constant ▸ ");
+                                    }
+                                    _ => {} // unknown: ignore
                                 }
-                                Token::Byte(b'x') => {
-                                    request_switch(Runtime::Codex, &mut session, &mut switching_to)
-                                }
-                                Token::Byte(b'd') => quitting = true,
-                                Token::Byte(b':') => {
-                                    mode = M_COMMAND;
-                                    cmd_buf.clear();
-                                    bottom_overlay(&mut out, " constant ▸ ")?;
-                                }
-                                Token::Prefix => passthrough.push(prefix), // literal prefix to child
-                                _ => {}                                    // unknown: ignore
                             }
                         }
 
@@ -595,7 +726,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                     0x1b => cancel = true,
                                     0x7f | 0x08 => {
                                         cmd_buf.pop();
-                                        bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"))?;
+                                        bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
                                     }
                                     _ => {
                                         if b == b' ' || b.is_ascii_graphic() {
@@ -603,34 +734,33 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                             bottom_overlay(
                                                 &mut out,
                                                 &format!(" constant ▸ {cmd_buf}"),
-                                            )?;
+                                            );
                                         }
                                     }
                                 },
                                 Token::Seq(s) => {
-                                    if let Some((cp, _, event)) = parse_kitty_u(&s) {
-                                        if event != 3 {
+                                    if let Some((cp, _, event)) = parse_kitty_u(&s)
+                                        && event != 3 {
                                             if cp == 13 {
                                                 submit = true;
                                             } else if cp == 27 {
                                                 cancel = true;
                                             }
                                         }
-                                    }
                                 }
                                 Token::Prefix => {}
                             }
                             if submit || cancel {
-                                clear_bottom(&mut out)?;
+                                clear_bottom(&mut out);
                                 mode = M_NORMAL;
                                 if !pending_out.is_empty() {
-                                    out.write_all(&pending_out)?;
-                                    out.flush()?;
+                                    let _ = out.write_all(&pending_out);
+                                    let _ = out.flush();
                                     pending_out.clear();
                                 }
                                 if submit
                                     && execute_command(
-                                        &cmd_buf.trim().to_string(),
+                                        cmd_buf.trim(),
                                         &mut session,
                                         &mut switching_to,
                                     ) == Action::Quit
@@ -662,8 +792,77 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
         }
     }
 
-    let _ = session.child.kill();
+    terminate(&mut session.child);
     let _ = session.child.wait();
     Ok(())
     // TerminalGuard restores the terminal on drop.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_prefix_legacy_bytes() {
+        assert_eq!(parse_prefix("C-b").unwrap(), (0x02, "Ctrl-B".to_string()));
+        assert_eq!(parse_prefix("ctrl-t").unwrap().0, 0x14);
+        assert_eq!(parse_prefix("^g").unwrap().0, 0x07);
+        assert!(parse_prefix("nonsense").is_err());
+        assert!(parse_prefix("").is_err());
+    }
+
+    #[test]
+    fn parse_kitty_u_decodes_fields() {
+        // Ctrl-b press: codepoint 98 ('b'), mods 5 (=1+Ctrl), event 1 (press).
+        assert_eq!(parse_kitty_u(b"\x1b[98;5u"), Some((98, 5, 1)));
+        // Explicit release event.
+        assert_eq!(parse_kitty_u(b"\x1b[98;5:3u"), Some((98, 5, 3)));
+        // Not a CSI-u sequence.
+        assert_eq!(parse_kitty_u(b"abc"), None);
+    }
+
+    #[test]
+    fn command_key_from_both_encodings() {
+        assert_eq!(command_key(&Token::Byte(b'c')), Some(b'c'));
+        // Kitty press of 'c' (codepoint 99, unmodified mods=1).
+        assert_eq!(command_key(&Token::Seq(b"\x1b[99;1u".to_vec())), Some(b'c'));
+        // Release is ignored.
+        assert_eq!(command_key(&Token::Seq(b"\x1b[99;1:3u".to_vec())), None);
+        // A MODIFIED key (Ctrl-C: mods=5) must NOT decode as plain `c`.
+        assert_eq!(command_key(&Token::Seq(b"\x1b[99;5u".to_vec())), None);
+        assert_eq!(command_key(&Token::Prefix), None);
+    }
+
+    fn classify_all(bytes: &[u8], prefix_byte: u8) -> Vec<Token> {
+        let mut tk = Tokenizer::new(prefix_byte);
+        let mut out = Vec::new();
+        tk.feed(bytes, &mut out);
+        out
+    }
+
+    #[test]
+    fn tokenizer_detects_prefix_legacy_and_kitty() {
+        // Legacy Ctrl-B (0x02).
+        let toks = classify_all(&[0x02], 0x02);
+        assert!(matches!(toks.as_slice(), [Token::Prefix]));
+        // Kitty CSI-u Ctrl-b.
+        let toks = classify_all(b"\x1b[98;5u", 0x02);
+        assert!(matches!(toks.as_slice(), [Token::Prefix]));
+        // A normal byte passes through.
+        let toks = classify_all(b"a", 0x02);
+        assert!(matches!(toks.as_slice(), [Token::Byte(b'a')]));
+    }
+
+    #[test]
+    fn tokenizer_caps_runaway_escape() {
+        // A never-terminating escape must not grow the buffer without bound (M8):
+        // it gets flushed as a Seq once it exceeds MAX_ESC.
+        let mut blob = vec![0x1b, b'['];
+        blob.extend(std::iter::repeat_n(b'0', MAX_ESC * 2));
+        let toks = classify_all(&blob, 0x02);
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::Seq(_))),
+            "runaway escape was not flushed"
+        );
+    }
 }

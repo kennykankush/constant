@@ -1009,6 +1009,9 @@ fn register_thread_in_sqlite(
 
     let connection = Connection::open(&sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    // Wait out a briefly-locked DB instead of failing the carry (a fresh codex
+    // projection registers here, before alembic's best-effort upsert runs).
+    connection.busy_timeout(std::time::Duration::from_secs(3))?;
     let title = thread_name.to_string();
     let first_user_message = first_user_message(session).unwrap_or_else(|| title.clone());
     let cwd = session

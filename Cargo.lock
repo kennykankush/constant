@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "libc",
  "portable-pty",
  "regex",
  "rusqlite",

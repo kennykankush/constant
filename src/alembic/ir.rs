@@ -13,6 +13,10 @@ pub enum SessionFormat {
     Claude,
 }
 
+/// Explicit source-format override. Only `Auto` is constructed today (we always
+/// auto-detect), but the explicit variants are kept as part of the vendored codec
+/// API surface for `--from`-style callers.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceFormat {
     Auto,
