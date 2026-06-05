@@ -2,9 +2,8 @@
 
 **One conversation. Any agent runtime.**
 
-Constant is a local-first terminal harness that hosts an agent CLI (Codex, Claude
-Code) and lets you **switch the active runtime mid-conversation** — the room moves,
-the work doesn't reset.
+Constant is a local-first host for agent CLIs. Start a thread in Codex, switch to
+Claude Code mid-conversation, then switch back without re-explaining the work.
 
 ```text
 Codex changes.
@@ -12,138 +11,243 @@ Claude changes.
 The conversation stays constant.
 ```
 
-You're talking to Codex. You hit `Ctrl-B c`. You're now in Claude Code, continuing
-the *same* conversation — it has the whole thread, no re-explaining. Hit `Ctrl-B x`
-and you're back in Codex. One conversation, two (or more) interchangeable minds.
+Constant is early software. It works by reading and writing local runtime session
+files, so read the trust boundary below before using it on important sessions.
 
----
+## What It Is
 
-## How it works
-
-Constant is the outer process; the agent CLI runs *inside* it in a PTY, fully
-native (colors, TUI, keys all pass through). A tmux-style prefix key drops you into
-Constant's control layer to switch runtimes.
+Constant runs one agent CLI at a time inside a native PTY. The child keeps its
+normal terminal UI, colors, keybindings, and resume behavior. Constant only sits
+outside it, watches for a tmux-style prefix key, and swaps the active runtime when
+you ask.
 
 ```text
-        ┌──────────────── constant host ─────────────────┐
-          you type ─▶ [interceptor] ─▶ PTY ─▶ codex (native)
-          screen   ◀──────────────────── PTY ◀── codex
-        └─────────────────────────────────────────────────┘
-                    Ctrl-B c  → switch to claude
-                    Ctrl-B x  → switch to codex
+constant host codex
 
-   on switch:  read the session the runtime is in
-               │  distill → neutral IR → sanitize → target's native format
-               ▼
-               resume the target natively (claude -r / codex resume)
+you talk to Codex
+Ctrl-B c  ->  Claude Code continues the same thread
+Ctrl-B x  ->  Codex continues it again
 ```
 
-The switch doesn't paste a summary or a briefing — it **transcodes the actual
-session into the target's native format and resumes it**, so the next runtime
-reads the conversation as its own scrollback. The agents are stateless between
-launches; their "memory" is just a transcript file on disk, and Constant writes
-that file. (See [PRODUCT.md](./PRODUCT.md) for the vision and [AGENTS.md](./AGENTS.md)
-for the design spine.)
+The switch is not a pasted summary. Constant reads the source runtime's local
+session, distills it to the conversation, writes a target-native session, and
+starts the target runtime with its own resume command.
 
-The distillation layer is named **alembic** — it distills a session down to the
-pure conversation: runtime scaffold stripped, secrets redacted, tool/reasoning
-noise dropped, then re-crystallized in the target's format.
-
-## Quickstart
+## Install
 
 Requires Rust, plus `codex` and/or `claude` on your `PATH`.
 
+From this repository:
+
+```bash
+cargo install --path . --locked
+constant --version
+```
+
+From GitHub:
+
+```bash
+cargo install --git https://github.com/kennykankush/constant --locked
+constant --version
+```
+
+Or build a local release binary:
+
 ```bash
 cargo build --release
-./target/release/constant host codex      # host codex inside Constant
+./target/release/constant --version
 ```
 
-Inside a hosted session, the prefix is **`Ctrl-B`** (like tmux):
+Homebrew and prebuilt release binaries are planned, but not published yet.
 
-| Keys            | Action                                            |
-| --------------- | ------------------------------------------------- |
-| `Ctrl-B` `c`    | switch to **claude**, carrying the conversation   |
-| `Ctrl-B` `x`    | switch to **codex**, carrying the conversation    |
-| `Ctrl-B` `:`    | command line (`switch claude`, `quit`)            |
-| `Ctrl-B` `d`    | detach (exit the harness cleanly)                 |
-| `Ctrl-B` `Ctrl-B` | send a literal `Ctrl-B` to the child            |
+## Quickstart
 
-Inside tmux (which also uses `Ctrl-B`), pick another prefix:
+Host Codex:
 
 ```bash
-constant host codex --prefix C-t       # or: CONSTANT_PREFIX=C-t constant host codex
+constant host codex
 ```
+
+Inside a hosted session, the default prefix is `Ctrl-B`.
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl-B` `c` | Switch to Claude Code, carrying the conversation |
+| `Ctrl-B` `x` | Switch to Codex, carrying the conversation |
+| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `quit`) |
+| `Ctrl-B` `d` | Detach and exit cleanly |
+| `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
+
+If you are already inside tmux, pick another prefix:
+
+```bash
+constant host codex --prefix C-t
+CONSTANT_PREFIX=C-t constant host codex
+```
+
+Show the switch lineage for the current directory:
+
+```bash
+constant trail
+constant trail --all
+```
+
+## Trust Boundary
+
+Constant does not claim shared native memory between agent CLIs. It reads visible
+local session evidence and authors a new session that the target runtime can
+resume.
+
+Constant currently writes:
+
+- `~/.claude/projects/<cwd-slug>/<id>.jsonl`
+- `~/.claude/history.jsonl`
+- `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`
+- `~/.codex/session_index.jsonl`
+- `~/.codex/state_5.sqlite`
+- `~/.constant/trail.jsonl`
+
+Original source sessions are read as seeds and are not overwritten. Constant
+maintains its own runtime projections for the carried thread, then keeps those
+projections in sync as you switch back and forth.
+
+Constant redacts common secrets from carried text and strips runtime scaffold, but
+it still moves conversation content across a trust boundary. Do not use it on a
+session if you are not comfortable with the target runtime reading that thread.
+
+## What Carries
+
+Carries:
+
+- user and assistant conversation turns
+- the working directory recorded by the source runtime
+- a Constant trail name so the carried session is recognizable in `/resume`
+
+Stripped on purpose:
+
+- runtime scaffold such as system prompts, injected environment blocks, skill
+  lists, plugin lists, and memory blocks
+- common secrets such as API keys, GitHub tokens, Slack tokens, authorization
+  headers, password/token assignments, and email addresses
+
+Not carried:
+
+- tool calls and tool results
+- reasoning traces
+- hidden provider state
+- approvals, sandbox state, prompt cache state, or private runtime internals
+
+For coding sessions, the narrative usually survives. The machine-level tool
+history does not.
+
+## How It Works
+
+```text
+        ┌────────────────── constant host ──────────────────┐
+        │  real terminal                                    │
+        │    input -> prefix interceptor -> PTY -> runtime   │
+        │    screen <- child output  <- PTY <- runtime       │
+        └───────────────────────────────────────────────────┘
+
+on switch:
+  source runtime session
+      -> alembic reader
+      -> neutral thread model
+      -> sanitize + redact
+      -> target-native session writer
+      -> target runtime resume
+```
+
+The distillation layer is named `alembic`. It is the part that knows how to load
+Codex and Claude Code session formats, strip them down to the portable
+conversation, and materialize the target runtime's native session shape.
 
 ## Commands
 
+Public commands:
+
 ```bash
-constant host [codex|claude] [--prefix C-t]   # the harness (default: codex)
-constant distill --from codex --to claude     # transcode the latest convo (no launch)
-constant distill --session <file> --to codex  #   …or a specific session file
-constant keys                                  # raw key probe (debug input encodings)
+constant host [codex|claude] [--prefix C-t]
+constant trail [--all]
+constant --version
 ```
 
-`constant distill` is the codec on its own — handy for inspecting what a switch
-would carry, with no TTY and no model calls.
+Debug and inspection commands:
 
-## What carries (and what doesn't)
+```bash
+constant distill --from codex --to claude
+constant distill --session <file> --to codex
+constant keys
+```
 
-- **Carries cleanly:** the conversation — every user and assistant turn — verbatim.
-- **Stripped on purpose:** runtime scaffold (system prompts, skill/plugin lists,
-  memory blocks) and secrets (API keys, tokens, emails are redacted).
-- **Dropped (lossy across runtimes):** tool calls, tool results, and reasoning.
-  The *narrative* of a coding session survives; the agentic tool history does not —
-  tool schemas aren't 1:1 between runtimes.
+`constant distill` runs the codec without opening a hosted terminal. It still
+writes a target-native session, so treat it as a write operation.
 
-Each conversation lives as a **stable pair** of ids — one per runtime — that a
-switch reuses and keeps in sync, so ping-ponging doesn't spawn a pile of new
-sessions. Both incarnations show up in each CLI's own `/resume`.
+## Supported Runtimes
 
-## Honest limits
+Current support:
 
-- **Not read-only.** Constant writes synthetic sessions into `~/.claude` and
-  `~/.codex` (and codex's `state_5.sqlite`). It never displays raw secrets and
-  redacts them from carried text, but it does author sessions in the runtime homes.
-- **Private formats, version-fragile.** Session schemas are undocumented and move
-  between releases. Verified against `codex 0.137.x` / `claude 2.1.x`; a runtime
-  update can require a codec refresh.
-- **Mid-turn switches** carry up to the last *persisted* turn — if you switch while
-  a runtime is still generating, that in-flight turn isn't on disk yet.
-- **Conversation-only.** Tool/reasoning history is intentionally not carried (yet).
+- Codex CLI: validated against `0.137.x`
+- Claude Code: validated against `2.1.x`
 
-## What Constant is not
+The session formats are private and can change between runtime releases. Constant
+has round-trip tests for the current known shapes, but a runtime update can still
+require a codec refresh.
 
-- Not a claim that the runtimes share hidden native memory — it reads visible local
-  session evidence and re-authors it for the next runtime.
-- Not a multi-agent dashboard, model router, or API proxy.
-- Not a terminal multiplexer — it hosts *one* runtime at a time and passes its
-  output through untouched (no compositing), which is why it stays small.
+Planned runtime targets include OpenCode, Aider, and Gemini CLI.
 
-## Architecture
+## When Not To Use Constant
+
+Constant is probably the wrong tool if:
+
+- you need a lossless transfer of tool calls, reasoning, or hidden runtime state
+- you do not want any writes into `~/.claude` or `~/.codex`
+- your source runtime is still generating the current turn
+- your installed Codex or Claude Code version is outside the validated range
+- you want a multi-agent dashboard, model router, API proxy, or terminal
+  multiplexer
+
+## Development
+
+Useful checks:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
+
+Project map:
 
 ```text
 src/
-  main.rs              CLI: host / distill / keys
-  runtime.rs           runtime defs + fresh/resume launch commands
-  host.rs              the PTY harness: raw-input FSM, prefix interception,
-                       switch orchestration, stable-pair thread map, terminal restore
+  main.rs              CLI entrypoint
+  runtime.rs           runtime launch/resume commands
+  host.rs              PTY host, prefix handling, switch orchestration
+  trail.rs             Constant-owned lineage ledger
   alembic/
-    mod.rs             distill: find active session, sanitize (strip + redact),
-                       transcode, native resume, codex /resume visibility
+    mod.rs             distill, sanitize, redact, active-session detection
     ir.rs              neutral session model
-    formats/{claude,codex}.rs   per-runtime readers + writers
-    LICENSE.transession
+    formats/
+      claude.rs        Claude session reader/writer
+      codex.rs         Codex rollout reader/writer and sqlite registration
 ```
 
-## Attribution
-
 The low-level session codecs in `src/alembic/formats/` and the neutral IR are
-vendored from [transession](https://github.com/inmzhang/transession) (MIT — see
-`src/alembic/LICENSE.transession`). Alembic adds the sanitize/redact pass, the
-native-resume schema matching, and the stable-pair switching the harness needs.
+vendored from [transession](https://github.com/inmzhang/transession) (MIT; see
+`src/alembic/LICENSE.transession`). Constant adds the sanitize/redact pass,
+native-resume hardening, stable runtime projections, trail naming, and the live
+host.
 
-## Status
+## Documentation
 
-Early. The codex ↔ claude live switch works end to end — verified carrying real
-conversations both directions, resumable from each CLI's own `/resume`. More
-runtimes (OpenCode, Aider, Gemini) and carrying tool history are next.
+- [Product vision](./PRODUCT.md)
+- [Architecture](./docs/architecture.md)
+- [How it works](./docs/how-it-works.md)
+- [The alembic cartridge](./docs/the-cartridge.md)
+- [Decisions and tradeoffs](./docs/decisions-and-tradeoffs.md)
+- [Changelog](./CHANGELOG.md)
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
