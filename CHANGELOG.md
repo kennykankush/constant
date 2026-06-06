@@ -3,6 +3,15 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - Homebrew tap readiness
+
+### Fixed
+- Align the crate version with the release tag so `constant --version` matches
+  the artifact version Homebrew installs.
+
+### Added
+- Prepare direct-repository Homebrew tap support via `Formula/constant.rb`.
+
 ## [0.1.0] - Genesis
 
 The first release line: one conversation, any agent runtime. Host an agent CLI
