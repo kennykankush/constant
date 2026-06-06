@@ -69,32 +69,39 @@ constant carry --from codex --to claude
 
 ## Install
 
-Requires Rust, plus `codex` and/or `claude` on your `PATH`.
+Requires `codex` and/or `claude` on your `PATH`. The cargo lanes also need Rust.
 
-From this repository:
+### From source (works today)
 
 ```bash
-cargo install --path . --locked
+cargo install --path . --locked                                        # local checkout
+cargo install --git https://github.com/kennykankush/constant --locked  # from GitHub
 constant --version
 constant doctor
 ```
 
-From GitHub:
-
-```bash
-cargo install --git https://github.com/kennykankush/constant --locked
-constant --version
-constant doctor
-```
-
-Or build a local release binary:
+Or build a local release binary without installing it:
 
 ```bash
 cargo build --release
 ./target/release/constant --version
 ```
 
-Homebrew and prebuilt release binaries are planned, but not published yet.
+### Prebuilt binaries — Homebrew & curl (after the first release)
+
+These consume GitHub Release artifacts and start working once `v0.1.0` is tagged
+and published. They are prepared in the repo but **not live yet**:
+
+```bash
+# Homebrew (planned tap)
+brew install kennykankush/tap/constant
+
+# curl installer — no sudo, installs to ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh
+```
+
+The installer honors `CONSTANT_VERSION` and `CONSTANT_INSTALL_DIR`. Until the
+first release is published, use the from-source lane above.
 
 ## Quickstart
 

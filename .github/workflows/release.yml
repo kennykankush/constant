@@ -1,0 +1,86 @@
+name: release
+
+# Source of truth for prebuilt binaries. Fires only on a version tag (v*),
+# builds the three supported targets, checksums them, and publishes a GitHub
+# Release. Homebrew and scripts/install.sh consume these artifacts.
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege: build jobs only read; the release job elevates to write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # macos-13 was retired Dec 2025; macos-15-intel is the current (and
+          # final, ~Aug 2027) x86_64 macOS image.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      # Third-party actions pinned to commit SHAs (supply-chain: this workflow
+      # publishes the artifacts the installer/Homebrew trust). Comments note the tag.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: smoke test
+        run: ./target/${{ matrix.target }}/release/constant --version
+      - name: package
+        env:
+          # Pass through env (never interpolate ${{ github.ref_name }} into the
+          # script) — a pushed tag is untrusted and could carry shell metachars.
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          # Validate the tag before it touches shell/file names.
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "refusing to release for unexpected tag: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *[!A-Za-z0-9.+_-]*) echo "tag has unsafe characters: $TAG" >&2; exit 1 ;;
+          esac
+          name="constant-${TAG}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/constant" "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: list artifacts
+        run: ls -la dist
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
