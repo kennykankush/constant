@@ -71,7 +71,36 @@ constant carry --from codex --to claude
 
 Requires `codex` and/or `claude` on your `PATH`. The cargo lanes also need Rust.
 
-### From source (works today)
+### Prebuilt release (recommended)
+
+Published releases include checksum-verified binaries for:
+
+- macOS Apple Silicon (`aarch64-apple-darwin`)
+- macOS Intel (`x86_64-apple-darwin`)
+- Linux x86_64 (`x86_64-unknown-linux-gnu`)
+
+Install the latest release with no sudo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh
+constant --version
+constant doctor
+```
+
+The installer downloads the matching tarball from GitHub Releases, verifies the
+`.sha256` file, smoke-tests the binary, then installs it to `~/.local/bin`.
+
+Useful installer overrides:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | CONSTANT_VERSION=vX.Y.Z sh
+curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | CONSTANT_INSTALL_DIR="$HOME/bin" sh
+```
+
+If `~/.local/bin` is not on your `PATH`, the installer prints the shell export to
+add.
+
+### From source
 
 ```bash
 cargo install --path . --locked                                        # local checkout
@@ -87,21 +116,20 @@ cargo build --release
 ./target/release/constant --version
 ```
 
-### Prebuilt binaries — Homebrew & curl (after the first release)
+### Homebrew
 
-These consume GitHub Release artifacts and start working once `v0.1.0` is tagged
-and published. They are prepared in the repo but **not live yet**:
+Tap this repository directly and install the CLI formula:
 
 ```bash
-# Homebrew (planned tap)
-brew install kennykankush/tap/constant
-
-# curl installer — no sudo, installs to ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh
+brew tap kennykankush/constant https://github.com/kennykankush/constant
+brew install constant
 ```
 
-The installer honors `CONSTANT_VERSION` and `CONSTANT_INSTALL_DIR`. Until the
-first release is published, use the from-source lane above.
+If Homebrew cannot resolve the short formula name, use the fully qualified form:
+
+```bash
+brew install kennykankush/constant/constant
+```
 
 ## Quickstart
 

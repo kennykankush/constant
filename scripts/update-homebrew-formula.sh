@@ -30,13 +30,35 @@ need() {
     exit 1
   }
 }
-need curl
+need gh
+need python3
 need ruby
+
+assets_json="$(gh release view "$tag" --repo "$repo" --json assets)"
 
 sha_for() {
   target="$1"
   asset="constant-$tag-$target.tar.gz"
-  curl -fsSL "$base/$asset.sha256" | awk '{print $1}'
+  ASSETS_JSON="$assets_json" python3 - "$asset" <<'PY'
+import json
+import os
+import re
+import sys
+
+want = sys.argv[1]
+data = json.loads(os.environ["ASSETS_JSON"])
+for item in data.get("assets", []):
+    if item.get("name") == want:
+        digest = item.get("digest") or ""
+        if not digest.startswith("sha256:"):
+            raise SystemExit(f"error: missing sha256 digest for {want}")
+        sha = digest.split(":", 1)[1]
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise SystemExit(f"error: invalid sha256 for {want}: {sha}")
+        print(sha)
+        raise SystemExit(0)
+raise SystemExit(f"error: release asset not found: {want}")
+PY
 }
 
 sha_aarch64_apple="$(sha_for aarch64-apple-darwin)"
