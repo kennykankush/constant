@@ -384,7 +384,7 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     for rt in runtimes {
         sessions.extend(alembic::list_sessions(rt, cwd.as_deref(), titles));
     }
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.mtime));
 
     if json {
         let arr: Vec<_> = sessions

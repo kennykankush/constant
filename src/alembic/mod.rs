@@ -465,7 +465,7 @@ fn find_child_session(from: SessionFormat, host_cwd: Option<&Path>) -> Option<Pa
             candidates.push((mtime, path));
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
 
     for (_, path) in candidates {
         // Cheap cwd filter before the full-content conversation check.
@@ -648,7 +648,7 @@ pub fn list_sessions(runtime: Runtime, cwd: Option<&Path>, with_titles: bool) ->
             });
         }
     }
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
     out
 }
 
