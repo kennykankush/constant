@@ -69,17 +69,29 @@ constant carry --from codex --to claude
 
 ## Install
 
-Requires `codex` and/or `claude` on your `PATH`. The cargo lanes also need Rust.
+If you are on macOS and use Homebrew, use this:
 
-### Prebuilt release (recommended)
+```bash
+brew tap kennykankush/constant https://github.com/kennykankush/constant
+brew install kennykankush/constant/constant
+constant --version
+constant doctor
+```
 
-Published releases include checksum-verified binaries for:
+That is the recommended install path. The explicit
+`kennykankush/constant/constant` name avoids ambiguity with any other formula
+named `constant`.
 
-- macOS Apple Silicon (`aarch64-apple-darwin`)
-- macOS Intel (`x86_64-apple-darwin`)
-- Linux x86_64 (`x86_64-unknown-linux-gnu`)
+You also need the agent CLIs you want to switch between:
 
-Install the latest release with no sudo:
+```bash
+codex --version   # optional, for Codex support
+claude --version  # optional, for Claude Code support
+```
+
+### Alternative: curl installer
+
+Use this if you do not want Homebrew, or you are on Linux x86_64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh
@@ -87,48 +99,31 @@ constant --version
 constant doctor
 ```
 
-The installer downloads the matching tarball from GitHub Releases, verifies the
-`.sha256` file, smoke-tests the binary, then installs it to `~/.local/bin`.
+The installer downloads the latest prebuilt binary, verifies its checksum,
+smoke-tests it, and installs it to `~/.local/bin`. If `~/.local/bin` is not on
+your `PATH`, it prints the exact export line to add.
 
-Useful installer overrides:
+Supported prebuilt targets:
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
+### Developers: install from source
+
+Use this only if you are hacking on Constant or want to build directly from the
+repo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | CONSTANT_VERSION=vX.Y.Z sh
-curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | CONSTANT_INSTALL_DIR="$HOME/bin" sh
+cargo install --git https://github.com/kennykankush/constant --locked
 ```
 
-If `~/.local/bin` is not on your `PATH`, the installer prints the shell export to
-add.
-
-### From source
+From a local checkout:
 
 ```bash
-cargo install --path . --locked                                        # local checkout
-cargo install --git https://github.com/kennykankush/constant --locked  # from GitHub
-constant --version
-constant doctor
-```
-
-Or build a local release binary without installing it:
-
-```bash
+cargo install --path . --locked
 cargo build --release
 ./target/release/constant --version
-```
-
-### Homebrew
-
-Tap this repository directly and install the CLI formula:
-
-```bash
-brew tap kennykankush/constant https://github.com/kennykankush/constant
-brew install constant
-```
-
-If Homebrew cannot resolve the short formula name, use the fully qualified form:
-
-```bash
-brew install kennykankush/constant/constant
 ```
 
 ## Quickstart
