@@ -61,9 +61,33 @@ raise SystemExit(f"error: release asset not found: {want}")
 PY
 }
 
+api_url_for() {
+  target="$1"
+  asset="constant-$tag-$target.tar.gz"
+  ASSETS_JSON="$assets_json" python3 - "$asset" <<'PY'
+import json
+import os
+import sys
+
+want = sys.argv[1]
+data = json.loads(os.environ["ASSETS_JSON"])
+for item in data.get("assets", []):
+    if item.get("name") == want:
+        api_url = item.get("apiUrl") or ""
+        if not api_url.startswith("https://api.github.com/"):
+            raise SystemExit(f"error: missing GitHub API URL for {want}")
+        print(api_url)
+        raise SystemExit(0)
+raise SystemExit(f"error: release asset not found: {want}")
+PY
+}
+
 sha_aarch64_apple="$(sha_for aarch64-apple-darwin)"
 sha_x86_64_apple="$(sha_for x86_64-apple-darwin)"
 sha_x86_64_linux="$(sha_for x86_64-unknown-linux-gnu)"
+url_aarch64_apple="$(api_url_for aarch64-apple-darwin)"
+url_x86_64_apple="$(api_url_for x86_64-apple-darwin)"
+url_x86_64_linux="$(api_url_for x86_64-unknown-linux-gnu)"
 
 mkdir -p Formula packaging/homebrew
 
@@ -78,18 +102,21 @@ class Constant < Formula
 
   on_macos do
     on_arm do
-      url "$base/constant-$tag-aarch64-apple-darwin.tar.gz"
+      url "$url_aarch64_apple",
+          headers: ["Accept: application/octet-stream"]
       sha256 "$sha_aarch64_apple"
     end
     on_intel do
-      url "$base/constant-$tag-x86_64-apple-darwin.tar.gz"
+      url "$url_x86_64_apple",
+          headers: ["Accept: application/octet-stream"]
       sha256 "$sha_x86_64_apple"
     end
   end
 
   on_linux do
     on_intel do
-      url "$base/constant-$tag-x86_64-unknown-linux-gnu.tar.gz"
+      url "$url_x86_64_linux",
+          headers: ["Accept: application/octet-stream"]
       sha256 "$sha_x86_64_linux"
     end
   end

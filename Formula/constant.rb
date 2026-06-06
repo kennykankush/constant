@@ -6,18 +6,21 @@ class Constant < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/kennykankush/constant/releases/download/v0.1.2/constant-v0.1.2-aarch64-apple-darwin.tar.gz"
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/439810253",
+          headers: ["Accept: application/octet-stream"]
       sha256 "de152e6c4439966e50a565b93402f2187aebd95d03de7aa6e09882436b20f912"
     end
     on_intel do
-      url "https://github.com/kennykankush/constant/releases/download/v0.1.2/constant-v0.1.2-x86_64-apple-darwin.tar.gz"
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/439810254",
+          headers: ["Accept: application/octet-stream"]
       sha256 "f3a31920e41a754aad0e0862dac2f85572dad0889b241ffb00d645a2fc4dbf59"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/kennykankush/constant/releases/download/v0.1.2/constant-v0.1.2-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/439810251",
+          headers: ["Accept: application/octet-stream"]
       sha256 "7f05317b7d5fd438b60542f8af69238c7f6b27b2316551af4efbd415a34a37c4"
     end
   end
