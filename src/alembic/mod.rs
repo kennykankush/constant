@@ -74,6 +74,12 @@ pub fn distill_path(
 ) -> Result<(String, PathBuf, Option<PathBuf>)> {
     let to_fmt = session_format(to);
 
+    if let Some((_, path)) = reuse
+        && same_file(src, path)
+    {
+        bail!("refusing to overwrite source session at {}", src.display());
+    }
+
     let mut session = formats::load_session(src, SourceFormat::Auto)
         .with_context(|| format!("failed to read {}", src.display()))?;
 
@@ -300,6 +306,24 @@ fn session_format(runtime: Runtime) -> SessionFormat {
     match runtime {
         Runtime::Codex => SessionFormat::Codex,
         Runtime::Claude => SessionFormat::Claude,
+    }
+}
+
+/// True when two paths point at the same existing file. This is the core F1
+/// guard: even if a caller passes a bad reuse target, alembic refuses to
+/// materialize over the donor conversation.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -955,6 +979,36 @@ mod tests {
             "carry modified the source file — F1 violation"
         );
         assert!(out.exists(), "carry did not write the target");
+    }
+
+    #[test]
+    fn carry_refuses_to_reuse_the_source_as_target() {
+        let dir = unique_tmp();
+        let src = dir.join("source.jsonl");
+        let mut session = UniversalSession::new("src-0000".to_string());
+        session.metadata.cwd = Some(PathBuf::from("/tmp/x"));
+        session.events.push(msg("user", "keep me intact"));
+        session.events.push(msg("assistant", "ok"));
+        formats::write_ir(&session, &src).expect("write IR source");
+        let before = fs::read(&src).expect("read source before");
+
+        let err = distill_path(
+            &src,
+            Runtime::Claude,
+            Some(("bad-reuse-target", &src)),
+            None,
+        )
+        .expect_err("source reuse should be refused");
+
+        assert!(
+            format!("{err:#}").contains("refusing to overwrite source session"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            before,
+            fs::read(&src).expect("read source after"),
+            "refused carry still modified the source"
+        );
     }
 
     // --- the fields Claude's resume parser requires (guards "Failed to resume") ---
