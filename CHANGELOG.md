@@ -3,6 +3,22 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - Orientation and explicit continuations
+
+### Added
+- Add `constant status` as the quick orientation command for runtime readiness,
+  current trail state, and latest sessions.
+- Change `constant trail` to show current projections by default, with
+  `constant trail --events` preserving the raw append-only switch ledger.
+- Add explicit new-continuation routing (`--new` and hosted uppercase switch
+  shortcuts) so users can intentionally branch instead of refreshing an existing
+  projection.
+
+### Fixed
+- Keep `status` cheap by reading only the newest transcript title per runtime.
+- Hide deleted projection files from the current trail view while keeping their
+  historical events visible under `--events`.
+
 ## [0.1.2] - Homebrew tap readiness
 
 ### Fixed
