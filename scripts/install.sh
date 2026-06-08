@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh
 #
 # Env:
-#   CONSTANT_VERSION       version tag to install (default: latest, e.g. v0.1.3)
+#   CONSTANT_VERSION       version tag to install (default: latest, e.g. v0.1.4)
 #   CONSTANT_INSTALL_DIR   install directory (default: $HOME/.local/bin)
 set -eu
 

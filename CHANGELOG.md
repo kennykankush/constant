@@ -3,6 +3,13 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - Source overwrite guard hardening
+
+### Fixed
+- Move the donor-protection invariant into the core alembic layer: a carry now
+  refuses to materialize over the source session even if a future caller or
+  corrupted trail passes the donor path as the reuse target.
+
 ## [0.1.3] - Orientation and explicit continuations
 
 ### Added
