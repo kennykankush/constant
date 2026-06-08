@@ -16,13 +16,13 @@
 //! So the interceptor recognizes the prefix in BOTH encodings, swallows it, and
 //! forwards every other sequence (terminal replies, key releases) untouched.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
+use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
 use crate::runtime::Runtime;
@@ -198,6 +198,12 @@ struct Session {
     child: Box<dyn Child + Send + Sync>,
 }
 
+#[derive(Clone, Copy)]
+struct SwitchRequest {
+    target: Runtime,
+    new: bool,
+}
+
 fn spawn_session(
     runtime: Runtime,
     resume: Option<&str>,
@@ -277,11 +283,16 @@ fn terminate(child: &mut Box<dyn Child + Send + Sync>) {
     let _ = child.kill();
 }
 
-fn request_switch(target: Runtime, session: &mut Session, switching_to: &mut Option<Runtime>) {
+fn request_switch(
+    target: Runtime,
+    new: bool,
+    session: &mut Session,
+    switching_to: &mut Option<SwitchRequest>,
+) {
     if session.runtime == target || switching_to.is_some() {
         return;
     }
-    *switching_to = Some(target);
+    *switching_to = Some(SwitchRequest { target, new });
     terminate(&mut session.child);
 }
 
@@ -291,12 +302,22 @@ enum Action {
     Quit,
 }
 
-fn execute_command(line: &str, session: &mut Session, switching_to: &mut Option<Runtime>) -> Action {
+fn execute_command(
+    line: &str,
+    session: &mut Session,
+    switching_to: &mut Option<SwitchRequest>,
+) -> Action {
     let parts: Vec<&str> = line.split_whitespace().collect();
     match parts.as_slice() {
         ["switch", rt] | ["s", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, session, switching_to);
+                request_switch(target, false, session, switching_to);
+            }
+            Action::None
+        }
+        ["new", rt] | ["n", rt] | ["fork", rt] | ["switch", "--new", rt] | ["s", "--new", rt] => {
+            if let Ok(target) = Runtime::parse(rt) {
+                request_switch(target, true, session, switching_to);
             }
             Action::None
         }
@@ -322,7 +343,7 @@ fn clear_bottom(out: &mut impl Write) {
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  :=command  d=detach\x1b[0m\r\n",
+        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  C=new claude  x=codex  X=new codex  :=command  d=detach\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();
@@ -445,7 +466,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
     }
 
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   x=codex   :=command   d=detach   ({prefix_label} again = literal) "
+        " {prefix_label} ▸  c=claude   C=new claude   x=codex   X=new codex   :=command   d=detach "
     );
 
     let mut out = std::io::stdout();
@@ -456,7 +477,11 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
         None
     };
     if let Some(f) = dbg.as_mut() {
-        let _ = writeln!(f, "[start] prefix=0x{prefix:02x} ({prefix_label}) cp={}", prefix | 0x60);
+        let _ = writeln!(
+            f,
+            "[start] prefix=0x{prefix:02x} ({prefix_label}) cp={}",
+            prefix | 0x60
+        );
         let _ = f.flush();
     }
 
@@ -480,7 +505,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
 
     let mut mode = M_NORMAL;
     let mut cmd_buf = String::new();
-    let mut switching_to: Option<Runtime> = None;
+    let mut switching_to: Option<SwitchRequest> = None;
     let mut pending_out: Vec<u8> = Vec::new();
     let mut quitting = false;
 
@@ -496,7 +521,8 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
             }
 
             Ev::PtyClosed => {
-                if let Some(target) = switching_to.take() {
+                if let Some(request) = switching_to.take() {
+                    let target = request.target;
                     let from = session.runtime;
                     let _ = session.child.wait();
                     let (c, r) = size().unwrap_or((cols, rows));
@@ -539,8 +565,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                             // conversation inside the child, we detect the change
                             // instead of overwriting the old pair's projection with
                             // an unrelated thread and mis-recording the trail (M6).
-                            let (cid, last_n, projs) =
-                                crate::trail::resume(&src_path, &src_id);
+                            let (cid, last_n, projs) = crate::trail::resume(&src_path, &src_id);
                             if root_id.as_deref() != Some(cid.as_str()) {
                                 // New conversation (first switch, or a /resume-away):
                                 // adopt it, reseed the projection map from the
@@ -563,9 +588,10 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                             let n = trail_n + 1;
                             let title = crate::trail::title(n, from, &slug);
 
+                            let action = if request.new { "new" } else { "continue" };
                             let _ = out.write_all(
                                 format!(
-                                    "\x1b[2m  trail · {} · {} \u{2192} {}\x1b[0m\r\n",
+                                    "\x1b[2m  trail · {} · {} \u{2192} {} · {action}\x1b[0m\r\n",
                                     title,
                                     from.label(),
                                     target.label()
@@ -576,12 +602,20 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
 
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.
-                            let reuse_owned = owned.get(&target).cloned();
+                            let reuse_owned = if request.new {
+                                None
+                            } else {
+                                owned.get(&target).cloned()
+                            };
                             let reuse = reuse_owned
                                 .as_ref()
                                 .map(|(id, p)| (id.as_str(), p.as_path()));
-                            match crate::alembic::distill_path(&src_path, target, reuse, Some(&title))
-                            {
+                            match crate::alembic::distill_path(
+                                &src_path,
+                                target,
+                                reuse,
+                                Some(&title),
+                            ) {
                                 Ok((id, written, session_cwd)) => {
                                     if let Some(f) = dbg.as_mut() {
                                         let _ = writeln!(
@@ -600,11 +634,18 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                         &conv_id,
                                         &slug,
                                         host_cwd.as_deref(),
+                                        &src_id,
+                                        &src_path,
                                         from,
                                         target,
                                         &id,
                                         &written,
                                         &title,
+                                        if reuse_owned.is_some() {
+                                            "refresh-existing"
+                                        } else {
+                                            "new-fork"
+                                        },
                                     );
                                     session = spawn_session(
                                         target,
@@ -698,11 +739,25 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                 match command_key(&tok) {
                                     Some(b'c') => request_switch(
                                         Runtime::Claude,
+                                        false,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'C') => request_switch(
+                                        Runtime::Claude,
+                                        true,
                                         &mut session,
                                         &mut switching_to,
                                     ),
                                     Some(b'x') => request_switch(
                                         Runtime::Codex,
+                                        false,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'X') => request_switch(
+                                        Runtime::Codex,
+                                        true,
                                         &mut session,
                                         &mut switching_to,
                                     ),
@@ -740,13 +795,14 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                 },
                                 Token::Seq(s) => {
                                     if let Some((cp, _, event)) = parse_kitty_u(&s)
-                                        && event != 3 {
-                                            if cp == 13 {
-                                                submit = true;
-                                            } else if cp == 27 {
-                                                cancel = true;
-                                            }
+                                        && event != 3
+                                    {
+                                        if cp == 13 {
+                                            submit = true;
+                                        } else if cp == 27 {
+                                            cancel = true;
                                         }
+                                    }
                                 }
                                 Token::Prefix => {}
                             }

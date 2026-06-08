@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use crate::alembic::ir::{SessionFormat, SourceFormat, UniversalSession};
 
-
 #[derive(Debug)]
 pub struct ResolvedInput {
     pub path: PathBuf,

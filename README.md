@@ -128,10 +128,11 @@ cargo build --release
 
 ## Quickstart
 
-Check your local runtime setup:
+Check your local runtime setup and current project state:
 
 ```bash
 constant doctor
+constant status
 ```
 
 Host Codex:
@@ -144,9 +145,11 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 
 | Keys | Action |
 | --- | --- |
-| `Ctrl-B` `c` | Switch to Claude Code, carrying the conversation |
-| `Ctrl-B` `x` | Switch to Codex, carrying the conversation |
-| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `quit`) |
+| `Ctrl-B` `c` | Continue in Claude Code, refreshing the existing Claude projection if one exists |
+| `Ctrl-B` `C` | Create a new Claude continuation |
+| `Ctrl-B` `x` | Continue in Codex, refreshing the existing Codex projection if one exists |
+| `Ctrl-B` `X` | Create a new Codex continuation |
+| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `new claude`, `quit`) |
 | `Ctrl-B` `d` | Detach and exit cleanly |
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
 
@@ -157,12 +160,25 @@ constant host codex --prefix C-t
 CONSTANT_PREFIX=C-t constant host codex
 ```
 
-Show the switch lineage for the current directory:
+Show the current Constant projections for this directory:
 
 ```bash
 constant trail
+constant route
 constant trail --all
 ```
+
+`constant trail` shows the current projection per runtime. If the same projection
+was updated multiple times, it is shown as `synced Nx` instead of repeated as a
+new conversation. To inspect the raw append-only switch ledger:
+
+```bash
+constant trail --events
+```
+
+`constant route` is the debug view. It reconstructs the fork graph Constant knows
+about and labels projections with readable aliases like `codex[1]` and
+`claude[1.1]`.
 
 ## Headless CLI
 
@@ -186,6 +202,7 @@ Preview a carry without writing anything:
 
 ```bash
 constant carry --from codex --to claude --dry-run
+constant carry --from codex --to claude --dry-run --debug
 constant carry --session <path-or-session-id> --to codex --dry-run --json
 ```
 
@@ -194,6 +211,15 @@ Carry into the target runtime's native session and print the resume command:
 ```bash
 constant carry --from codex --to claude
 constant carry --session <path-or-session-id> --to codex
+```
+
+By default, `carry` continues the current target projection for the conversation:
+if `codex[1]` already has `claude[1.1]`, another carry to Claude updates that
+same Claude session. Use `--new` when you want a separate target continuation:
+
+```bash
+constant carry --from codex --to claude --new
+# codex[1] -> claude[1.2]
 ```
 
 `distill` is kept as an alias for `carry`, but `carry` is the public verb.
@@ -238,6 +264,9 @@ projections. They do not overwrite the original source session.
 Command write behavior:
 
 - `constant doctor`: reads CLI/version/store presence only
+- `constant status`: reads runtime readiness, latest sessions, and the trail ledger
+- `constant trail`: reads the Constant trail ledger
+- `constant route`: reads the Constant trail ledger and target projection paths
 - `constant sessions`: reads session metadata; `--titles` also reads transcripts
 - `constant carry --dry-run`: reads and distills, writes nothing
 - `constant carry`: writes a target-native projection and updates the trail
@@ -297,11 +326,13 @@ Public commands:
 
 ```bash
 constant host [codex|claude] [--prefix C-t]
-constant carry --to codex|claude [--from codex|claude | --session <path-or-id>] [--json] [--dry-run]
+constant carry --to codex|claude [--from codex|claude | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new]
 constant sessions [--from codex|claude] [--all] [--titles] [--json]
 constant export (--from codex|claude | --session <path-or-id>) [--out FILE]
 constant doctor [--json]
-constant trail [--all]
+constant status [--all]
+constant trail [--all] [--events]
+constant route [--all] [--session <path-or-id>]
 constant --version
 ```
 

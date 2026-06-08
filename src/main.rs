@@ -9,7 +9,7 @@ mod host;
 mod runtime;
 mod trail;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use runtime::Runtime;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,9 @@ fn main() -> Result<()> {
         Some("sessions") | Some("ls") => run_sessions(&args[1..]),
         Some("export") => run_export(&args[1..]),
         Some("doctor") => run_doctor(&args[1..]),
+        Some("status") => run_status(&args[1..]),
         Some("trail") => run_trail(&args[1..]),
+        Some("route") | Some("routes") => run_route(&args[1..]),
         Some("keys") => host::debug_keys(),
         Some("-V") | Some("--version") => {
             println!("constant {}", env!("CARGO_PKG_VERSION"));
@@ -56,7 +58,9 @@ fn flag_value(rest: &[String], i: usize, flag: &str) -> Result<String> {
 /// to the terminal — a crafted session could embed ANSI/OSC bytes that manipulate
 /// terminal state or spoof output. (JSON output is escaped by the serializer.)
 fn term_safe(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// True if `out` resolves to the same file as `src`, so `export --out` can never
@@ -126,6 +130,8 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let mut session: Option<PathBuf> = None;
     let mut json = false;
     let mut dry_run = false;
+    let mut debug = false;
+    let mut new = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -148,6 +154,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
             }
             "--dry-run" => {
                 dry_run = true;
+                i += 1;
+            }
+            "--debug" => {
+                debug = true;
+                i += 1;
+            }
+            "--new" => {
+                new = true;
                 i += 1;
             }
             other => bail!("unknown flag: {other}"),
@@ -182,20 +196,65 @@ fn run_carry(rest: &[String]) -> Result<()> {
         }
     };
 
+    // Trail: which conversation this source belongs to, the next hop number, and
+    // any existing projection for the target — so repeated headless carries reuse
+    // the stable pair (overwrite Constant's own projection) instead of minting a
+    // new file every time, exactly like the interactive harness.
+    let (conv_id, last_n, projs) = trail::resume(&src_path, &src_id);
+    let slug = trail::slug(
+        &alembic::root_name(&src_path, from_rt).unwrap_or_else(|| "conversation".to_string()),
+    );
+    let n = last_n + 1;
+    let title = trail::title(n, from_rt, &slug);
+
+    // Reuse the conversation's existing projection for the target (stable pair)
+    // unless the caller explicitly asks for a fresh continuation. Never reuse
+    // the source file itself, which would rewrite the source in place.
+    let reuse_owned = if new {
+        None
+    } else {
+        projs
+            .iter()
+            .find(|(rt, _, _)| *rt == to)
+            .map(|(_, id, p)| (id.clone(), p.clone()))
+            .filter(|(_, p)| !same_file(&src_path, p))
+    };
+    let reuse = reuse_owned
+        .as_ref()
+        .map(|(id, p)| (id.as_str(), p.as_path()));
+    let mode = if reuse_owned.is_some() {
+        "refresh-existing"
+    } else {
+        "new-fork"
+    };
+
     if dry_run {
         let p = alembic::preview(&src_path)?;
+        if debug && !json {
+            trail::print_carry_debug(&src_path, &src_id, &conv_id, &slug, from_rt, to, n, reuse);
+        }
         if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "dry_run": true,
-                    "from": from_rt.label(),
-                    "to": to.label(),
-                    "messages": p.message_count,
-                    "root": p.root_name,
-                    "source": src_path.display().to_string(),
-                })
-            );
+            let mut out = serde_json::json!({
+                "dry_run": true,
+                "from": from_rt.label(),
+                "to": to.label(),
+                "messages": p.message_count,
+                "root": p.root_name,
+                "source": src_path.display().to_string(),
+            });
+            if debug {
+                out["debug"] = serde_json::json!({
+                    "conversation": conv_id,
+                    "source_id": src_id,
+                    "source_path": src_path.display().to_string(),
+                    "target_runtime": to.label(),
+                    "mode": mode,
+                    "new": new,
+                    "reuse_id": reuse_owned.as_ref().map(|(id, _)| id.as_str()),
+                    "next_event": format!("t{n:02}"),
+                });
+            }
+            println!("{out}");
         } else {
             println!(
                 "dry-run: would carry {} message(s) {} → {} (root: {})",
@@ -208,28 +267,9 @@ fn run_carry(rest: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Trail: which conversation this source belongs to, the next hop number, and
-    // any existing projection for the target — so repeated headless carries reuse
-    // the stable pair (overwrite Constant's own projection) instead of minting a
-    // new file every time, exactly like the interactive harness.
-    let (conv_id, last_n, projs) = trail::resume(&src_path, &src_id);
-    let slug = trail::slug(
-        &alembic::root_name(&src_path, from_rt).unwrap_or_else(|| "conversation".to_string()),
-    );
-    let n = last_n + 1;
-    let title = trail::title(n, from_rt, &slug);
-
-    // Reuse the conversation's existing projection for the target (stable pair) —
-    // but NEVER one that is the source file we're reading, which would rewrite the
-    // source in place (e.g. a same-runtime carry). Mint a fresh one in that case.
-    let reuse_owned = projs
-        .into_iter()
-        .find(|(rt, _, _)| *rt == to)
-        .map(|(_, id, p)| (id, p))
-        .filter(|(_, p)| !same_file(&src_path, p));
-    let reuse = reuse_owned
-        .as_ref()
-        .map(|(id, p)| (id.as_str(), p.as_path()));
+    if debug && !json {
+        trail::print_carry_debug(&src_path, &src_id, &conv_id, &slug, from_rt, to, n, reuse);
+    }
     let (id, written, cwd) = alembic::distill_path(&src_path, to, reuse, Some(&title))?;
     // Record the trail under the CONVERSATION's own cwd (carried from the source
     // session), not the directory `carry` happened to be invoked from — so
@@ -240,11 +280,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
         &conv_id,
         &slug,
         cwd.as_deref().or(here.as_deref()),
+        &src_id,
+        &src_path,
         from_rt,
         to,
         &id,
         &written,
         &title,
+        mode,
     );
 
     let resume = match to {
@@ -253,14 +296,27 @@ fn run_carry(rest: &[String]) -> Result<()> {
     };
 
     if json {
-        let out = serde_json::json!({
-            "id": id,
+        let mut out = serde_json::json!({
+            "id": &id,
             "from": from_rt.label(),
             "to": to.label(),
             "cwd": cwd.as_ref().map(|p| p.display().to_string()),
-            "resume": resume,
-            "trail": title,
+            "resume": &resume,
+            "trail": &title,
         });
+        if debug {
+            out["debug"] = serde_json::json!({
+                "conversation": conv_id,
+                "source_id": src_id,
+                "source_path": src_path.display().to_string(),
+                "target_runtime": to.label(),
+                "mode": mode,
+                "new": new,
+                "target_id": &id,
+                "target_path": written.display().to_string(),
+                "next_event": format!("t{n:02}"),
+            });
+        }
         println!("{out}");
     } else {
         println!("carried → {} session {id}  ({title})", to.label());
@@ -337,14 +393,114 @@ fn run_export(rest: &[String]) -> Result<()> {
 
 fn run_trail(rest: &[String]) -> Result<()> {
     let mut all = false;
+    let mut events = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--all" => all = true,
+            "--events" => events = true,
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    if events {
+        trail::print_events(cwd.as_deref())
+    } else {
+        trail::print(cwd.as_deref())
+    }
+}
+
+fn run_route(rest: &[String]) -> Result<()> {
+    let mut all = false;
+    let mut session: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--session" => {
+                session = Some(PathBuf::from(flag_value(rest, i, "--session")?));
+                i += 2;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+
+    if let Some(session) = session {
+        let resolved = alembic::resolve_session(&session)?;
+        let (_, id) = alembic::identify(&resolved)
+            .with_context(|| format!("could not identify session {}", resolved.display()))?;
+        let (conv_id, _, _) = trail::resume(&resolved, &id);
+        return trail::print_routes(None, Some(&conv_id));
+    }
+
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    trail::print_routes(cwd.as_deref(), None)
+}
+
+fn run_status(rest: &[String]) -> Result<()> {
+    let mut all = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
             other => bail!("unknown flag: {other}"),
         }
     }
-    let cwd = if all { None } else { std::env::current_dir().ok() };
-    trail::print(cwd.as_deref())
+
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+
+    println!("constant status");
+    match &cwd {
+        Some(cwd) => println!("project: {}", term_safe(&cwd.display().to_string())),
+        None => println!("scope: all projects"),
+    }
+
+    let d = alembic::doctor();
+    let mark = |b: bool| if b { "ok" } else { "missing" };
+    println!("\nruntimes:");
+    println!(
+        "  codex  : {} (cli {}, sessions {}, db {})",
+        d.codex_version.as_deref().unwrap_or("not found"),
+        mark(d.codex_version.is_some()),
+        mark(d.codex_store),
+        mark(d.codex_db),
+    );
+    println!(
+        "  claude : {} (cli {}, projects {})",
+        d.claude_version.as_deref().unwrap_or("not found"),
+        mark(d.claude_version.is_some()),
+        mark(d.claude_store),
+    );
+
+    println!();
+    trail::print_status(cwd.as_deref())?;
+
+    println!("\nlatest sessions:");
+    for rt in [Runtime::Codex, Runtime::Claude] {
+        // Keep `status` cheap and privacy-minimal: no transcript reads here.
+        // Use `constant sessions --titles` when the prompt-derived title is wanted.
+        let sessions = alembic::list_sessions(rt, cwd.as_deref(), false);
+        if let Some(s) = sessions.first() {
+            println!("  {:<6} {}", s.runtime, term_safe(&s.id));
+        } else {
+            println!("  {:<6} none", rt.label());
+        }
+    }
+    Ok(())
 }
 
 fn run_sessions(rest: &[String]) -> Result<()> {
@@ -375,7 +531,11 @@ fn run_sessions(rest: &[String]) -> Result<()> {
         }
     }
 
-    let cwd = if all { None } else { std::env::current_dir().ok() };
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
     let runtimes = match from {
         Some(s) => vec![Runtime::parse(&s)?],
         None => vec![Runtime::Codex, Runtime::Claude],
@@ -403,7 +563,11 @@ fn run_sessions(rest: &[String]) -> Result<()> {
             .collect();
         println!("{}", serde_json::Value::Array(arr));
     } else if sessions.is_empty() {
-        let scope = if all { "" } else { " in this directory (try --all)" };
+        let scope = if all {
+            ""
+        } else {
+            " in this directory (try --all)"
+        };
         println!("no sessions found{scope}");
     } else {
         for s in &sessions {
@@ -479,10 +643,12 @@ USAGE:
   constant host [codex|claude] [--prefix C-t]
         Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B)
 
-  constant carry --to codex|claude [--from codex|claude | --session PATH] [--json] [--dry-run]
+  constant carry --to codex|claude [--from codex|claude | --session PATH] [--json] [--dry-run] [--debug] [--new]
         Headless: carry a conversation into the target runtime's native session and
         print the resume command (no terminal). --json for machine output;
-        --dry-run previews without writing. (`distill` is an alias.)
+        --dry-run previews without writing; --debug shows the route decision;
+        --new creates a fresh target continuation instead of refreshing one.
+        (`distill` is an alias.)
 
   constant sessions [--from codex|claude] [--all] [--titles] [--json]
         List carryable sessions (this directory, or --all). --titles adds a preview
@@ -495,8 +661,14 @@ USAGE:
   constant doctor [--json]
         Preflight: which runtimes/versions are installed and whether supported.
 
-  constant trail [--all]
-        Show the switch lineage (per directory, or --all) from ~/.constant/trail.jsonl
+  constant status [--all]
+        Show current project, runtime readiness, latest sessions, and Constant trail.
+
+  constant trail [--all] [--events]
+        Show current projections by conversation. --events shows the raw switch ledger.
+
+  constant route [--all] [--session PATH_OR_ID]
+        Show the reconstructed fork graph with aliases like codex[1] and claude[1.1].
 
 PREFIX KEY:
   Default is Ctrl-B. If you run inside tmux (which also uses Ctrl-B), pick another:
@@ -504,10 +676,12 @@ PREFIX KEY:
       CONSTANT_PREFIX=C-g constant host codex
 
 INSIDE A HOSTED SESSION (press the prefix, then):
-  c              switch to claude
-  x              switch to codex
-  :              open the command line (e.g. `switch claude`, `quit`)
-  d              detach / quit the harness
+  c              continue in claude
+  C              create a new claude continuation
+  x              continue in codex
+  X              create a new codex continuation
+  :              open the command line (e.g. `switch claude`, `new claude`, `quit`)
+  d              detach / quit Constant
   <prefix> again send a literal prefix key to the child
 "#
     );

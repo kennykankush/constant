@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
 use crate::runtime::Runtime;
@@ -121,8 +121,7 @@ pub fn distill_path(
     // Stamp the target's native resume-picker name. `title` is the trail name
     // (`constant·tNN·from-…`) when carried by the harness; otherwise we fall
     // back to the conversation's first user message.
-    let first_msg =
-        first_user_text(&session).unwrap_or_else(|| "carried conversation".to_string());
+    let first_msg = first_user_text(&session).unwrap_or_else(|| "carried conversation".to_string());
     match to_fmt {
         // Codex's picker filters on has_user_event=1 + native source, so stamp
         // our row to look native; set `title`/`preview` to the trail name.
@@ -194,7 +193,12 @@ fn detect_codex_version() -> Option<String> {
                 .ok()?;
             let text = String::from_utf8_lossy(&output.stdout);
             text.split_whitespace()
-                .find(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .find(|t| {
+                    t.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                })
                 .map(str::to_string)
         })
         .clone()
@@ -211,7 +215,7 @@ fn upsert_codex_thread(
     title: &str,
     first_msg: &str,
 ) -> Result<()> {
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
     let db = formats::default_output_root(SessionFormat::Codex)?.join("state_5.sqlite");
     if !db.exists() {
         return Ok(());
@@ -282,7 +286,11 @@ fn session_id_of(path: &Path, fmt: SessionFormat) -> Option<String> {
             let mut first = String::new();
             BufReader::new(file).read_line(&mut first).ok()?;
             let value: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
-            value.get("payload")?.get("id")?.as_str().map(str::to_string)
+            value
+                .get("payload")?
+                .get("id")?
+                .as_str()
+                .map(str::to_string)
         }
         SessionFormat::Ir => None,
     }
@@ -422,7 +430,12 @@ fn detect_claude_version() -> Option<String> {
             let text = String::from_utf8_lossy(&output.stdout);
             text.split_whitespace()
                 .next()
-                .filter(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .filter(|t| {
+                    t.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                })
                 .map(str::to_string)
         })
         .clone()
@@ -471,11 +484,9 @@ fn find_child_session(from: SessionFormat, host_cwd: Option<&Path>) -> Option<Pa
         // Cheap cwd filter before the full-content conversation check.
         let cwd_ok = match (from, host_cwd) {
             (_, None) => true,
-            (SessionFormat::Codex, Some(c)) => {
-                codex_session_cwd(&path)
-                    .map(|rec| same_dir(&rec, c))
-                    .unwrap_or(false)
-            }
+            (SessionFormat::Codex, Some(c)) => codex_session_cwd(&path)
+                .map(|rec| same_dir(&rec, c))
+                .unwrap_or(false),
             (SessionFormat::Claude, Some(_)) => {
                 path.parent()
                     .and_then(|p| p.file_name())
@@ -577,7 +588,11 @@ pub struct SessionSummary {
 /// `with_titles` is opt-in because deriving a title fully loads + sanitizes each
 /// transcript; on a large store that's expensive, so bulk discovery defaults to
 /// metadata only and titles are computed only when explicitly requested.
-pub fn list_sessions(runtime: Runtime, cwd: Option<&Path>, with_titles: bool) -> Vec<SessionSummary> {
+pub fn list_sessions(
+    runtime: Runtime,
+    cwd: Option<&Path>,
+    with_titles: bool,
+) -> Vec<SessionSummary> {
     let fmt = session_format(runtime);
     let Ok(root) = formats::default_output_root(fmt) else {
         return Vec::new();
@@ -633,7 +648,10 @@ pub fn list_sessions(runtime: Runtime, cwd: Option<&Path>, with_titles: bool) ->
             // transcript on a large store.
             let (has_conversation, title) = if with_titles {
                 let has = has_conversation(&path, fmt);
-                (Some(has), if has { root_name(&path, runtime) } else { None })
+                (
+                    Some(has),
+                    if has { root_name(&path, runtime) } else { None },
+                )
             } else {
                 (None, None)
             };
@@ -801,20 +819,32 @@ mod tests {
         let basic = redact("Authorization: Basic dXNlcjpwYXNzd29yZA==");
         assert!(!basic.contains("dXNlcjpwYXNz"), "basic leaked: {basic}");
         let apikey = redact("Authorization: ApiKey supersecretvalue123");
-        assert!(!apikey.contains("supersecretvalue123"), "apikey leaked: {apikey}");
+        assert!(
+            !apikey.contains("supersecretvalue123"),
+            "apikey leaked: {apikey}"
+        );
         // Bare bearer scheme outside a header.
         let bare = redact("bearer abcDEF123.456_tok-en");
         assert!(!bare.contains("abcDEF123"), "bare bearer leaked: {bare}");
         // Quoted JSON/header-object forms.
         let json_basic = redact(r#"{"Authorization":"Basic dXNlcjpwYXNzd29yZA=="}"#);
-        assert!(!json_basic.contains("dXNlcjpwYXNz"), "quoted basic leaked: {json_basic}");
+        assert!(
+            !json_basic.contains("dXNlcjpwYXNz"),
+            "quoted basic leaked: {json_basic}"
+        );
         let json_api = redact(r#"{"authorization": "ApiKey supersecretvalue123"}"#);
-        assert!(!json_api.contains("supersecretvalue123"), "quoted apikey leaked: {json_api}");
+        assert!(
+            !json_api.contains("supersecretvalue123"),
+            "quoted apikey leaked: {json_api}"
+        );
     }
 
     #[test]
     fn redact_keeps_plain_prose() {
-        assert_eq!(redact("just a normal sentence about cats"), "just a normal sentence about cats");
+        assert_eq!(
+            redact("just a normal sentence about cats"),
+            "just a normal sentence about cats"
+        );
     }
 
     // --- scaffold detection ---
@@ -831,7 +861,10 @@ mod tests {
 
     #[test]
     fn cwd_slug_matches_claude_convention() {
-        assert_eq!(cwd_slug(Path::new("/Users/x/dev/constant")), "-Users-x-dev-constant");
+        assert_eq!(
+            cwd_slug(Path::new("/Users/x/dev/constant")),
+            "-Users-x-dev-constant"
+        );
     }
 
     #[test]
@@ -877,8 +910,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("carry me across please"), "{target:?} lost user turn: {text}");
-        assert!(text.contains("carried, here I am"), "{target:?} lost assistant turn: {text}");
+        assert!(
+            text.contains("carry me across please"),
+            "{target:?} lost user turn: {text}"
+        );
+        assert!(
+            text.contains("carried, here I am"),
+            "{target:?} lost assistant turn: {text}"
+        );
     }
 
     #[test]
@@ -911,7 +950,10 @@ mod tests {
             .expect("carry");
 
         let after = fs::read(&src).expect("read source after");
-        assert_eq!(before, after, "carry modified the source file — F1 violation");
+        assert_eq!(
+            before, after,
+            "carry modified the source file — F1 violation"
+        );
         assert!(out.exists(), "carry did not write the target");
     }
 
@@ -967,7 +1009,10 @@ mod tests {
         formats::write_ir(&session, &src).expect("write IR source");
 
         let (json, _n) = export_ir(&src).expect("export");
-        assert!(!json.contains("sk-ABCDEFGHIJKLMNOP"), "text key leaked: {json}");
+        assert!(
+            !json.contains("sk-ABCDEFGHIJKLMNOP"),
+            "text key leaked: {json}"
+        );
         assert!(!json.contains("sk-DATALEAK"), "block.data leaked");
         assert!(!json.contains("sk-METALEAK"), "message metadata leaked");
         assert!(!json.contains("sk-EXTRALEAK"), "metadata.extra leaked");

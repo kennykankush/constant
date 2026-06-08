@@ -1,6 +1,6 @@
 //! Runtime definitions: which agent CLIs Constant can host, and how to launch them.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use portable_pty::CommandBuilder;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
