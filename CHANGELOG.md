@@ -49,6 +49,16 @@ carry pipeline made definite.
   moved to a per-process temp path.
 
 ### Added
+- **`--with-tools` carry (experimental).** Opt-in on `carry`, `host`, and
+  `resume`: tool calls and results are carried across the runtime boundary
+  instead of dropped. Every string anywhere in their JSON payloads goes through
+  the full redactor set, oversized tool outputs are capped (a file dump must
+  not ride into the target's context window), and reasoning stays dropped
+  (model-internal, never carried). Tool records written into claude sessions
+  carry the strict resume schema (`entrypoint`/`requestId`). Record volumes
+  written from a with-tools carry hold the (redacted, capped) tools too, and
+  `restore` reprints whatever the record holds. The receipt distinguishes
+  `kept N tool events` from `dropped N tool events`.
 - **`constant resume [QUERY]`** — re-host a conversation straight from the
   trail: picks its latest projection and opens it live in the harness with the
   session identity declared from birth (no filesystem detection). No QUERY

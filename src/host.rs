@@ -535,6 +535,7 @@ pub fn debug_keys() -> Result<()> {
 pub fn run(
     initial: Runtime,
     resume: Option<&str>,
+    with_tools: bool,
     prefix: u8,
     prefix_label: String,
 ) -> Result<()> {
@@ -719,7 +720,7 @@ pub fn run(
 
                     // Load + distill the source ONCE; naming and the carry share it.
                     let distilled = src.as_ref().map(|(src_path, _)| {
-                        crate::alembic::distill_source(src_path)
+                        crate::alembic::distill_source(src_path, with_tools)
                     });
 
                     let spawned = match (src, distilled) {

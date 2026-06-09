@@ -69,6 +69,7 @@ fn term_safe(s: &str) -> String {
 fn run_host(rest: &[String]) -> Result<()> {
     let mut runtime_str = "codex".to_string();
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
+    let mut with_tools = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -80,6 +81,10 @@ fn run_host(rest: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--prefix needs a value, e.g. --prefix C-t"))?;
                 i += 2;
             }
+            "--with-tools" => {
+                with_tools = true;
+                i += 1;
+            }
             s if !s.starts_with('-') => {
                 runtime_str = s.to_string();
                 i += 1;
@@ -89,7 +94,13 @@ fn run_host(rest: &[String]) -> Result<()> {
     }
 
     let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
-    host::run(Runtime::parse(&runtime_str)?, None, prefix_byte, prefix_label)
+    host::run(
+        Runtime::parse(&runtime_str)?,
+        None,
+        with_tools,
+        prefix_byte,
+        prefix_label,
+    )
 }
 
 fn run_carry(rest: &[String]) -> Result<()> {
@@ -100,10 +111,15 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut debug = false;
     let mut new = false;
+    let mut with_tools = false;
 
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--with-tools" => {
+                with_tools = true;
+                i += 1;
+            }
             "--from" => {
                 from = Some(flag_value(rest, i, "--from")?);
                 i += 2;
@@ -166,7 +182,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
 
     // Load + distill ONCE — the trail name, the dry-run preview, and the carry
     // itself all share the same parsed source.
-    let mut distilled = alembic::distill_source(&src_path)?;
+    let mut distilled = alembic::distill_source(&src_path, with_tools)?;
     let root = distilled.root_name();
 
     // Trail: which conversation this source belongs to, the next hop number, and
@@ -202,7 +218,9 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let receipt = distilled.receipt;
     let receipt_json = serde_json::json!({
         "turns": receipt.turns,
+        "tools": receipt.tools,
         "dropped_tools": receipt.dropped_tools,
+        "dropped_reasoning": receipt.dropped_reasoning,
         "dropped_scaffold": receipt.dropped_scaffold,
         "redactions": receipt.redactions,
     });
@@ -424,11 +442,16 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     let mut runtime_in: Option<Runtime> = None;
     let mut all = false;
     let mut list = false;
+    let mut with_tools = false;
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
 
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--with-tools" => {
+                with_tools = true;
+                i += 1;
+            }
             "--in" => {
                 runtime_in = Some(Runtime::parse(&flag_value(rest, i, "--in")?)?);
                 i += 2;
@@ -548,7 +571,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     if let Some(n) = &note {
         println!("{n}");
     }
-    host::run(rt, Some(&id), prefix_byte, prefix_label)
+    host::run(rt, Some(&id), with_tools, prefix_byte, prefix_label)
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
@@ -604,7 +627,9 @@ fn restore_session(source: &Path, to_override: Option<Runtime>) -> Result<Restor
     // Default target: the runtime the recorded conversation came from.
     let to = to_override.unwrap_or(src_rt);
 
-    let mut distilled = alembic::distill_source(&resolved)?;
+    // Fidelity to the record: a restore reprints what the volume holds — if
+    // tools were carried into it, they come back out (already redacted/capped).
+    let mut distilled = alembic::distill_source(&resolved, true)?;
     let root = distilled.root_name();
     let (conv_id, last_n, _) = trail::resume(&resolved, &src_id);
     let slug = trail::slug(&root.unwrap_or_else(|| "conversation".to_string()));
@@ -702,7 +727,9 @@ fn run_restore(rest: &[String]) -> Result<()> {
                 "trail": &title,
                 "receipt": {
                     "turns": receipt.turns,
+                    "tools": receipt.tools,
                     "dropped_tools": receipt.dropped_tools,
+                    "dropped_reasoning": receipt.dropped_reasoning,
                     "dropped_scaffold": receipt.dropped_scaffold,
                     "redactions": receipt.redactions,
                 },
@@ -950,17 +977,20 @@ fn print_help() {
         r#"Constant — one conversation, any agent runtime.
 
 USAGE:
-  constant host [codex|claude] [--prefix C-t]
+  constant host [codex|claude] [--prefix C-t] [--with-tools]
         Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B)
 
-  constant carry --to codex|claude [--from codex|claude | --session PATH] [--json] [--dry-run] [--debug] [--new]
+  constant carry --to codex|claude [--from codex|claude | --session PATH] [--json] [--dry-run] [--debug] [--new] [--with-tools]
         Headless: carry a conversation into the target runtime's native session and
         print the resume command (no terminal). --json for machine output;
         --dry-run previews without writing; --debug shows the route decision;
         --new creates a fresh target continuation instead of refreshing one.
         (`distill` is an alias.)
 
-  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t]
+        --with-tools (experimental, also on host/resume): carry tool calls and
+        results too — redacted and size-capped. Default carries conversation only.
+
+  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t] [--with-tools]
         Re-host a conversation from the trail: wakes its latest projection live
         (prefix switching ready). No QUERY = the newest conversation here;
         QUERY matches the slug or conversation id. If every projection is gone,

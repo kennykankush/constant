@@ -103,8 +103,12 @@ pub fn claude_supports_session_id() -> bool {
 pub struct CarryReceipt {
     /// User/assistant turns carried.
     pub turns: usize,
-    /// Tool calls/results + reasoning events dropped (the agentic layer).
+    /// Tool calls/results carried (only in `--with-tools` mode).
+    pub tools: usize,
+    /// Tool calls/results dropped (the default, conversation-only mode).
     pub dropped_tools: usize,
+    /// Reasoning events dropped (always — model-internal, never carried).
+    pub dropped_reasoning: usize,
     /// Runtime-scaffold user turns dropped.
     pub dropped_scaffold: usize,
     /// Secrets burned off by redaction.
@@ -112,15 +116,21 @@ pub struct CarryReceipt {
 }
 
 impl CarryReceipt {
-    /// One human line, e.g. `carried 14 turns · dropped 6 tool events · 2 redactions`.
+    /// One human line, e.g. `carried 14 turns · kept 6 tool events · 2 redactions`.
     pub fn summary(&self) -> String {
         let mut parts = vec![format!(
             "carried {} turn{}",
             self.turns,
             if self.turns == 1 { "" } else { "s" }
         )];
+        if self.tools > 0 {
+            parts.push(format!("kept {} tool events", self.tools));
+        }
         if self.dropped_tools > 0 {
             parts.push(format!("dropped {} tool events", self.dropped_tools));
+        }
+        if self.dropped_reasoning > 0 {
+            parts.push(format!("dropped {} reasoning", self.dropped_reasoning));
         }
         if self.dropped_scaffold > 0 {
             parts.push(format!("dropped {} scaffold", self.dropped_scaffold));
@@ -160,10 +170,12 @@ pub fn write_snapshot(session: &UniversalSession, path: &Path) -> Result<()> {
 }
 
 /// Phase 1: load a source session and distill it (sanitize + redact).
-pub fn distill_source(src: &Path) -> Result<Distilled> {
+/// `keep_tools` carries (redacted, size-capped) tool calls/results instead of
+/// dropping the agentic layer — the conversation-only default.
+pub fn distill_source(src: &Path, keep_tools: bool) -> Result<Distilled> {
     let mut session = formats::load_session(src, SourceFormat::Auto)
         .with_context(|| format!("failed to read {}", src.display()))?;
-    let receipt = sanitize(&mut session);
+    let receipt = sanitize(&mut session, keep_tools);
     Ok(Distilled { session, receipt })
 }
 
@@ -267,7 +279,7 @@ pub fn distill_path(
     reuse: Option<(&str, &Path)>,
     title: Option<&str>,
 ) -> Result<(String, PathBuf, Option<PathBuf>, CarryReceipt)> {
-    let mut distilled = distill_source(src)?;
+    let mut distilled = distill_source(src, false)?;
     let (id, written, cwd) = distill_write(&mut distilled, src, to, reuse, title)?;
     Ok((id, written, cwd, distilled.receipt))
 }
@@ -275,7 +287,7 @@ pub fn distill_path(
 /// The conversation's root handle: the first real user message in `path`,
 /// sanitized the same way a carry would. Used to name the trail.
 pub fn root_name(path: &Path, _from: Runtime) -> Option<String> {
-    distill_source(path).ok().and_then(|d| d.root_name())
+    distill_source(path, false).ok().and_then(|d| d.root_name())
 }
 
 /// First user message text (for the codex thread title/preview).
@@ -516,16 +528,42 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 /// `block.data` payloads and per-message metadata — which the loaders preserve
 /// and could carry secrets the text redactor never sees — are dropped outright,
 /// exactly as the IR export does. Returns a receipt of what was done.
-fn sanitize(session: &mut UniversalSession) -> CarryReceipt {
+///
+/// `keep_tools` carries tool calls/results too — every string anywhere in
+/// their JSON payloads is redacted, and oversized tool outputs are capped (a
+/// file dump must not ride along into the target's context). Reasoning is
+/// dropped either way: it's model-internal, not conversation or tool history.
+fn sanitize(session: &mut UniversalSession, keep_tools: bool) -> CarryReceipt {
     let mut receipt = CarryReceipt::default();
     let mut kept = Vec::new();
     for event in std::mem::take(&mut session.events) {
-        // Drop reasoning, tool calls, and tool results — the agentic layer is
-        // lossy across runtimes anyway; we carry the conversation, not the tools.
-        let SessionEvent::Message(mut message) = event else {
-            receipt.dropped_tools += 1;
-            continue;
+        let message = match event {
+            SessionEvent::Message(message) => message,
+            SessionEvent::Reasoning(_) => {
+                receipt.dropped_reasoning += 1;
+                continue;
+            }
+            SessionEvent::ToolCall(mut call) if keep_tools => {
+                call.metadata.clear();
+                receipt.redactions += redact_value(&mut call.arguments);
+                receipt.tools += 1;
+                kept.push(SessionEvent::ToolCall(call));
+                continue;
+            }
+            SessionEvent::ToolResult(mut result) if keep_tools => {
+                result.metadata.clear();
+                receipt.redactions += redact_value(&mut result.output);
+                truncate_tool_output(&mut result.output);
+                receipt.tools += 1;
+                kept.push(SessionEvent::ToolResult(result));
+                continue;
+            }
+            SessionEvent::ToolCall(_) | SessionEvent::ToolResult(_) => {
+                receipt.dropped_tools += 1;
+                continue;
+            }
         };
+        let mut message = message;
         // Drop developer/system scaffold messages outright.
         if message.role != "user" && message.role != "assistant" {
             receipt.dropped_scaffold += 1;
@@ -572,6 +610,45 @@ fn sanitize(session: &mut UniversalSession) -> CarryReceipt {
     }
     session.events = kept;
     receipt
+}
+
+/// Redact every string anywhere inside a JSON value (tool arguments/outputs
+/// are arbitrary nested JSON — the text redactor must reach all of it).
+/// Returns how many secrets were burned.
+fn redact_value(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => {
+            let (out, n) = redact(s);
+            *s = out;
+            n
+        }
+        serde_json::Value::Array(items) => items.iter_mut().map(redact_value).sum(),
+        serde_json::Value::Object(map) => map.values_mut().map(redact_value).sum(),
+        _ => 0,
+    }
+}
+
+/// Cap a carried tool output. A multi-megabyte file dump in one tool result
+/// would ride straight into the target runtime's context window on resume —
+/// clean over comprehensive.
+const TOOL_OUTPUT_CAP: usize = 10_000;
+
+fn truncate_tool_output(output: &mut serde_json::Value) {
+    let rendered_len = match &*output {
+        serde_json::Value::String(s) => s.len(),
+        other => serde_json::to_string(other).map(|t| t.len()).unwrap_or(0),
+    };
+    if rendered_len <= TOOL_OUTPUT_CAP {
+        return;
+    }
+    let text = match &*output {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let cut: String = text.chars().take(TOOL_OUTPUT_CAP).collect();
+    *output = serde_json::Value::String(format!(
+        "{cut}\n… [truncated by constant: tool output exceeded {TOOL_OUTPUT_CAP} chars]"
+    ));
 }
 
 fn is_scaffold(text: &str) -> bool {
@@ -1020,7 +1097,7 @@ pub fn doctor() -> DoctorReport {
 pub fn export_ir(src: &Path) -> Result<(String, usize)> {
     let mut session = formats::load_session(src, SourceFormat::Auto)
         .with_context(|| format!("failed to read {}", src.display()))?;
-    let _ = sanitize(&mut session);
+    let _ = sanitize(&mut session, false);
     // Defense in depth: `sanitize` already drops nested `block.data` payloads
     // and per-message metadata (the redaction invariant on every path), but a
     // master file is the artifact people share — strip again explicitly.
@@ -1175,14 +1252,81 @@ mod tests {
             metadata: BTreeMap::new(),
         }));
 
-        let receipt = sanitize(&mut session);
+        let receipt = sanitize(&mut session, false);
         let json = serde_json::to_string(&session.events).unwrap();
         assert!(!json.contains("sk-DATALEAK"), "block.data leaked: {json}");
         assert!(!json.contains("sk-METALEAK"), "metadata leaked: {json}");
         assert!(!json.contains("sk-ABCDEFGHIJKLMNOP"), "text leaked: {json}");
         assert_eq!(receipt.turns, 2);
-        assert_eq!(receipt.dropped_tools, 1);
+        assert_eq!(receipt.dropped_reasoning, 1);
         assert_eq!(receipt.redactions, 1);
+    }
+
+    // --- with-tools: tool events carried, recursively redacted, size-capped ---
+
+    fn tool_session() -> UniversalSession {
+        let mut session = UniversalSession::new("t-0001".to_string());
+        session.events.push(msg("user", "run the deploy"));
+        session.events.push(SessionEvent::ToolCall(ir::ToolCallEvent {
+            id: None,
+            parent_id: None,
+            call_id: "c1".to_string(),
+            name: "bash".to_string(),
+            timestamp: None,
+            arguments: serde_json::json!({
+                "command": "curl -H 'Authorization: Bearer sk-ARGLEAK1234567890abcd'"
+            }),
+            metadata: BTreeMap::new(),
+        }));
+        session.events.push(SessionEvent::ToolResult(ir::ToolResultEvent {
+            id: None,
+            parent_id: None,
+            call_id: "c1".to_string(),
+            timestamp: None,
+            output: serde_json::json!({"stdout": "token: sk-OUTLEAK1234567890abcd ok"}),
+            is_error: false,
+            metadata: BTreeMap::new(),
+        }));
+        session.events.push(msg("assistant", "deployed"));
+        session
+    }
+
+    #[test]
+    fn sanitize_with_tools_keeps_and_redacts_tool_events() {
+        let mut session = tool_session();
+        let receipt = sanitize(&mut session, true);
+        assert_eq!(receipt.turns, 2);
+        assert_eq!(receipt.tools, 2);
+        assert_eq!(receipt.dropped_tools, 0);
+        assert!(receipt.redactions >= 2, "receipt: {receipt:?}");
+        let json = serde_json::to_string(&session.events).unwrap();
+        assert!(json.contains("tool_call"), "tool call lost: {json}");
+        assert!(json.contains("tool_result"), "tool result lost: {json}");
+        assert!(!json.contains("sk-ARGLEAK"), "argument secret leaked: {json}");
+        assert!(!json.contains("sk-OUTLEAK"), "output secret leaked: {json}");
+    }
+
+    #[test]
+    fn sanitize_without_tools_still_drops_them() {
+        let mut session = tool_session();
+        let receipt = sanitize(&mut session, false);
+        assert_eq!(receipt.tools, 0);
+        assert_eq!(receipt.dropped_tools, 2);
+        let json = serde_json::to_string(&session.events).unwrap();
+        assert!(!json.contains("tool_call"), "tools should be dropped: {json}");
+    }
+
+    #[test]
+    fn oversized_tool_output_is_capped() {
+        let mut output = serde_json::Value::String("x".repeat(TOOL_OUTPUT_CAP * 3));
+        truncate_tool_output(&mut output);
+        let text = output.as_str().unwrap();
+        assert!(text.len() < TOOL_OUTPUT_CAP + 200, "not capped: {}", text.len());
+        assert!(text.contains("[truncated by constant"), "no marker");
+        // Small outputs pass through untouched.
+        let mut small = serde_json::json!({"stdout": "ok"});
+        truncate_tool_output(&mut small);
+        assert_eq!(small, serde_json::json!({"stdout": "ok"}));
     }
 
     // --- scaffold detection ---

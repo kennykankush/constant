@@ -804,6 +804,113 @@ fn status_reports_runtime_trail_and_latest_sessions() {
     );
 }
 
+// --- with-tools: tool history carried, redacted, opt-in ---
+
+fn ir_fixture_with_tools(dir: &Path) -> PathBuf {
+    let path = dir.join("fixture-tools.json");
+    let ir = r#"{
+  "ir_version": "transession/v1",
+  "metadata": {
+    "session_id": "fixture-tools-0001",
+    "source_format": "codex",
+    "cwd": "/tmp/constant-cli-proj"
+  },
+  "events": [
+    { "kind": "message", "role": "user",
+      "blocks": [ { "kind": "text", "text": "deploy the service" } ] },
+    { "kind": "tool_call", "call_id": "c1", "name": "bash",
+      "arguments": { "command": "deploy --key sk-ARGSECRET1234567890ab" } },
+    { "kind": "tool_result", "call_id": "c1",
+      "output": "ok, used token: sk-OUTSECRET1234567890ab", "is_error": false },
+    { "kind": "message", "role": "assistant",
+      "blocks": [ { "kind": "text", "text": "deployed cleanly" } ] }
+  ]
+}"#;
+    std::fs::write(&path, ir).unwrap();
+    path
+}
+
+#[test]
+fn carry_with_tools_keeps_redacted_tool_history() {
+    let dir = tmpdir();
+    let fix = ir_fixture_with_tools(&dir);
+
+    // Default: conversation-only — tools dropped, receipt says so.
+    let plain = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(plain.status.success(), "{}", err(&plain));
+    let pv: serde_json::Value = serde_json::from_str(&out(&plain)).unwrap();
+    assert_eq!(pv["receipt"]["tools"].as_u64(), Some(0));
+    assert_eq!(pv["receipt"]["dropped_tools"].as_u64(), Some(2));
+
+    // Opt-in: tools carried (as a fresh sibling), redacted, schema-complete.
+    let with = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+            "--new",
+            "--with-tools",
+        ],
+    );
+    assert!(with.status.success(), "{}", err(&with));
+    let wv: serde_json::Value = serde_json::from_str(&out(&with)).unwrap();
+    assert_eq!(wv["receipt"]["tools"].as_u64(), Some(2), "{wv}");
+
+    // Find the written claude session containing the tool events.
+    let id = wv["id"].as_str().unwrap();
+    let projects = dir.join("claude").join("projects");
+    let mut session_file = None;
+    let mut stack = vec![projects];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().unwrap().to_string_lossy() == format!("{id}.jsonl") {
+                session_file = Some(p);
+            }
+        }
+    }
+    let text = std::fs::read_to_string(session_file.expect("tool projection missing")).unwrap();
+    assert!(text.contains("tool_use"), "tool call not materialized");
+    assert!(text.contains("tool_result"), "tool result not materialized");
+    assert!(
+        !text.contains("sk-ARGSECRET") && !text.contains("sk-OUTSECRET"),
+        "tool payload secrets leaked"
+    );
+    // The strict resume schema applies to tool records too.
+    let tool_line = text
+        .lines()
+        .find(|l| l.contains("tool_use"))
+        .expect("tool_use line");
+    assert!(
+        tool_line.contains("\"entrypoint\":\"cli\"") && tool_line.contains("\"requestId\""),
+        "tool record missing resume-strict fields: {tool_line}"
+    );
+
+    // The record volume for the with-tools hop holds the tools too.
+    let snap = wv["snapshot"].as_str().expect("no snapshot");
+    let snap_text = std::fs::read_to_string(snap).unwrap();
+    assert!(
+        snap_text.contains("tool_call") && !snap_text.contains("sk-ARGSECRET"),
+        "record should hold redacted tools"
+    );
+}
+
 // --- constant resume: the ledger as the front door ---
 
 #[test]
