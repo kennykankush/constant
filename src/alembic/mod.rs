@@ -13,6 +13,7 @@
 
 pub mod formats;
 pub mod ir;
+pub(crate) mod sha256;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,11 +35,15 @@ pub fn identify(path: &Path) -> Option<(Runtime, String)> {
     match fmt {
         SessionFormat::Codex => Some((Runtime::Codex, session_id_of(path, fmt)?)),
         SessionFormat::Claude => Some((Runtime::Claude, session_id_of(path, fmt)?)),
+        SessionFormat::Gemini => Some((Runtime::Gemini, session_id_of(path, fmt)?)),
+        SessionFormat::OpenCode => Some((Runtime::OpenCode, session_id_of(path, fmt)?)),
         SessionFormat::Ir => {
             let session = formats::load_ir(path).ok()?;
             let runtime = match session.metadata.source_format? {
                 SessionFormat::Codex => Runtime::Codex,
                 SessionFormat::Claude => Runtime::Claude,
+                SessionFormat::Gemini => Runtime::Gemini,
+                SessionFormat::OpenCode => Runtime::OpenCode,
                 SessionFormat::Ir => return None,
             };
             Some((runtime, session.metadata.session_id))
@@ -62,10 +67,52 @@ pub fn active_session(
     host_cwd: Option<&Path>,
     since: Option<SystemTime>,
 ) -> Option<(PathBuf, String)> {
+    if from == Runtime::OpenCode {
+        // OpenCode sessions live in its sqlite store, not files: find the
+        // newest cwd-matching session there, then read it through a cache
+        // copy so the path-centric carry machinery applies unchanged.
+        let id = opencode_newest_session(host_cwd, since)?;
+        let path = formats::export_opencode_to_cache(&id).ok()?;
+        return Some((path, id));
+    }
     let from_fmt = session_format(from);
     let path = find_child_session(from_fmt, host_cwd, since)?;
     let id = session_id_of(&path, from_fmt)?;
     Some((path, id))
+}
+
+/// Newest opencode session for a directory (read-only sqlite), respecting the
+/// spawn-time fence and requiring at least one real message.
+fn opencode_newest_session(host_cwd: Option<&Path>, since: Option<SystemTime>) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+    let db = formats::opencode_data_root().ok()?.join("opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let fence_ms = since
+        .map(|s| s.checked_sub(Duration::from_secs(2)).unwrap_or(s))
+        .and_then(|s| s.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let cwd = host_cwd.map(|p| p.display().to_string());
+    let cwd_canon = host_cwd
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string());
+    conn.query_row(
+        "SELECT s.id FROM session s
+         WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
+           AND s.time_updated >= ?3
+           AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
+         ORDER BY s.time_updated DESC LIMIT 1",
+        rusqlite::params![cwd, cwd_canon, fence_ms],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 /// Resolve a session the harness POSITIVELY knows the child owns — by its
@@ -78,6 +125,8 @@ pub fn session_by_id(rt: Runtime, id: &str) -> Option<(PathBuf, String)> {
     let path = match fmt {
         SessionFormat::Codex => formats::resolve_codex_session_id(id).ok()?,
         SessionFormat::Claude => formats::resolve_claude_session_id(id).ok()?,
+        SessionFormat::Gemini => formats::resolve_gemini_session_id(id).ok()?,
+        SessionFormat::OpenCode => formats::export_opencode_to_cache(id).ok()?,
         SessionFormat::Ir => return None,
     };
     has_conversation(&path, fmt).then(|| (path, id.to_string()))
@@ -209,12 +258,20 @@ pub fn distill_write(
         bail!("no conversation to carry yet");
     }
 
+    if !supports_target(to) {
+        bail!(
+            "carrying INTO {} isn't supported yet — it works as a carry source",
+            to.label()
+        );
+    }
+
     let id = match reuse {
         Some((id, _)) => id.to_string(),
         None => match to_fmt {
             SessionFormat::Claude => Uuid::new_v4().to_string(),
             SessionFormat::Codex => Uuid::now_v7().to_string(),
-            SessionFormat::Ir => bail!("unsupported target"),
+            SessionFormat::OpenCode => formats::opencode::mint_id("ses"),
+            SessionFormat::Gemini | SessionFormat::Ir => bail!("unsupported target"),
         },
     };
     session.metadata.session_id = id.clone();
@@ -224,17 +281,32 @@ pub fn distill_write(
     session.metadata.platform_version = Some(match to {
         Runtime::Claude => detect_claude_version().unwrap_or_else(|| "2.1.154".to_string()),
         Runtime::Codex => detect_codex_version().unwrap_or_else(|| "0.137.0".to_string()),
+        Runtime::OpenCode => detect_opencode_version().unwrap_or_else(|| "1.14.48".to_string()),
+        Runtime::Gemini => detect_gemini_version().unwrap_or_else(|| "0.40.0".to_string()),
     });
+    // OpenCode shows info.title in its picker — stamp the trail name there.
+    if to_fmt == SessionFormat::OpenCode
+        && let Some(t) = title
+    {
+        session.metadata.title = Some(t.to_string());
+    }
 
     // Reuse → overwrite the SAME file in place. This is the fix for the "fork on
     // disk" bug: codex names rollouts `rollout-<ts>-<id>.jsonl`, so writing to
     // the home root each sync produced a SECOND file with the same id and a new
     // timestamp, and `/resume` then loaded the wrong (original) one. Writing
     // straight to the existing file keeps exactly one file per id.
-    let written = match reuse {
-        Some((_, path)) => formats::materialize(session, to_fmt, path)
+    let written = match (reuse, to_fmt) {
+        (Some((_, path)), _) => formats::materialize(session, to_fmt, path)
             .with_context(|| format!("failed to overwrite {} session", to.label()))?,
-        None => {
+        // OpenCode's store is a database; the Constant-owned file artifact is
+        // the cache copy, and `opencode import` (below) is the real write.
+        (None, SessionFormat::OpenCode) => {
+            let cache = formats::opencode_cache_path(&id)?;
+            formats::materialize(session, to_fmt, &cache)
+                .with_context(|| format!("failed to write {} session", to.label()))?
+        }
+        (None, _) => {
             let out_root = formats::default_output_root(to_fmt)?;
             formats::materialize(session, to_fmt, &out_root)
                 .with_context(|| format!("failed to write {} session", to.label()))?
@@ -263,10 +335,46 @@ pub fn distill_write(
                 let _ = stamp_claude_title(&written, &id, t);
             }
         }
-        SessionFormat::Ir => {}
+        // OpenCode's registry step IS `opencode import` — their supported
+        // door, which validates, preserves the id, and upserts on refresh.
+        // Like codex's sqlite row, this is REQUIRED for resume: failure fails
+        // the carry loudly (callers fall back to fresh).
+        SessionFormat::OpenCode => {
+            import_opencode(&written, &id)
+                .context("failed to register the opencode session (import)")?;
+        }
+        SessionFormat::Gemini | SessionFormat::Ir => {}
     }
 
     Ok((id, written, session.metadata.cwd.clone()))
+}
+
+/// Run `opencode import` on a materialized export file and verify it landed
+/// under the id we wrote (import preserves ids — verified live).
+fn import_opencode(file: &Path, expected: &str) -> Result<()> {
+    let out = std::process::Command::new("opencode")
+        .arg("import")
+        .arg(file)
+        .output()
+        .context("failed to run `opencode import` — is opencode on PATH?")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        bail!(
+            "opencode import failed: {} {}",
+            stdout.trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    match stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("Imported session: "))
+        .map(str::trim)
+    {
+        Some(id) if id == expected => Ok(()),
+        Some(id) => bail!("opencode import changed the session id ({id} != {expected})"),
+        None => bail!("opencode import did not confirm a session id"),
+    }
 }
 
 /// One-shot carry: load + distill + materialize. Returns (id, file, cwd, receipt).
@@ -470,6 +578,8 @@ fn session_id_of(path: &Path, fmt: SessionFormat) -> Option<String> {
                 .as_str()
                 .map(str::to_string)
         }
+        SessionFormat::Gemini => formats::gemini::session_id(path),
+        SessionFormat::OpenCode => formats::opencode::session_id(path),
         SessionFormat::Ir => None,
     }
 }
@@ -478,7 +588,15 @@ fn session_format(runtime: Runtime) -> SessionFormat {
     match runtime {
         Runtime::Codex => SessionFormat::Codex,
         Runtime::Claude => SessionFormat::Claude,
+        Runtime::Gemini => SessionFormat::Gemini,
+        Runtime::OpenCode => SessionFormat::OpenCode,
     }
+}
+
+/// Whether a runtime can be a carry TARGET. Gemini is source-only until its
+/// 0.40 session landing pad is verified live (see docs/third-runtime-formats.md).
+pub fn supports_target(runtime: Runtime) -> bool {
+    !matches!(runtime, Runtime::Gemini)
 }
 
 /// True when `b` resolves to the same file as `a` — the core F1 guard: even if
@@ -778,6 +896,40 @@ fn detect_claude_version() -> Option<String> {
         .clone()
 }
 
+/// Detect the installed gemini CLI version (e.g. "0.40.0"). Cached per process.
+fn detect_gemini_version() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let output = std::process::Command::new("gemini")
+                .arg("--version")
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.split_whitespace()
+                .find(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .map(str::to_string)
+        })
+        .clone()
+}
+
+/// Detect the installed opencode CLI version (e.g. "1.14.48"). Cached per process.
+fn detect_opencode_version() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let output = std::process::Command::new("opencode")
+                .arg("--version")
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.split_whitespace()
+                .find(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .map(str::to_string)
+        })
+        .clone()
+}
+
 /// Find the session this harness is hosting: newest `*.jsonl` under the runtime
 /// store whose recorded cwd matches `host_cwd` and whose mtime is at/after the
 /// child was spawned (`since`, with a small slack for filesystem timestamp
@@ -793,9 +945,19 @@ fn find_child_session(
     let search = root.join(match from {
         SessionFormat::Codex => "sessions",
         SessionFormat::Claude => "projects",
-        SessionFormat::Ir => return None,
+        SessionFormat::Gemini => "tmp",
+        // OpenCode is db-backed — discovery happens in opencode_newest_session.
+        SessionFormat::OpenCode | SessionFormat::Ir => return None,
     });
     let want_slug = host_cwd.map(cwd_slug);
+    let want_hash = host_cwd.map(|p| {
+        sha256::hex(
+            &p.canonicalize()
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string(),
+        )
+    });
     let fence = since.map(|s| s.checked_sub(Duration::from_secs(2)).unwrap_or(s));
 
     // Gather candidates by mtime only (cheap — no content reads), then check
@@ -818,7 +980,16 @@ fn find_child_session(
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            let ext = path.extension().and_then(|e| e.to_str());
+            let ext_ok = match from {
+                // Gemini sessions are .json (or .jsonl in newer versions) and
+                // live only under chats/ (logs.json etc. must not match).
+                SessionFormat::Gemini => {
+                    matches!(ext, Some("json") | Some("jsonl")) && formats::under_chats(&path)
+                }
+                _ => ext == Some("jsonl"),
+            };
+            if !ext_ok {
                 continue;
             }
             let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
@@ -847,7 +1018,11 @@ fn find_child_session(
                     .and_then(|n| n.to_str())
                     == want_slug.as_deref()
             }
-            (SessionFormat::Ir, _) => false,
+            // Gemini files record sha256(cwd) — scheme-independent evidence.
+            (SessionFormat::Gemini, Some(_)) => {
+                formats::gemini::session_project_hash(&path).as_deref() == want_hash.as_deref()
+            }
+            (SessionFormat::OpenCode, _) | (SessionFormat::Ir, _) => false,
         };
         if !cwd_ok {
             continue;
@@ -896,9 +1071,40 @@ fn has_conversation(path: &Path, from: SessionFormat) -> bool {
                         Some("user") | Some("assistant")
                     ) && v.get("message").is_some()
                 }
+                // Whole-document formats: the line-reader hands us the full
+                // text only for single-line files; parse the whole file instead.
+                SessionFormat::Gemini | SessionFormat::OpenCode => false,
                 SessionFormat::Ir => false,
             }
         })
+        || match from {
+            // Whole-document formats need a document parse, not a line scan.
+            SessionFormat::Gemini => fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| {
+                    v.get("messages").and_then(|m| {
+                        m.as_array().map(|a| {
+                            a.iter().any(|msg| {
+                                matches!(
+                                    msg.get("type").and_then(serde_json::Value::as_str),
+                                    Some("user") | Some("gemini")
+                                )
+                            })
+                        })
+                    })
+                })
+                .unwrap_or(false),
+            SessionFormat::OpenCode => fs::read_to_string(path)
+                .ok()
+                .and_then(|t| {
+                    let end = t.rfind('}').map(|i| i + 1)?;
+                    serde_json::from_str::<serde_json::Value>(&t[..end]).ok()
+                })
+                .and_then(|v| v.get("messages").and_then(|m| m.as_array().map(|a| !a.is_empty())))
+                .unwrap_or(false),
+            _ => false,
+        }
 }
 
 /// Compare a recorded cwd string to the host cwd, tolerant of trailing slashes
@@ -972,15 +1178,27 @@ pub fn list_sessions(
     with_titles: bool,
 ) -> Vec<SessionSummary> {
     let fmt = session_format(runtime);
+    if fmt == SessionFormat::OpenCode {
+        return list_opencode_sessions(cwd);
+    }
     let Ok(root) = formats::default_output_root(fmt) else {
         return Vec::new();
     };
     let search = root.join(match fmt {
         SessionFormat::Codex => "sessions",
         SessionFormat::Claude => "projects",
-        SessionFormat::Ir => return Vec::new(),
+        SessionFormat::Gemini => "tmp",
+        SessionFormat::OpenCode | SessionFormat::Ir => return Vec::new(),
     });
     let want_slug = cwd.map(cwd_slug);
+    let want_hash = cwd.map(|p| {
+        sha256::hex(
+            &p.canonicalize()
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string(),
+        )
+    });
 
     let mut out = Vec::new();
     let mut stack = vec![search];
@@ -998,7 +1216,14 @@ pub fn list_sessions(
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            let ext = path.extension().and_then(|e| e.to_str());
+            let ext_ok = match fmt {
+                SessionFormat::Gemini => {
+                    matches!(ext, Some("json") | Some("jsonl")) && formats::under_chats(&path)
+                }
+                _ => ext == Some("jsonl"),
+            };
+            if !ext_ok {
                 continue;
             }
             let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
@@ -1019,7 +1244,11 @@ pub fn list_sessions(
                         .and_then(|n| n.to_str())
                         == want_slug.as_deref()
                 }
-                (SessionFormat::Ir, _) => false,
+                (SessionFormat::Gemini, Some(_)) => {
+                    formats::gemini::session_project_hash(&path).as_deref()
+                        == want_hash.as_deref()
+                }
+                (SessionFormat::OpenCode, _) | (SessionFormat::Ir, _) => false,
             };
             if !cwd_ok {
                 continue;
@@ -1055,15 +1284,76 @@ pub fn list_sessions(
 /// CLI versions Constant's codec is validated against. The native session
 /// formats are undocumented and can drift between releases (S1); these are the
 /// versions the round-trip tests exercise.
+/// OpenCode session listing straight from its db (read-only) — titles come
+/// from the `session.title` column, so even `--titles` costs no transcript read.
+fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
+    use rusqlite::{Connection, OpenFlags};
+    let Ok(root) = formats::opencode_data_root() else {
+        return Vec::new();
+    };
+    let db = root.join("opencode.db");
+    if !db.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let cwd_s = cwd.map(|p| p.display().to_string());
+    let cwd_c = cwd
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string());
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT s.id, s.directory, s.title, s.time_updated,
+                EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
+         FROM session s
+         WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
+         ORDER BY s.time_updated DESC",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(rusqlite::params![cwd_s, cwd_c], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    });
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .map(|(id, directory, title, updated_ms, has)| SessionSummary {
+            runtime: "opencode",
+            id,
+            path: PathBuf::new(), // db-backed; no file until exported
+            cwd: Some(directory),
+            mtime: UNIX_EPOCH + Duration::from_millis(updated_ms.max(0) as u64),
+            has_conversation: Some(has),
+            title: (!title.is_empty()).then_some(title),
+        })
+        .collect()
+}
+
 pub const SUPPORTED_CODEX: &str = "0.137";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
+pub const SUPPORTED_GEMINI: &str = "0.40";
+pub const SUPPORTED_OPENCODE: &str = "1.14";
 
 /// Environment preflight (for `constant doctor`).
 pub struct DoctorReport {
     pub codex_version: Option<String>,
     pub claude_version: Option<String>,
+    pub gemini_version: Option<String>,
+    pub opencode_version: Option<String>,
     pub codex_store: bool,
     pub claude_store: bool,
+    pub gemini_store: bool,
+    pub opencode_db: bool,
     pub codex_db: bool,
 }
 
@@ -1072,9 +1362,13 @@ pub struct DoctorReport {
 pub fn doctor() -> DoctorReport {
     let codex_root = formats::default_output_root(SessionFormat::Codex).ok();
     let claude_root = formats::default_output_root(SessionFormat::Claude).ok();
+    let gemini_root = formats::default_output_root(SessionFormat::Gemini).ok();
+    let opencode_root = formats::default_output_root(SessionFormat::OpenCode).ok();
     DoctorReport {
         codex_version: detect_codex_version(),
         claude_version: detect_claude_version(),
+        gemini_version: detect_gemini_version(),
+        opencode_version: detect_opencode_version(),
         codex_store: codex_root
             .as_ref()
             .map(|r| r.join("sessions").exists())
@@ -1082,6 +1376,14 @@ pub fn doctor() -> DoctorReport {
         claude_store: claude_root
             .as_ref()
             .map(|r| r.join("projects").exists())
+            .unwrap_or(false),
+        gemini_store: gemini_root
+            .as_ref()
+            .map(|r| r.join("tmp").exists())
+            .unwrap_or(false),
+        opencode_db: opencode_root
+            .as_ref()
+            .map(|r| r.join("opencode.db").exists())
             .unwrap_or(false),
         codex_db: codex_root
             .as_ref()

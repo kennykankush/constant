@@ -317,7 +317,10 @@ fn request_switch(
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) {
-    if session.runtime == target || switching_to.is_some() {
+    if session.runtime == target
+        || switching_to.is_some()
+        || !crate::alembic::supports_target(target)
+    {
         return;
     }
     *switching_to = Some(SwitchRequest { target, new });
@@ -342,7 +345,9 @@ fn spawn_fresh(
     let minted = match runtime {
         Runtime::Claude => crate::alembic::claude_supports_session_id()
             .then(|| uuid::Uuid::new_v4().to_string()),
-        Runtime::Codex => None,
+        // Codex/gemini have no fresh-id flag; opencode fresh sessions are
+        // detected via its db (the fence applies there too).
+        _ => None,
     };
     let session = spawn_session(
         runtime,
@@ -452,7 +457,7 @@ fn clear_bottom(out: &mut impl Write) {
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  C=new claude  x=codex  X=new codex  :=command  d=quit\x1b[0m\r\n",
+        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  :=command  d=quit\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();
@@ -667,7 +672,7 @@ pub fn run(
     }
 
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   C=new claude   x=codex   X=new codex   :=command   d=quit "
+        " {prefix_label} ▸  c=claude   x=codex   o=opencode   (shift=new)   :=command   d=quit "
     );
 
     let mut out = std::io::stdout();
@@ -1152,6 +1157,22 @@ pub fn run(
                                         true,
                                         &mut session,
                                         &mut switching_to,
+                                    ),
+                                    Some(b'o') => request_switch(
+                                        Runtime::OpenCode,
+                                        false,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'O') => request_switch(
+                                        Runtime::OpenCode,
+                                        true,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    Some(b'g') | Some(b'G') => dim(
+                                        &mut out,
+                                        "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b'd') => quitting = true,
                                     Some(b':') => {

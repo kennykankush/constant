@@ -310,10 +310,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
         eprintln!("warning: trail ledger write failed: {e}");
     }
 
-    let resume = match to {
-        Runtime::Claude => format!("claude -r {id}"),
-        Runtime::Codex => format!("codex resume {id}"),
-    };
+    let resume = native_resume_cmd(to, &id);
 
     if json {
         let mut out = serde_json::json!({
@@ -682,6 +679,8 @@ fn native_resume_cmd(rt: Runtime, id: &str) -> String {
     match rt {
         Runtime::Claude => format!("claude -r {id}"),
         Runtime::Codex => format!("codex resume {id}"),
+        Runtime::Gemini => format!("gemini --resume {id}"),
+        Runtime::OpenCode => format!("opencode -s {id}"),
     }
 }
 
@@ -821,24 +820,41 @@ fn run_status(rest: &[String]) -> Result<()> {
     let mark = |b: bool| if b { "ok" } else { "missing" };
     println!("\nruntimes:");
     println!(
-        "  codex  : {} (cli {}, sessions {}, db {})",
+        "  codex    : {} (cli {}, sessions {}, db {})",
         d.codex_version.as_deref().unwrap_or("not found"),
         mark(d.codex_version.is_some()),
         mark(d.codex_store),
         mark(d.codex_db),
     );
     println!(
-        "  claude : {} (cli {}, projects {})",
+        "  claude   : {} (cli {}, projects {})",
         d.claude_version.as_deref().unwrap_or("not found"),
         mark(d.claude_version.is_some()),
         mark(d.claude_store),
+    );
+    println!(
+        "  opencode : {} (cli {}, db {})",
+        d.opencode_version.as_deref().unwrap_or("not found"),
+        mark(d.opencode_version.is_some()),
+        mark(d.opencode_db),
+    );
+    println!(
+        "  gemini   : {} (cli {}, store {}) — carry source only for now",
+        d.gemini_version.as_deref().unwrap_or("not found"),
+        mark(d.gemini_version.is_some()),
+        mark(d.gemini_store),
     );
 
     println!();
     trail::print_status(cwd.as_deref())?;
 
     println!("\nlatest sessions:");
-    for rt in [Runtime::Codex, Runtime::Claude] {
+    for rt in [
+        Runtime::Codex,
+        Runtime::Claude,
+        Runtime::OpenCode,
+        Runtime::Gemini,
+    ] {
         // Keep `status` cheap and privacy-minimal: no transcript reads here.
         // Use `constant sessions --titles` when the prompt-derived title is wanted.
         let sessions = alembic::list_sessions(rt, cwd.as_deref(), false);
@@ -886,7 +902,12 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     };
     let runtimes = match from {
         Some(s) => vec![Runtime::parse(&s)?],
-        None => vec![Runtime::Codex, Runtime::Claude],
+        None => vec![
+            Runtime::Codex,
+            Runtime::Claude,
+            Runtime::OpenCode,
+            Runtime::Gemini,
+        ],
     };
     let mut sessions = Vec::new();
     for rt in runtimes {
@@ -959,6 +980,17 @@ fn run_doctor(rest: &[String]) -> Result<()> {
                     "supported": alembic::SUPPORTED_CLAUDE,
                     "store": r.claude_store,
                 },
+                "opencode": {
+                    "version": r.opencode_version,
+                    "supported": alembic::SUPPORTED_OPENCODE,
+                    "db": r.opencode_db,
+                },
+                "gemini": {
+                    "version": r.gemini_version,
+                    "supported": alembic::SUPPORTED_GEMINI,
+                    "store": r.gemini_store,
+                    "target": false,
+                },
             })
         );
     } else {
@@ -979,6 +1011,20 @@ fn run_doctor(rest: &[String]) -> Result<()> {
             mark(r.claude_store),
             alembic::SUPPORTED_CLAUDE,
         );
+        println!(
+            "  opencode : {} (cli {}, db {}) — validated against {}.x",
+            r.opencode_version.as_deref().unwrap_or("not found"),
+            mark(r.opencode_version.is_some()),
+            mark(r.opencode_db),
+            alembic::SUPPORTED_OPENCODE,
+        );
+        println!(
+            "  gemini : {} (cli {}, store {}) — validated against {}.x; carry source only",
+            r.gemini_version.as_deref().unwrap_or("not found"),
+            mark(r.gemini_version.is_some()),
+            mark(r.gemini_store),
+            alembic::SUPPORTED_GEMINI,
+        );
     }
     Ok(())
 }
@@ -988,12 +1034,14 @@ fn print_help() {
         r#"Constant — one conversation, any agent runtime.
 
 USAGE:
-  constant host [codex|claude] [--prefix C-t] [--with-tools] [--no-bar]
+  constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
         Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B).
         A persistent status bar lives on the bottom row (runtime, thread, keys);
         --no-bar disables it.
 
-  constant carry --to codex|claude [--from codex|claude | --session PATH] [--json] [--dry-run] [--debug] [--new] [--with-tools]
+  constant carry --to codex|claude|opencode [--from RT | --session PATH_OR_ID] [--json] [--dry-run] [--debug] [--new] [--with-tools]
+        Sources: codex, claude, opencode (ses_… ids resolve automatically), and
+        gemini (source only — carrying INTO gemini lands after one live check).
         Headless: carry a conversation into the target runtime's native session and
         print the resume command (no terminal). --json for machine output;
         --dry-run previews without writing; --debug shows the route decision;
@@ -1046,6 +1094,8 @@ INSIDE A HOSTED SESSION (press the prefix, then):
   C              create a new claude continuation
   x              continue in codex
   X              create a new codex continuation
+  o              continue in opencode
+  O              create a new opencode continuation
   :              open the command line (e.g. `switch claude`, `new claude`, `quit`)
   d              quit Constant (the hosted CLI exits with it)
   <prefix> again send a literal prefix key to the child

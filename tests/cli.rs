@@ -66,8 +66,10 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env("CODEX_HOME", dir.join("codex"))
         .env("CLAUDE_HOME", dir.join("claude"))
         .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env("XDG_DATA_HOME", dir.join("xdg"))
         .env_remove("TRANSESSION_CODEX_HOME")
         .env_remove("TRANSESSION_CLAUDE_HOME")
+        .env_remove("CONSTANT_GEMINI_HOME")
         .output()
         .expect("failed to run constant")
 }
@@ -802,6 +804,218 @@ fn status_reports_runtime_trail_and_latest_sessions() {
         !text.contains("hello-from-the-fixture"),
         "status should not print prompt-derived trail slugs: {text}"
     );
+}
+
+// --- third runtime: gemini + opencode sources ---
+
+fn gemini_fixture(dir: &Path) -> PathBuf {
+    // The real gemini session shape (verified on disk): whole-file JSON,
+    // user content = block array, gemini content = string, tools + thoughts.
+    let path = dir.join("gemini-session.json");
+    let ir = r#"{
+  "sessionId": "9d2f7c30-aaaa-bbbb-cccc-1234567890ab",
+  "projectHash": "cf84c1cae18c9e9c3a83a4e9e6dfa0af71650ac22d7c58cf89f0c76bb2c8425b",
+  "startTime": "2026-06-01T10:00:00.000Z",
+  "lastUpdated": "2026-06-01T10:05:00.000Z",
+  "kind": "main",
+  "messages": [
+    { "id": "m1", "timestamp": "2026-06-01T10:00:01.000Z", "type": "user",
+      "content": [ { "text": "hello from gemini land" } ] },
+    { "id": "m2", "timestamp": "2026-06-01T10:00:05.000Z", "type": "gemini",
+      "content": "greetings, carried one",
+      "thoughts": [ { "subject": "Pondering", "description": "what to say" } ],
+      "toolCalls": [ { "id": "t1", "name": "run_shell_command",
+                        "args": { "command": "echo sk-GEMSECRET1234567890ab" },
+                        "result": [ { "ok": true } ] } ],
+      "tokens": { "input": 10, "output": 5, "total": 15 },
+      "model": "gemini-3-pro" },
+    { "id": "m3", "timestamp": "2026-06-01T10:01:00.000Z", "type": "info",
+      "content": "Update successful!" }
+  ]
+}"#;
+    std::fs::write(&path, ir).unwrap();
+    path
+}
+
+#[test]
+fn gemini_session_carries_into_claude() {
+    let dir = tmpdir();
+    let fix = gemini_fixture(&dir);
+    let before = std::fs::read(&fix).unwrap();
+
+    let o = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "gemini carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["from"].as_str(), Some("gemini"), "{v}");
+    assert_eq!(v["receipt"]["turns"].as_u64(), Some(2), "{v}");
+    // info message is scaffold; tools dropped by default; thoughts are reasoning.
+    assert_eq!(v["receipt"]["dropped_tools"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["receipt"]["dropped_reasoning"].as_u64(), Some(1), "{v}");
+    assert_eq!(before, std::fs::read(&fix).unwrap(), "source modified");
+
+    // with tools: kept + payload secret redacted in the materialized session.
+    let w = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+            "--new",
+            "--with-tools",
+        ],
+    );
+    assert!(w.status.success(), "{}", err(&w));
+    let wv: serde_json::Value = serde_json::from_str(&out(&w)).unwrap();
+    assert_eq!(wv["receipt"]["tools"].as_u64(), Some(2), "{wv}");
+    let snap = wv["snapshot"].as_str().unwrap();
+    let snap_text = std::fs::read_to_string(snap).unwrap();
+    assert!(
+        !snap_text.contains("sk-GEMSECRET"),
+        "gemini tool secret leaked into the record"
+    );
+}
+
+fn opencode_export_fixture(dir: &Path) -> PathBuf {
+    // The export shape `opencode export` emits (with its trailing status line,
+    // which the loader must tolerate).
+    let path = dir.join("opencode-export.json");
+    let body = r#"{
+  "info": {
+    "id": "ses_0123456789abcdefSOURCE01",
+    "slug": "test-session",
+    "projectID": "global",
+    "directory": "/tmp/constant-cli-proj",
+    "title": "opencode test session",
+    "version": "1.14.48",
+    "summary": {"additions": 0, "deletions": 0, "files": 0},
+    "time": {"created": 1778707096618, "updated": 1778707193869}
+  },
+  "messages": [
+    { "info": { "id": "msg_a", "role": "user", "time": {"created": 1778707096634},
+                "summary": {"diffs": []}, "agent": "build",
+                "model": {"providerID": "test", "modelID": "test-model"} },
+      "parts": [ { "type": "text", "text": "hello from opencode" } ] },
+    { "info": { "id": "msg_b", "role": "assistant",
+                "time": {"created": 1778707097000, "completed": 1778707099000},
+                "modelID": "test-model", "providerID": "test", "mode": "build",
+                "agent": "build", "path": {"cwd": "/tmp/constant-cli-proj", "root": "/tmp/constant-cli-proj"},
+                "cost": 0, "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}} },
+      "parts": [
+        { "type": "step-start", "id": "prt_1", "sessionID": "ses_0123456789abcdefSOURCE01", "messageID": "msg_b" },
+        { "type": "reasoning", "text": "thinking it over", "id": "prt_2" },
+        { "type": "tool", "tool": "bash", "callID": "call_1", "id": "prt_3",
+          "state": {"status": "completed", "input": {"command": "ls"}, "output": "files: token: sk-OCSECRET1234567890ab"} },
+        { "type": "text", "text": "answered from opencode", "id": "prt_4" }
+      ] }
+  ]
+}
+Exporting session: ses_0123456789abcdefSOURCE01"#;
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn opencode_export_file_carries_into_codex() {
+    let dir = tmpdir();
+    let fix = opencode_export_fixture(&dir);
+    let o = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "codex",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "opencode carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["from"].as_str(), Some("opencode"), "{v}");
+    assert_eq!(v["receipt"]["turns"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["receipt"]["dropped_tools"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["receipt"]["dropped_reasoning"].as_u64(), Some(1), "{v}");
+}
+
+/// Full round trip THROUGH the real opencode binary: carry an IR fixture INTO
+/// opencode (writer = export-shaped JSON + `opencode import`), then read it
+/// back out via `opencode export`. Skips when opencode isn't installed (CI).
+#[test]
+fn carry_into_opencode_round_trips_through_import() {
+    if std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: opencode binary not available");
+        return;
+    }
+
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "opencode",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "carry to opencode failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let id = v["id"].as_str().expect("no id");
+    assert!(id.starts_with("ses_"), "unexpected opencode id: {id}");
+    assert!(
+        v["resume"].as_str().unwrap_or("").contains("opencode -s"),
+        "{v}"
+    );
+
+    // The isolated opencode store (XDG_DATA_HOME) must now hold the session.
+    let export = std::process::Command::new("opencode")
+        .args(["export", id])
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .output()
+        .expect("run opencode export");
+    assert!(export.status.success(), "export-back failed");
+    let text = String::from_utf8_lossy(&export.stdout).to_string();
+    assert!(
+        text.contains("hello from the fixture"),
+        "round trip lost the conversation: {text}"
+    );
+
+    // Refresh (stable pair): same id again, upserted through their door.
+    let again = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "opencode",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(again.status.success(), "{}", err(&again));
+    let av: serde_json::Value = serde_json::from_str(&out(&again)).unwrap();
+    assert_eq!(av["id"].as_str(), Some(id), "stable pair broke");
+    assert_eq!(av["debug"].get("mode"), None); // not in non-debug json
 }
 
 // --- with-tools: tool history carried, redacted, opt-in ---

@@ -7,6 +7,8 @@ use portable_pty::CommandBuilder;
 pub enum Runtime {
     Codex,
     Claude,
+    Gemini,
+    OpenCode,
 }
 
 impl Runtime {
@@ -14,7 +16,9 @@ impl Runtime {
         Ok(match s.trim().to_lowercase().as_str() {
             "codex" | "x" => Runtime::Codex,
             "claude" | "c" => Runtime::Claude,
-            other => bail!("unknown runtime: {other} (use codex|claude)"),
+            "gemini" | "g" => Runtime::Gemini,
+            "opencode" | "o" => Runtime::OpenCode,
+            other => bail!("unknown runtime: {other} (use codex|claude|gemini|opencode)"),
         })
     }
 
@@ -22,14 +26,13 @@ impl Runtime {
         match self {
             Runtime::Codex => "codex",
             Runtime::Claude => "claude",
+            Runtime::Gemini => "gemini",
+            Runtime::OpenCode => "opencode",
         }
     }
 
     fn bin(self) -> &'static str {
-        match self {
-            Runtime::Codex => "codex",
-            Runtime::Claude => "claude",
-        }
+        self.label()
     }
 
     /// Build a fresh interactive launch command for this runtime. When
@@ -53,6 +56,8 @@ impl Runtime {
         match self {
             Runtime::Codex => self.command(&["resume", session_id]),
             Runtime::Claude => self.command(&["-r", session_id]),
+            Runtime::Gemini => self.command(&["--resume", session_id]),
+            Runtime::OpenCode => self.command(&["-s", session_id]),
         }
     }
 

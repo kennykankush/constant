@@ -49,6 +49,24 @@ carry pipeline made definite.
   moved to a per-process temp path.
 
 ### Added
+- **Third runtime, doubled: OpenCode (full) + Gemini (carry source).**
+  - **OpenCode** is a complete runtime: host it (`constant host opencode`),
+    switch to it live (prefix `o`/`O`), carry into it (`--to opencode`), out
+    of it (`ses_…` ids resolve automatically via `opencode export`), resume it
+    (`opencode -s <id>`), list it (`sessions`, with db-backed titles). The
+    writer goes through opencode's own supported door — export-shaped JSON +
+    `opencode import`, which validates, preserves our session ids, and
+    upserts on refresh (the stable pair works natively). Tool history maps
+    both ways, so `--with-tools` works on day one. Covered by a real
+    import→export round-trip test (skips when the binary is absent).
+  - **Gemini** is a carry source: existing gemini conversations (sessions,
+    thoughts, tool calls) load, list, and carry into codex/claude/opencode.
+    Carrying INTO gemini lands after one live landing-pad verification —
+    in a scratch directory only: gemini 0.40's storage migration can DELETE
+    legacy-format chats (it did; see docs).
+  - Internals: a neutral-IR codec per runtime (hub-and-spoke — no pairwise
+    translators), a pure-Rust SHA-256 for gemini's `projectHash = sha256(cwd)`
+    discovery evidence, and read-only sqlite discovery for opencode.
 - **Persistent status bar.** A tmux-style bar lives on the terminal's bottom
   row while hosting: active runtime (`+tools` when carrying tool history),
   trail position and conversation slug, and the prefix keys. Constant stays a

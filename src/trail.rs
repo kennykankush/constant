@@ -261,6 +261,8 @@ fn runtime_rank(runtime: &str) -> u8 {
     match runtime {
         "codex" => 0,
         "claude" => 1,
+        "opencode" => 2,
+        "gemini" => 3,
         _ => 9,
     }
 }
@@ -269,6 +271,8 @@ fn resume_cmd(runtime: &str, id: &str) -> String {
     match runtime {
         "codex" => format!("codex resume {id}"),
         "claude" => format!("claude -r {id}"),
+        "gemini" => format!("gemini --resume {id}"),
+        "opencode" => format!("opencode -s {id}"),
         _ => format!("{runtime} resume {id}"),
     }
 }

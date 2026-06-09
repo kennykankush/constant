@@ -11,6 +11,9 @@ pub enum SessionFormat {
     Ir,
     Codex,
     Claude,
+    Gemini,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 /// Explicit source-format override. Only `Auto` is constructed today (we always
