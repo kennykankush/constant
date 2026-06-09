@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, SecondsFormat, Utc};
-use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -33,14 +32,26 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
     let mut session = UniversalSession::new(Uuid::now_v7().to_string());
     session.metadata.source_format = Some(SessionFormat::Codex);
 
+    // A torn FINAL line (a child killed mid-flush) must not void the whole
+    // conversation: tolerate it. A bad line FOLLOWED by valid data is real
+    // corruption and still fails loudly.
+    let mut torn: Option<anyhow::Error> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
 
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("invalid JSONL in {}", path.display()))?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(e) => {
+                torn = Some(anyhow::anyhow!("invalid JSONL in {}: {e}", path.display()));
+                continue;
+            }
+        };
+        if let Some(e) = torn.take() {
+            return Err(e.context("corrupt line followed by valid data"));
+        }
 
         let timestamp = value
             .get("timestamp")
@@ -329,7 +340,13 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut file = File::create(&materialization.session_file).with_context(|| {
+    // Atomic materialization (B1): the projection may be the only copy of the
+    // conversation's newest turns, so never truncate it in place. Write a
+    // sibling tmp file, fsync, then rename over the target — a crash mid-write
+    // leaves the previous projection intact.
+    let tmp_path = super::tmp_sibling(&materialization.session_file);
+    let mut tmp_guard = super::TmpCleanup::new(&tmp_path);
+    let mut file = File::create(&tmp_path).with_context(|| {
         format!(
             "failed to create Codex session file {}",
             materialization.session_file.display()
@@ -577,6 +594,17 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
 
     close_turn(&mut file, &mut active_turn, updated_at)?;
 
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, &materialization.session_file).with_context(|| {
+        format!(
+            "failed to move session into place at {}",
+            materialization.session_file.display()
+        )
+    })?;
+    tmp_guard.keep();
+
     let thread_name = exported_codex_thread_name(session, &session_id);
 
     if let Some(session_index) = &materialization.session_index {
@@ -598,18 +626,6 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 "thread_name": thread_name.clone(),
                 "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             }),
-        )?;
-    }
-
-    if output.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-        register_thread_in_sqlite(
-            output,
-            session,
-            &materialization.session_file,
-            &session_id,
-            &thread_name,
-            created_at,
-            updated_at,
         )?;
     }
 
@@ -991,129 +1007,6 @@ fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
             }
         }
     }
-}
-
-fn register_thread_in_sqlite(
-    codex_root: &Path,
-    session: &UniversalSession,
-    session_file: &Path,
-    session_id: &str,
-    thread_name: &str,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-) -> Result<()> {
-    let sqlite_path = codex_root.join("state_5.sqlite");
-    if !sqlite_path.exists() {
-        return Ok(());
-    }
-
-    let connection = Connection::open(&sqlite_path)
-        .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
-    // Wait out a briefly-locked DB instead of failing the carry (a fresh codex
-    // projection registers here, before alembic's best-effort upsert runs).
-    connection.busy_timeout(std::time::Duration::from_secs(3))?;
-    let title = thread_name.to_string();
-    let first_user_message = first_user_message(session).unwrap_or_else(|| title.clone());
-    let cwd = session
-        .metadata
-        .cwd
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    let sandbox_policy = session
-        .metadata
-        .extra
-        .get("codex_sandbox_policy")
-        .map(json_to_string)
-        .unwrap_or_else(|| "{\"type\":\"workspace-write\"}".to_string());
-    let approval_mode = extra_string(&session.metadata, "codex_approval_policy")
-        .unwrap_or_else(|| "on-request".to_string());
-    let model_provider = exported_codex_model_provider();
-    let git_branch = session.metadata.git_branch.clone();
-    let has_user_event = session
-        .events
-        .iter()
-        .any(|event| matches!(event, SessionEvent::Message(message) if message.role == "user"))
-        as i64;
-
-    connection
-        .execute(
-            "INSERT INTO threads (
-                id,
-                rollout_path,
-                created_at,
-                updated_at,
-                source,
-                model_provider,
-                cwd,
-                title,
-                sandbox_policy,
-                approval_mode,
-                tokens_used,
-                has_user_event,
-                archived,
-                git_sha,
-                git_branch,
-                git_origin_url,
-                cli_version,
-                first_user_message,
-                agent_nickname,
-                agent_role,
-                memory_mode
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, NULL, ?12, NULL, ?13, ?14, NULL, NULL, 'enabled'
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                rollout_path=excluded.rollout_path,
-                updated_at=excluded.updated_at,
-                source=excluded.source,
-                model_provider=excluded.model_provider,
-                cwd=excluded.cwd,
-                title=excluded.title,
-                sandbox_policy=excluded.sandbox_policy,
-                approval_mode=excluded.approval_mode,
-                has_user_event=excluded.has_user_event,
-                git_branch=excluded.git_branch,
-                cli_version=excluded.cli_version,
-                first_user_message=excluded.first_user_message,
-                memory_mode=excluded.memory_mode",
-            params![
-                session_id,
-                session_file.display().to_string(),
-                created_at.timestamp(),
-                updated_at.timestamp(),
-                "cli",
-                model_provider,
-                cwd,
-                title,
-                sandbox_policy,
-                approval_mode,
-                has_user_event,
-                git_branch,
-                codex_cli_version(&session.metadata),
-                first_user_message,
-            ],
-        )
-        .with_context(|| format!("failed to register thread {} in {}", session_id, sqlite_path.display()))?;
-
-    Ok(())
-}
-
-fn first_user_message(session: &UniversalSession) -> Option<String> {
-    session.events.iter().find_map(|event| {
-        let SessionEvent::Message(message) = event else {
-            return None;
-        };
-        if message.role != "user" {
-            return None;
-        }
-        message
-            .blocks
-            .iter()
-            .filter_map(|block| block.text.as_deref())
-            .map(collapse_whitespace)
-            .find(|text| !text.is_empty())
-    })
 }
 
 fn format_name(format: SessionFormat) -> &'static str {

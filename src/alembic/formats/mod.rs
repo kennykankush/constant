@@ -15,42 +15,94 @@ pub struct ResolvedInput {
     pub format: SessionFormat,
 }
 
+/// Sibling path used for atomic materialization: write here, fsync, then
+/// rename over the real target. The name never ends in `.jsonl`, so neither
+/// the runtimes' own session scanners nor ours can pick a half-written file.
+pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "session".to_string());
+    path.with_file_name(format!(".{name}.constant-tmp"))
+}
+
+/// Removes the tmp file on drop unless `keep()` was called (the rename
+/// happened), so a failed write never leaves debris in the store.
+pub(crate) struct TmpCleanup {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TmpCleanup {
+    pub(crate) fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            keep: false,
+        }
+    }
+
+    pub(crate) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TmpCleanup {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub fn detect_format(path: &Path) -> Result<SessionFormat> {
-    let bytes = fs::read(path).with_context(|| {
+    use std::io::{BufRead, BufReader};
+
+    // The JSONL formats (codex/claude) are decided by the first non-empty line
+    // alone — don't read a potentially huge transcript just to classify it.
+    let file = fs::File::open(path).with_context(|| {
         format!(
             "failed to read input for format detection: {}",
             path.display()
         )
     })?;
-    let text = String::from_utf8(bytes)
-        .with_context(|| format!("input is not valid UTF-8: {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    loop {
+        first.clear();
+        let n = reader
+            .read_line(&mut first)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if n == 0 {
+            bail!("input file is empty: {}", path.display());
+        }
+        if !first.trim().is_empty() {
+            break;
+        }
+    }
 
+    if let Ok(value) = serde_json::from_str::<Value>(first.trim()) {
+        if value.get("ir_version").is_some() {
+            return Ok(SessionFormat::Ir);
+        }
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("session_meta")
+        ) {
+            return Ok(SessionFormat::Codex);
+        }
+        if value.get("sessionId").is_some() {
+            return Ok(SessionFormat::Claude);
+        }
+    }
+
+    // Not a recognizable JSONL first line — it may be a pretty-printed IR file
+    // (a single whole-file JSON document). Only now read the full file.
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
     if let Ok(value) = serde_json::from_str::<Value>(&text)
         && value.get("ir_version").is_some()
     {
         return Ok(SessionFormat::Ir);
-    }
-
-    let first_line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .context("input file is empty")?;
-    let value: Value =
-        serde_json::from_str(first_line).context("failed to parse the first JSON line")?;
-
-    if value.get("ir_version").is_some() {
-        return Ok(SessionFormat::Ir);
-    }
-
-    if matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("session_meta")
-    ) {
-        return Ok(SessionFormat::Codex);
-    }
-
-    if value.get("sessionId").is_some() {
-        return Ok(SessionFormat::Claude);
     }
 
     bail!("could not detect format for {}", path.display())
@@ -161,13 +213,14 @@ pub fn default_output_root(target: SessionFormat) -> Result<PathBuf> {
     }
 }
 
-fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
     let root = codex_root()?;
     let sessions_root = root.join("sessions");
-    find_in_tree(&sessions_root, |path| {
+    let suffix = format!("-{session_id}.jsonl");
+    find_newest_in_tree(&sessions_root, |path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .map(|name| name.ends_with(&format!("-{session_id}.jsonl")))
+            .map(|name| name.ends_with(&suffix))
             .unwrap_or(false)
     })
     .with_context(|| {
@@ -178,13 +231,14 @@ fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
     })
 }
 
-fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
     let root = claude_root()?;
     let projects_root = root.join("projects");
-    find_in_tree(&projects_root, |path| {
+    let name_want = format!("{session_id}.jsonl");
+    find_newest_in_tree(&projects_root, |path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .map(|name| name == format!("{session_id}.jsonl"))
+            .map(|name| name == name_want)
             .unwrap_or(false)
     })
     .with_context(|| {
@@ -224,10 +278,15 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
-fn find_in_tree<F>(root: &Path, predicate: F) -> Result<PathBuf>
+/// Newest-mtime match wins: duplicate files for the same session id can exist
+/// (an old fork bug left some), and resuming the stale one silently loses the
+/// freshest turns. Directory recursion checks `entry.file_type()` — which does
+/// NOT follow symlinks — so a symlink cycle in a store can't hang the walk.
+fn find_newest_in_tree<F>(root: &Path, predicate: F) -> Result<PathBuf>
 where
     F: Fn(&Path) -> bool + Copy,
 {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
@@ -237,13 +296,23 @@ where
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 stack.push(path);
             } else if predicate(&path) {
-                return Ok(path);
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().map(|(t, _)| mtime >= *t).unwrap_or(true) {
+                    best = Some((mtime, path));
+                }
             }
         }
     }
 
-    bail!("could not find a matching session under {}", root.display())
+    best.map(|(_, path)| path)
+        .with_context(|| format!("could not find a matching session under {}", root.display()))
 }

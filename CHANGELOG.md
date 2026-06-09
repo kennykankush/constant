@@ -3,6 +3,63 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - Bank-logic hardening
+
+The round-2 audit pass: every write, identity decision, and failure path in the
+carry pipeline made definite.
+
+### Fixed
+- **Atomic projection writes.** Both codec writers now materialize into a tmp
+  sibling, fsync, and rename into place — a crash or full disk mid-switch can no
+  longer destroy the projection holding the conversation's newest turns. A
+  failed write provably leaves the previous projection intact (regression-tested).
+- **Spawn-time fence restored.** Carry-seed detection is scoped to sessions
+  touched at/after the hosted child was spawned (plus cwd), so an old session in
+  the same directory — or a concurrent codex/claude running there — can no
+  longer be adopted as the seed on a first switch.
+- **Declared session identity.** Fresh claude children are launched with a
+  minted `--session-id`, and every resumed child's id is tracked — source
+  resolution now prefers the session the harness positively KNOWS the child
+  owns over filesystem inference. Session-id lookups resolve newest-file-wins,
+  so stale duplicate rollouts are never carried.
+- **Codex registry writes are real errors.** The two divergent sqlite upserts
+  merged into one; a failed `threads` upsert now fails the carry (with fresh
+  fallback) instead of silently producing a session `codex resume` can't find.
+- **Switch failures degrade instead of dying.** A target that can't launch
+  falls back: target resumed → target fresh → previous runtime. A child that
+  exits within 2s of a spawn (rejected resume, missing binary) is detected and
+  relaunched fresh once, with the carry preserved in the trail.
+- **Torn-tail tolerance.** A half-written final transcript line (child killed
+  mid-flush) no longer voids the whole carry; mid-file corruption still fails
+  loudly. SIGTERM grace extended to 1s so large flushes finish.
+- **Redaction invariant enforced on the carry path.** `sanitize` now drops
+  nested `block.data` payloads and per-message metadata (previously only the IR
+  export did), and the redactor set gains AWS access keys, PEM private-key
+  blocks, and bare JWTs.
+- **Bracketed-paste guard.** Pasted content containing the raw prefix byte can
+  no longer trigger a phantom runtime switch mid-paste.
+- **Ledger hardening.** Trail writes surface their failures (a silent miss can
+  fork a conversation on re-host); recorded cwds are canonicalized and compared
+  symlink-tolerantly; the ledger-reconciliation core is now pure and unit-tested
+  (ping-pong stable pair, sibling isolation, moved-path identity).
+- Store walkers no longer follow symlinks (a cycle can't hang a switch);
+  `has_conversation` parses lines instead of substring-matching (embedded
+  AGENTS.md text can't make an empty session look conversational); synthetic
+  claude records carry the source conversation's real model name; the debug log
+  moved to a per-process temp path.
+
+### Added
+- **Carry receipt.** Every switch and headless carry reports what the
+  distillation did: `carried N turns · dropped M tool events · K redactions` —
+  in the host trail line, `carry` output, and `--json` (`receipt`).
+
+### Changed
+- A switch now loads + distills the source transcript once (previously twice),
+  and format detection reads one line instead of the whole file — switch latency
+  on long conversations roughly halved.
+- `d` is labeled honestly as quit (the hosted CLI exits with it); `detach`
+  remains accepted in the command line.
+
 ## [0.1.4] - Source overwrite guard hardening
 
 ### Fixed

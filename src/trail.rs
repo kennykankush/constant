@@ -175,6 +175,19 @@ fn parse_entry(line: &str) -> Option<TrailEntry> {
     })
 }
 
+/// Compare a recorded cwd string against a filter path, tolerant of symlinked
+/// spellings of the same directory (the rest of the codebase canonicalizes —
+/// the ledger views must not split one project into two over a symlink).
+fn same_cwd(recorded: &str, want: &Path) -> bool {
+    if recorded == want.display().to_string() {
+        return true;
+    }
+    match (Path::new(recorded).canonicalize(), want.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn load_entries(cwd_filter: Option<&Path>) -> Vec<TrailEntry> {
     let Some(ledger) = ledger_path() else {
         return Vec::new();
@@ -182,11 +195,10 @@ fn load_entries(cwd_filter: Option<&Path>) -> Vec<TrailEntry> {
     let Ok(text) = fs::read_to_string(&ledger) else {
         return Vec::new();
     };
-    let want_cwd = cwd_filter.map(|p| p.display().to_string());
     text.lines()
         .filter_map(parse_entry)
-        .filter(|e| match &want_cwd {
-            Some(want) => e.cwd.as_deref() == Some(want.as_str()),
+        .filter(|e| match cwd_filter {
+            Some(want) => e.cwd.as_deref().map(|c| same_cwd(c, want)).unwrap_or(false),
             None => true,
         })
         .collect()
@@ -426,11 +438,16 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
     out
 }
 
-/// Append one switch to the trail ledger. Best-effort: never fails a switch.
+/// Append one switch to the trail ledger.
 ///
 /// `conv_id` is the stable grouping key (the conversation's root source session
 /// id) — durable and unique, so unrelated threads never merge. `slug` is only
 /// the human display handle (which can collide and is not used for grouping).
+///
+/// The ledger is what pair-reuse and lineage recovery are rebuilt from: a
+/// failed append means the next re-host can silently fork the conversation, so
+/// the error is RETURNED for the caller to surface (the switch itself still
+/// proceeds — divergence is recoverable, a dead harness is not).
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     n: u32,
@@ -445,14 +462,16 @@ pub fn record(
     path: &Path,
     title: &str,
     mode: &str,
-) {
-    let Some(ledger) = ledger_path_for_write() else {
-        return;
-    };
+) -> anyhow::Result<()> {
+    let ledger =
+        ledger_path_for_write().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Store the canonical spelling so symlinked invocations of the same
+    // project group as one conversation in the scoped views.
+    let cwd = cwd.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
     let entry = serde_json::json!({
         "ts": ts,
         "n": n,
@@ -470,13 +489,12 @@ pub fn record(
         "title": title,
         "mode": mode,
     });
-    if let Ok(mut f) = fs::OpenOptions::new()
+    let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&ledger)
-    {
-        let _ = writeln!(f, "{entry}");
-    }
+        .open(&ledger)?;
+    writeln!(f, "{entry}")?;
+    Ok(())
 }
 
 /// On (re)host, recover the conversation a source belongs to and the trail
@@ -498,13 +516,32 @@ pub fn resume(src_path: &Path, src_id: &str) -> (String, u32, Vec<(Runtime, Stri
     let Ok(text) = fs::read_to_string(&ledger) else {
         return fallback;
     };
-    let src_path_str = src_path.display().to_string();
     let entries: Vec<TrailEntry> = text.lines().filter_map(parse_entry).collect();
+    let (conv_id, max_n, projections) = resume_from_entries(&entries, src_path, src_id);
+    // Only advertise projections that still exist on disk (IO stays out of the
+    // pure core so it can be unit-tested against synthetic ledgers).
+    let projections = projections
+        .into_iter()
+        .filter(|(_, _, p)| p.exists())
+        .collect();
+    (conv_id, max_n, projections)
+}
+
+/// The pure ledger-reconciliation core of [`resume`] — the most intricate
+/// logic in the codebase, kept IO-free so the unit tests can drive it with
+/// synthetic ledgers.
+#[allow(clippy::type_complexity)]
+fn resume_from_entries(
+    entries: &[TrailEntry],
+    src_path: &Path,
+    src_id: &str,
+) -> (String, u32, Vec<(Runtime, String, PathBuf)>) {
+    let src_path_str = src_path.display().to_string();
 
     // Which conversation does this source belong to? If it matches a prior
     // projection's id or path, reuse that conversation key; else it's new.
     let mut conv_id = src_id.to_string();
-    for e in &entries {
+    for e in entries {
         if e.id == src_id || e.path == src_path_str {
             conv_id = e.conversation.clone();
             break;
@@ -585,10 +622,7 @@ pub fn resume(src_path: &Path, src_id: &str) -> (String, u32, Vec<(Runtime, Stri
     let mut projections = Vec::new();
     for (to, (_, id, path)) in latest {
         if let Ok(rt) = Runtime::parse(&to) {
-            let p = PathBuf::from(&path);
-            if p.exists() {
-                projections.push((rt, id, p));
-            }
+            projections.push((rt, id, PathBuf::from(&path)));
         }
     }
 
@@ -892,5 +926,109 @@ mod tests {
             title(12, Runtime::Claude, "x"),
             "constant·t12·from-claude·x"
         );
+    }
+
+    // --- resume_from_entries: the ledger-reconciliation core ---
+
+    fn entry(json: serde_json::Value) -> TrailEntry {
+        parse_entry(&json.to_string()).expect("test entry parses")
+    }
+
+    /// One switch row: conversation `conv`, hop `n` at time `ts`,
+    /// from (`from`, `sid`@`spath`) into (`to`, `tid`@`tpath`).
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        conv: &str,
+        n: u32,
+        ts: u64,
+        from: &str,
+        sid: &str,
+        spath: &str,
+        to: &str,
+        tid: &str,
+        tpath: &str,
+    ) -> TrailEntry {
+        entry(serde_json::json!({
+            "ts": ts, "n": n, "conversation": conv, "slug": "s", "cwd": "/p",
+            "from": from, "to": to,
+            "source_id": sid, "source_path": spath,
+            "target_id": tid, "target_path": tpath,
+            "title": "t", "mode": "new-fork",
+        }))
+    }
+
+    #[test]
+    fn resume_unknown_source_starts_fresh_conversation() {
+        let (conv, n, projs) = resume_from_entries(&[], Path::new("/x/s.jsonl"), "S");
+        assert_eq!(conv, "S");
+        assert_eq!(n, 0);
+        assert!(projs.is_empty());
+    }
+
+    #[test]
+    fn resume_ping_pong_keeps_a_stable_pair() {
+        // The live switch sequence: codex S → claude C (t1), claude C → codex A2
+        // (t2: a NEW codex projection — never the user's original S).
+        let ledger = vec![
+            row("S", 1, 100, "codex", "S", "/s", "claude", "C", "/c"),
+            row("S", 2, 200, "claude", "C", "/c", "codex", "A2", "/a2"),
+        ];
+
+        // Switching OUT of codex A2 must come back to claude C (the owned
+        // parent), not mint a parallel claude branch.
+        let (conv, n, projs) = resume_from_entries(&ledger, Path::new("/a2"), "A2");
+        assert_eq!(conv, "S");
+        assert_eq!(n, 2);
+        assert_eq!(projs.len(), 1, "{projs:?}");
+        assert!(matches!(&projs[0], (Runtime::Claude, id, _) if id == "C"));
+
+        // And switching OUT of claude C must reuse codex A2 (its direct child),
+        // never the original seed S.
+        let (conv, _, projs) = resume_from_entries(&ledger, Path::new("/c"), "C");
+        assert_eq!(conv, "S");
+        let codex: Vec<_> = projs
+            .iter()
+            .filter(|(rt, _, _)| *rt == Runtime::Codex)
+            .collect();
+        assert_eq!(codex.len(), 1, "{projs:?}");
+        assert!(matches!(codex[0], (_, id, _) if id == "A2"));
+    }
+
+    #[test]
+    fn resume_sibling_branches_stay_separate() {
+        // Two --new claude siblings from the same codex source: a continue from
+        // the SOURCE refreshes the newest sibling; a continue from sibling C1
+        // must not see C2's codex child.
+        let ledger = vec![
+            row("S", 1, 100, "codex", "S", "/s", "claude", "C1", "/c1"),
+            row("S", 2, 200, "codex", "S", "/s", "claude", "C2", "/c2"),
+            row("S", 3, 300, "claude", "C2", "/c2", "codex", "X2", "/x2"),
+        ];
+
+        let (_, n, projs) = resume_from_entries(&ledger, Path::new("/s"), "S");
+        assert_eq!(n, 3);
+        let claude: Vec<_> = projs
+            .iter()
+            .filter(|(rt, _, _)| *rt == Runtime::Claude)
+            .collect();
+        assert!(matches!(claude[0], (_, id, _) if id == "C2"), "{projs:?}");
+
+        let (_, _, projs) = resume_from_entries(&ledger, Path::new("/c1"), "C1");
+        assert!(
+            !projs.iter().any(|(_, id, _)| id == "X2"),
+            "sibling C1 must not adopt C2's codex child: {projs:?}"
+        );
+    }
+
+    #[test]
+    fn resume_matches_projection_by_id_when_path_moved() {
+        let ledger = vec![row(
+            "S", 1, 100, "codex", "S", "/s", "claude", "C", "/c-original",
+        )];
+        // Same projection id surfacing from a different path still joins its
+        // conversation instead of starting a new one.
+        let (conv, n, _) = resume_from_entries(&ledger, Path::new("/c-moved"), "C");
+        assert_eq!(conv, "S");
+        assert_eq!(n, 1);
     }
 }

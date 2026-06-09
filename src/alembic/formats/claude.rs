@@ -26,14 +26,29 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
     let mut session = UniversalSession::new(Uuid::new_v4().to_string());
     session.metadata.source_format = Some(SessionFormat::Claude);
 
+    // A torn FINAL line (a child killed mid-flush) must not void the whole
+    // conversation: tolerate it. A bad line FOLLOWED by valid data is real
+    // corruption and still fails loudly.
+    let mut torn: Option<anyhow::Error> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
 
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("invalid JSONL in {}", path.display()))?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(e) => {
+                torn = Some(anyhow::anyhow!(
+                    "invalid JSONL in {}: {e}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if let Some(e) = torn.take() {
+            return Err(e.context("corrupt line followed by valid data"));
+        }
         import_metadata(&mut session.metadata, &value);
 
         match value.get("type").and_then(Value::as_str) {
@@ -388,8 +403,25 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         .platform_version
         .clone()
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    // Synthetic assistant records carry the source conversation's real claude
+    // model when known (alembic hoists it into `claude_model` before sanitize
+    // clears per-message metadata) instead of claiming a model that never
+    // produced them.
+    let model = session
+        .metadata
+        .extra
+        .get("claude_model")
+        .and_then(Value::as_str)
+        .unwrap_or("claude-opus-4-8")
+        .to_string();
 
-    let mut file = File::create(&materialization.session_file).with_context(|| {
+    // Atomic materialization (B1): the projection may be the only copy of the
+    // conversation's newest turns, so never truncate it in place. Write a
+    // sibling tmp file, fsync, then rename over the target — a crash mid-write
+    // leaves the previous projection intact.
+    let tmp_path = super::tmp_sibling(&materialization.session_file);
+    let mut tmp_guard = super::TmpCleanup::new(&tmp_path);
+    let mut file = File::create(&tmp_path).with_context(|| {
         format!(
             "failed to create Claude session {}",
             materialization.session_file.display()
@@ -420,7 +452,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 }
 
                 let line = if projected_role == "assistant" {
-                    let assistant_message = claude_assistant_message(content, Value::Null);
+                    let assistant_message = claude_assistant_message(&model, content, Value::Null);
                     json!({
                         "parentUuid": previous_uuid,
                         "isSidechain": false,
@@ -472,7 +504,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     })
                     .collect::<Vec<_>>();
                 let assistant_message =
-                    claude_assistant_message(Value::Array(content), Value::Null);
+                    claude_assistant_message(&model, Value::Array(content), Value::Null);
                 let line = json!({
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
@@ -492,6 +524,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::ToolCall(call) => {
                 let event_uuid = Uuid::new_v4().to_string();
                 let assistant_message = claude_assistant_message(
+                    &model,
                     json!([{
                         "type": "tool_use",
                         "id": call.call_id,
@@ -549,6 +582,17 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             }
         }
     }
+
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, &materialization.session_file).with_context(|| {
+        format!(
+            "failed to move session into place at {}",
+            materialization.session_file.display()
+        )
+    })?;
+    tmp_guard.keep();
 
     if let Some(history_file) = &materialization.history_file {
         if let Some(parent) = history_file.parent() {
@@ -669,7 +713,7 @@ fn user_text_content(blocks: &[ContentBlock]) -> Value {
     }
 }
 
-fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
+fn claude_assistant_message(model: &str, content: Value, stop_reason: Value) -> Value {
     let mut message = Map::new();
     message.insert(
         "id".to_string(),
@@ -677,10 +721,7 @@ fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
     );
     message.insert("type".to_string(), Value::String("message".to_string()));
     message.insert("role".to_string(), Value::String("assistant".to_string()));
-    message.insert(
-        "model".to_string(),
-        Value::String("claude-opus-4-8".to_string()),
-    );
+    message.insert("model".to_string(), Value::String(model.to_string()));
     message.insert("content".to_string(), content);
     message.insert("stop_reason".to_string(), stop_reason);
     message.insert("stop_sequence".to_string(), Value::Null);

@@ -161,6 +161,47 @@ fn carry_mints_target_and_preserves_source() {
 }
 
 #[test]
+fn carry_reports_a_receipt() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).expect("carry emitted invalid JSON");
+    assert_eq!(
+        v["receipt"]["turns"].as_u64(),
+        Some(2),
+        "receipt missing turns: {v}"
+    );
+
+    let text = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+        ],
+    );
+    assert!(text.status.success(), "{}", err(&text));
+    assert!(
+        out(&text).contains("carried 2 turns"),
+        "human output missing receipt: {}",
+        out(&text)
+    );
+}
+
+#[test]
 fn carry_dry_run_writes_nothing() {
     let dir = tmpdir();
     let fix = ir_fixture(&dir);

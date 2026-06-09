@@ -32,13 +32,19 @@ impl Runtime {
         }
     }
 
-    /// Build a fresh interactive launch command for this runtime.
+    /// Build a fresh interactive launch command for this runtime. When
+    /// `session_id` is given and the runtime supports declaring one (claude's
+    /// `--session-id`), the child's identity is KNOWN to the harness from
+    /// birth instead of inferred from the filesystem later.
     ///
     /// portable-pty's CommandBuilder does NOT inherit the parent environment by
     /// default, so we copy it explicitly — PATH, HOME, TERM all matter for the
     /// child TUI to behave natively.
-    pub fn fresh_command(self) -> CommandBuilder {
-        self.command(&[])
+    pub fn fresh_command(self, session_id: Option<&str>) -> CommandBuilder {
+        match (self, session_id) {
+            (Runtime::Claude, Some(id)) => self.command(&["--session-id", id]),
+            _ => self.command(&[]),
+        }
     }
 
     /// Build a command that resumes an existing native session by id

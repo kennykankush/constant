@@ -91,6 +91,10 @@ struct Tokenizer {
     esc: Vec<u8>,
     prefix_byte: u8,
     prefix_cp: u32,
+    /// Inside a bracketed paste (ESC[200~ … ESC[201~): pasted bytes that happen
+    /// to contain the prefix byte must NOT trigger prefix mode — a paste could
+    /// otherwise fire a real runtime switch mid-paste.
+    in_paste: bool,
 }
 
 impl Tokenizer {
@@ -100,6 +104,7 @@ impl Tokenizer {
             esc: Vec::new(),
             prefix_byte,
             prefix_cp: (prefix_byte | 0x60) as u32,
+            in_paste: false,
         }
     }
 
@@ -118,7 +123,7 @@ impl Tokenizer {
             }
             if b == 0x1b {
                 self.esc.push(b);
-            } else if b == self.prefix_byte {
+            } else if b == self.prefix_byte && !self.in_paste {
                 out.push(Token::Prefix);
             } else {
                 out.push(Token::Byte(b));
@@ -149,8 +154,19 @@ impl Tokenizer {
         }
     }
 
-    fn classify(&self, seq: Vec<u8>, out: &mut Vec<Token>) {
-        if let Some((cp, mods, event)) = parse_kitty_u(&seq) {
+    fn classify(&mut self, seq: Vec<u8>, out: &mut Vec<Token>) {
+        // Track bracketed-paste state; the markers themselves pass through.
+        if seq.as_slice() == b"\x1b[200~" {
+            self.in_paste = true;
+            out.push(Token::Seq(seq));
+            return;
+        }
+        if seq.as_slice() == b"\x1b[201~" {
+            self.in_paste = false;
+            out.push(Token::Seq(seq));
+            return;
+        }
+        if !self.in_paste && let Some((cp, mods, event)) = parse_kitty_u(&seq) {
             let ctrl = mods.saturating_sub(1) & 4 != 0;
             if cp == self.prefix_cp && ctrl {
                 if event != 3 {
@@ -204,9 +220,18 @@ struct SwitchRequest {
     new: bool,
 }
 
+enum SpawnMode<'a> {
+    /// A fresh launch. For runtimes that support it, the session id is MINTED
+    /// and DECLARED here so the harness knows the child's identity instead of
+    /// inferring it from the filesystem later.
+    Fresh { session_id: Option<&'a str> },
+    /// Resume an existing session by id.
+    Resume(&'a str),
+}
+
 fn spawn_session(
     runtime: Runtime,
-    resume: Option<&str>,
+    mode: SpawnMode,
     cwd: Option<&Path>,
     cols: u16,
     rows: u16,
@@ -222,9 +247,9 @@ fn spawn_session(
         })
         .context("openpty")?;
 
-    let mut cmd = match resume {
-        Some(id) => runtime.resume_command(id),
-        None => runtime.fresh_command(),
+    let mut cmd = match mode {
+        SpawnMode::Resume(id) => runtime.resume_command(id),
+        SpawnMode::Fresh { session_id } => runtime.fresh_command(session_id),
     };
     if let Some(dir) = cwd {
         cmd.cwd(dir);
@@ -273,7 +298,10 @@ fn terminate(child: &mut Box<dyn Child + Send + Sync>) {
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
-        for _ in 0..15 {
+        // Up to 1s of grace: a child flushing a large session file on a slow
+        // disk must not be SIGKILLed mid-write (we read that file next). The
+        // loop exits as soon as the child is gone, so quick exits stay quick.
+        for _ in 0..100 {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 return;
             }
@@ -294,6 +322,87 @@ fn request_switch(
     }
     *switching_to = Some(SwitchRequest { target, new });
     terminate(&mut session.child);
+}
+
+/// One dim parenthetical status line.
+fn dim(out: &mut impl Write, text: &str) {
+    let _ = write!(out, "\x1b[2m  ({text})\x1b[0m\r\n");
+    let _ = out.flush();
+}
+
+/// Spawn a runtime fresh, minting + declaring a session id when the CLI
+/// supports it (claude `--session-id`). Returns the session and the declared id.
+fn spawn_fresh(
+    runtime: Runtime,
+    cwd: Option<&Path>,
+    cols: u16,
+    rows: u16,
+    tx: Sender<Ev>,
+) -> Result<(Session, Option<String>)> {
+    let minted = match runtime {
+        Runtime::Claude => crate::alembic::claude_supports_session_id()
+            .then(|| uuid::Uuid::new_v4().to_string()),
+        Runtime::Codex => None,
+    };
+    let session = spawn_session(
+        runtime,
+        SpawnMode::Fresh {
+            session_id: minted.as_deref(),
+        },
+        cwd,
+        cols,
+        rows,
+        tx,
+    )?;
+    Ok((session, minted))
+}
+
+/// Launch the post-switch child with a fallback ladder instead of dying:
+/// target resumed (the carry) → target fresh → back to the previous runtime
+/// (resumed if possible, else fresh). A failed launch must never tear down the
+/// whole harness while a recoverable step remains. Returns the live session
+/// plus its declared session id when known.
+#[allow(clippy::too_many_arguments)]
+fn spawn_settled(
+    target: Runtime,
+    resume_id: Option<&str>,
+    from: Runtime,
+    from_resume: Option<&str>,
+    cwd: Option<&Path>,
+    cols: u16,
+    rows: u16,
+    tx: &Sender<Ev>,
+    out: &mut impl Write,
+) -> Result<(Session, Option<String>)> {
+    if let Some(id) = resume_id {
+        match spawn_session(target, SpawnMode::Resume(id), cwd, cols, rows, tx.clone()) {
+            Ok(s) => return Ok((s, Some(id.to_string()))),
+            Err(e) => dim(
+                out,
+                &format!(
+                    "couldn't launch {} resumed — {e}; trying fresh",
+                    target.label()
+                ),
+            ),
+        }
+    }
+    match spawn_fresh(target, None, cols, rows, tx.clone()) {
+        Ok(r) => return Ok(r),
+        Err(e) => dim(
+            out,
+            &format!(
+                "couldn't launch {} — {e}; returning to {}",
+                target.label(),
+                from.label()
+            ),
+        ),
+    }
+    if let Some(id) = from_resume
+        && let Ok(s) = spawn_session(from, SpawnMode::Resume(id), None, cols, rows, tx.clone())
+    {
+        return Ok((s, Some(id.to_string())));
+    }
+    spawn_fresh(from, None, cols, rows, tx.clone())
 }
 
 #[derive(PartialEq)]
@@ -343,7 +452,7 @@ fn clear_bottom(out: &mut impl Write) {
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  C=new claude  x=codex  X=new codex  :=command  d=detach\x1b[0m\r\n",
+        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  C=new claude  x=codex  X=new codex  :=command  d=quit\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();
@@ -466,13 +575,14 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
     }
 
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   C=new claude   x=codex   X=new codex   :=command   d=detach "
+        " {prefix_label} ▸  c=claude   C=new claude   x=codex   X=new codex   :=command   d=quit "
     );
 
     let mut out = std::io::stdout();
 
     let mut dbg: Option<std::fs::File> = if std::env::var("CONSTANT_DEBUG").is_ok() {
-        std::fs::File::create("/tmp/constant-debug.log").ok()
+        let path = std::env::temp_dir().join(format!("constant-debug-{}.log", std::process::id()));
+        std::fs::File::create(path).ok()
     } else {
         None
     };
@@ -500,7 +610,23 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
     let mut trail_n: u32 = 0;
     let mut root_id: Option<String> = None;
     let mut root_slug: Option<String> = None;
-    let mut session = spawn_session(initial, None, None, cols, rows, tx.clone())?;
+    // Declared identity: the session id we POSITIVELY know the child owns —
+    // the id we resumed into it, or the one we minted at a fresh claude launch.
+    // Source resolution prefers this over filesystem inference.
+    let mut child_session: Option<String>;
+    // Spawn-time fence for detection: only sessions touched at/after this
+    // instant can be adopted as a carry seed.
+    let mut child_spawned_at = std::time::SystemTime::now();
+    // Settlement watchdog: a child that exits within 2s of a spawn almost
+    // certainly rejected its session (or isn't installed) — recover once
+    // instead of silently tearing the harness down.
+    let mut watchdog = std::time::Instant::now();
+    let mut respawned_once = false;
+    let mut session = {
+        let (s, declared) = spawn_fresh(initial, None, cols, rows, tx.clone())?;
+        child_session = declared;
+        s
+    };
     banner(&mut out, session.runtime, &prefix_label);
 
     let mut mode = M_NORMAL;
@@ -513,7 +639,19 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
         match ev {
             Ev::Pty(bytes) => {
                 if mode == M_COMMAND {
-                    pending_out.extend_from_slice(&bytes);
+                    // Bounded: a chatty child while the user sits in the command
+                    // line must not grow memory forever. Past the cap, flush
+                    // through and redraw the prompt (a flicker beats a leak).
+                    const MAX_PENDING: usize = 1 << 20;
+                    if pending_out.len() + bytes.len() > MAX_PENDING {
+                        let _ = out.write_all(&pending_out);
+                        pending_out.clear();
+                        let _ = out.write_all(&bytes);
+                        let _ = out.flush();
+                        bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                    } else {
+                        pending_out.extend_from_slice(&bytes);
+                    }
                 } else {
                     let _ = out.write_all(&bytes);
                     let _ = out.flush();
@@ -529,36 +667,50 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                     write_reset(&mut out); // undo outgoing child's terminal modes
                     let _ = out.write_all(b"\x1b[2J\x1b[H");
 
-                    // Read source for `from`. Prefer our tracked projection — it's
-                    // the established ping-pong pair, positively tied to the child
-                    // we spawned — so an unrelated newer session in the same cwd is
-                    // NOT adopted (another codex/claude process must not hijack the
-                    // carry). Use the live active session when it's the child's OWN
-                    // session (same id — e.g. codex wrote a fresh rollout file for
-                    // the resumed id) so we still capture the latest turns, or as
-                    // the seed on the very first switch.
-                    // NB: a `/resume` to a *different* conversation inside the child
-                    // is deliberately not auto-followed — it's indistinguishable
-                    // from an unrelated same-cwd session (documented limitation).
-                    let active = crate::alembic::active_session(from, host_cwd.as_deref());
-                    let tracked = owned
-                        .get(&from)
-                        .and_then(|(id, p)| p.exists().then(|| (p.clone(), id.clone())));
-                    let src = match (tracked, active) {
-                        (Some((tpath, tid)), Some((apath, aid))) => {
-                            if aid == tid {
-                                Some((apath, aid)) // child's own session, freshest file
-                            } else {
-                                Some((tpath, tid)) // ignore unrelated newer session
+                    // Read source for `from`, strongest evidence first:
+                    //  1. DECLARED identity — the session id we positively know
+                    //     the child owns (resumed id, or minted at launch).
+                    //     Resolved by id with newest-file-wins, so codex's
+                    //     rewrite-on-resume is followed automatically.
+                    //  2. The tracked projection of the established pair.
+                    //  3. cwd- AND spawn-time-fenced detection (the seed on a
+                    //     first switch). The fence stops an older or concurrent
+                    //     same-cwd session from being adopted; a `/resume` away
+                    //     inside the child is picked up here when the declared
+                    //     session never got a conversation of its own.
+                    let declared = child_session
+                        .as_deref()
+                        .and_then(|id| crate::alembic::session_by_id(from, id));
+                    let src = declared.or_else(|| {
+                        let active = crate::alembic::active_session(
+                            from,
+                            host_cwd.as_deref(),
+                            Some(child_spawned_at),
+                        );
+                        let tracked = owned
+                            .get(&from)
+                            .and_then(|(id, p)| p.exists().then(|| (p.clone(), id.clone())));
+                        match (tracked, active) {
+                            (Some((tpath, tid)), Some((apath, aid))) => {
+                                if aid == tid {
+                                    Some((apath, aid)) // child's own session, freshest file
+                                } else {
+                                    Some((tpath, tid)) // ignore unrelated newer session
+                                }
                             }
+                            (Some(t), None) => Some(t),
+                            (None, Some(a)) => Some(a), // first switch / seed
+                            (None, None) => None,
                         }
-                        (Some(t), None) => Some(t),
-                        (None, Some(a)) => Some(a), // first switch / seed
-                        (None, None) => None,
-                    };
+                    });
 
-                    match src {
-                        Some((src_path, src_id)) => {
+                    // Load + distill the source ONCE; naming and the carry share it.
+                    let distilled = src.as_ref().map(|(src_path, _)| {
+                        crate::alembic::distill_source(src_path)
+                    });
+
+                    let spawned = match (src, distilled) {
+                        (Some((src_path, src_id)), Some(Ok(mut distilled))) => {
                             // Which conversation does the LIVE source belong to?
                             // Re-resolved every switch (via the ledger), not just
                             // the first — so if the user `/resume`d a *different*
@@ -577,7 +729,8 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                 for (rt, id, path) in projs {
                                     owned.insert(rt, (id, path));
                                 }
-                                let name = crate::alembic::root_name(&src_path, from)
+                                let name = distilled
+                                    .root_name()
                                     .unwrap_or_else(|| "conversation".to_string());
                                 root_slug = Some(crate::trail::slug(&name));
                             }
@@ -591,10 +744,11 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                             let action = if request.new { "new" } else { "continue" };
                             let _ = out.write_all(
                                 format!(
-                                    "\x1b[2m  trail · {} · {} \u{2192} {} · {action}\x1b[0m\r\n",
+                                    "\x1b[2m  trail · {} · {} \u{2192} {} · {action} · {}\x1b[0m\r\n",
                                     title,
                                     from.label(),
-                                    target.label()
+                                    target.label(),
+                                    distilled.receipt.summary(),
                                 )
                                 .as_bytes(),
                             );
@@ -610,7 +764,8 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                             let reuse = reuse_owned
                                 .as_ref()
                                 .map(|(id, p)| (id.as_str(), p.as_path()));
-                            match crate::alembic::distill_path(
+                            match crate::alembic::distill_write(
+                                &mut distilled,
                                 &src_path,
                                 target,
                                 reuse,
@@ -629,7 +784,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                     }
                                     trail_n = n; // commit only on success
                                     owned.insert(target, (id.clone(), written.clone()));
-                                    crate::trail::record(
+                                    if let Err(e) = crate::trail::record(
                                         n,
                                         &conv_id,
                                         &slug,
@@ -646,15 +801,23 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                         } else {
                                             "new-fork"
                                         },
-                                    );
-                                    session = spawn_session(
+                                    ) {
+                                        // The carry is fine; the LEDGER diverged —
+                                        // say so, or the next re-host silently forks.
+                                        dim(&mut out, &format!("trail ledger write failed: {e}"));
+                                    }
+                                    child_spawned_at = std::time::SystemTime::now();
+                                    spawn_settled(
                                         target,
                                         Some(&id),
+                                        from,
+                                        Some(&src_id),
                                         session_cwd.as_deref(),
                                         c,
                                         r,
-                                        tx.clone(),
-                                    )?;
+                                        &tx,
+                                        &mut out,
+                                    )?
                                 }
                                 Err(e) => {
                                     if let Some(f) = dbg.as_mut() {
@@ -668,24 +831,70 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                     owned.clear();
                                     root_id = None;
                                     root_slug = None;
-                                    let _ = out.write_all(
-                                        format!("\x1b[2m  (couldn't carry — {e}; starting fresh)\x1b[0m\r\n")
-                                            .as_bytes(),
-                                    );
-                                    let _ = out.flush();
-                                    session = spawn_session(target, None, None, c, r, tx.clone())?;
+                                    dim(&mut out, &format!("couldn't carry — {e}; starting fresh"));
+                                    child_spawned_at = std::time::SystemTime::now();
+                                    spawn_settled(
+                                        target,
+                                        None,
+                                        from,
+                                        Some(&src_id),
+                                        None,
+                                        c,
+                                        r,
+                                        &tx,
+                                        &mut out,
+                                    )?
                                 }
                             }
                         }
-                        None => {
-                            let _ = out.write_all(
-                                b"\x1b[2m  (no conversation here to carry; starting fresh)\x1b[0m\r\n",
-                            );
-                            let _ = out.flush();
-                            session = spawn_session(target, None, None, c, r, tx.clone())?;
+                        (Some((_, src_id)), Some(Err(e))) => {
+                            // The source exists but won't load (corrupt beyond the
+                            // tolerated torn tail). Don't kill recovered state we
+                            // might still need; start the target fresh.
+                            dim(&mut out, &format!("couldn't read the conversation — {e}; starting fresh"));
+                            child_spawned_at = std::time::SystemTime::now();
+                            spawn_settled(target, None, from, Some(&src_id), None, c, r, &tx, &mut out)?
                         }
-                    }
+                        _ => {
+                            dim(&mut out, "no conversation here to carry; starting fresh");
+                            child_spawned_at = std::time::SystemTime::now();
+                            spawn_settled(target, None, from, None, None, c, r, &tx, &mut out)?
+                        }
+                    };
+                    session = spawned.0;
+                    child_session = spawned.1;
+                    watchdog = std::time::Instant::now();
+                    respawned_once = false;
                     banner(&mut out, session.runtime, &prefix_label);
+                } else if watchdog.elapsed() < std::time::Duration::from_secs(2)
+                    && !respawned_once
+                {
+                    // Settlement check: the child died almost immediately after a
+                    // spawn — a rejected resume or a missing/broken binary, not a
+                    // user quitting. Recover once with a fresh launch (the carry,
+                    // if any, is safe in the trail) instead of exiting silently.
+                    respawned_once = true;
+                    let rt = session.runtime;
+                    let _ = session.child.wait();
+                    write_reset(&mut out);
+                    dim(
+                        &mut out,
+                        &format!(
+                            "{} exited immediately — restarting it fresh (any carried session stays in `constant trail`)",
+                            rt.label()
+                        ),
+                    );
+                    let (c, r) = size().unwrap_or((cols, rows));
+                    child_spawned_at = std::time::SystemTime::now();
+                    match spawn_fresh(rt, None, c, r, tx.clone()) {
+                        Ok((s, declared)) => {
+                            session = s;
+                            child_session = declared;
+                            watchdog = std::time::Instant::now();
+                            banner(&mut out, session.runtime, &prefix_label);
+                        }
+                        Err(_) => break,
+                    }
                 } else {
                     break;
                 }
@@ -907,6 +1116,23 @@ mod tests {
         // A normal byte passes through.
         let toks = classify_all(b"a", 0x02);
         assert!(matches!(toks.as_slice(), [Token::Byte(b'a')]));
+    }
+
+    #[test]
+    fn tokenizer_ignores_prefix_inside_bracketed_paste() {
+        // Pasted content containing the raw prefix byte must NOT enter prefix
+        // mode (it would fire a real switch mid-paste). After the paste closes,
+        // the prefix works again.
+        let mut tk = Tokenizer::new(0x02);
+        let mut toks = Vec::new();
+        tk.feed(b"\x1b[200~\x02c\x1b[201~", &mut toks);
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::Prefix)),
+            "prefix fired inside a paste"
+        );
+        let mut after = Vec::new();
+        tk.feed(&[0x02], &mut after);
+        assert!(matches!(after.as_slice(), [Token::Prefix]));
     }
 
     #[test]

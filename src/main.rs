@@ -11,7 +11,7 @@ mod trail;
 
 use anyhow::{Context, Result, bail};
 use runtime::Runtime;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,41 +61,6 @@ fn term_safe(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
-}
-
-/// True if `out` resolves to the same file as `src`, so `export --out` can never
-/// clobber the session it's reading. For existing files this compares device+inode
-/// (catching hard links AND symlinks, which path canonicalization alone misses);
-/// for a not-yet-existing `out` it compares resolved parent-dir + filename.
-fn same_file(src: &Path, out: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(out)) {
-            return a.dev() == b.dev() && a.ino() == b.ino();
-        }
-    }
-    let Ok(src_c) = src.canonicalize() else {
-        return false;
-    };
-    if let Ok(out_c) = out.canonicalize() {
-        return src_c == out_c;
-    }
-    // `out` doesn't exist yet: resolve its parent dir + filename.
-    match (out.parent(), out.file_name()) {
-        (Some(parent), Some(name)) => {
-            let parent = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            parent
-                .canonicalize()
-                .map(|p| p.join(name) == src_c)
-                .unwrap_or(false)
-        }
-        _ => false,
-    }
 }
 
 fn run_host(rest: &[String]) -> Result<()> {
@@ -190,20 +155,23 @@ fn run_carry(rest: &[String]) -> Result<()> {
                 from.as_deref()
                     .context("carry requires --from or --session")?,
             )?;
-            let (p, id) = alembic::active_session(rt, here.as_deref())
+            let (p, id) = alembic::active_session(rt, here.as_deref(), None)
                 .context("no conversation found here to carry")?;
             (p, id, rt)
         }
     };
+
+    // Load + distill ONCE — the trail name, the dry-run preview, and the carry
+    // itself all share the same parsed source.
+    let mut distilled = alembic::distill_source(&src_path)?;
+    let root = distilled.root_name();
 
     // Trail: which conversation this source belongs to, the next hop number, and
     // any existing projection for the target — so repeated headless carries reuse
     // the stable pair (overwrite Constant's own projection) instead of minting a
     // new file every time, exactly like the interactive harness.
     let (conv_id, last_n, projs) = trail::resume(&src_path, &src_id);
-    let slug = trail::slug(
-        &alembic::root_name(&src_path, from_rt).unwrap_or_else(|| "conversation".to_string()),
-    );
+    let slug = trail::slug(&root.clone().unwrap_or_else(|| "conversation".to_string()));
     let n = last_n + 1;
     let title = trail::title(n, from_rt, &slug);
 
@@ -217,7 +185,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             .iter()
             .find(|(rt, _, _)| *rt == to)
             .map(|(_, id, p)| (id.clone(), p.clone()))
-            .filter(|(_, p)| !same_file(&src_path, p))
+            .filter(|(_, p)| !alembic::same_file(&src_path, p))
     };
     let reuse = reuse_owned
         .as_ref()
@@ -228,8 +196,15 @@ fn run_carry(rest: &[String]) -> Result<()> {
         "new-fork"
     };
 
+    let receipt = distilled.receipt;
+    let receipt_json = serde_json::json!({
+        "turns": receipt.turns,
+        "dropped_tools": receipt.dropped_tools,
+        "dropped_scaffold": receipt.dropped_scaffold,
+        "redactions": receipt.redactions,
+    });
+
     if dry_run {
-        let p = alembic::preview(&src_path)?;
         if debug && !json {
             trail::print_carry_debug(&src_path, &src_id, &conv_id, &slug, from_rt, to, n, reuse);
         }
@@ -238,9 +213,10 @@ fn run_carry(rest: &[String]) -> Result<()> {
                 "dry_run": true,
                 "from": from_rt.label(),
                 "to": to.label(),
-                "messages": p.message_count,
-                "root": p.root_name,
+                "messages": receipt.turns,
+                "root": root,
                 "source": src_path.display().to_string(),
+                "receipt": receipt_json,
             });
             if debug {
                 out["debug"] = serde_json::json!({
@@ -258,10 +234,10 @@ fn run_carry(rest: &[String]) -> Result<()> {
         } else {
             println!(
                 "dry-run: would carry {} message(s) {} → {} (root: {})",
-                p.message_count,
+                receipt.turns,
                 from_rt.label(),
                 to.label(),
-                term_safe(p.root_name.as_deref().unwrap_or("?"))
+                term_safe(root.as_deref().unwrap_or("?"))
             );
         }
         return Ok(());
@@ -270,12 +246,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
     if debug && !json {
         trail::print_carry_debug(&src_path, &src_id, &conv_id, &slug, from_rt, to, n, reuse);
     }
-    let (id, written, cwd) = alembic::distill_path(&src_path, to, reuse, Some(&title))?;
+    let (id, written, cwd) =
+        alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
     // Record the trail under the CONVERSATION's own cwd (carried from the source
     // session), not the directory `carry` happened to be invoked from — so
     // `constant trail` in that project shows its own threads. Fall back to the
-    // invocation dir only if the session has no recorded cwd.
-    trail::record(
+    // invocation dir only if the session has no recorded cwd. A failed ledger
+    // append is surfaced: pair-reuse depends on it.
+    if let Err(e) = trail::record(
         n,
         &conv_id,
         &slug,
@@ -288,7 +266,9 @@ fn run_carry(rest: &[String]) -> Result<()> {
         &written,
         &title,
         mode,
-    );
+    ) {
+        eprintln!("warning: trail ledger write failed: {e}");
+    }
 
     let resume = match to {
         Runtime::Claude => format!("claude -r {id}"),
@@ -303,6 +283,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "cwd": cwd.as_ref().map(|p| p.display().to_string()),
             "resume": &resume,
             "trail": &title,
+            "receipt": receipt_json,
         });
         if debug {
             out["debug"] = serde_json::json!({
@@ -320,6 +301,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
         println!("{out}");
     } else {
         println!("carried → {} session {id}  ({title})", to.label());
+        println!("{}", receipt.summary());
         if let Some(cwd) = cwd {
             println!("cwd: {}", term_safe(&cwd.display().to_string()));
         }
@@ -362,7 +344,7 @@ fn run_export(rest: &[String]) -> Result<()> {
         (Some(p), _) => alembic::resolve_session(p)?,
         (None, Some(f)) => {
             let rt = Runtime::parse(f)?;
-            alembic::active_session(rt, here.as_deref())
+            alembic::active_session(rt, here.as_deref(), None)
                 .context("no conversation found here to export")?
                 .0
         }
@@ -372,7 +354,7 @@ fn run_export(rest: &[String]) -> Result<()> {
     let (ir, messages) = alembic::export_ir(&src_path)?;
     match out {
         Some(path) => {
-            if same_file(&src_path, &path) {
+            if alembic::same_file(&src_path, &path) {
                 bail!(
                     "refusing to overwrite the source session at {}",
                     term_safe(&path.display().to_string())
@@ -681,7 +663,7 @@ INSIDE A HOSTED SESSION (press the prefix, then):
   x              continue in codex
   X              create a new codex continuation
   :              open the command line (e.g. `switch claude`, `new claude`, `quit`)
-  d              detach / quit Constant
+  d              quit Constant (the hosted CLI exits with it)
   <prefix> again send a literal prefix key to the child
 "#
     );
