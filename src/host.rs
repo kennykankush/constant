@@ -529,8 +529,15 @@ pub fn debug_keys() -> Result<()> {
     Ok(())
 }
 
-/// Entry point for `constant host [runtime] [--prefix ...]`.
-pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
+/// Entry point for `constant host [runtime] [--prefix ...]` and
+/// `constant resume` (which passes the projection id to wake up — the child's
+/// identity is then declared from birth, no detection needed).
+pub fn run(
+    initial: Runtime,
+    resume: Option<&str>,
+    prefix: u8,
+    prefix_label: String,
+) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("`constant host` must run in an interactive terminal (a TTY)");
     }
@@ -622,10 +629,16 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
     // instead of silently tearing the harness down.
     let mut watchdog = std::time::Instant::now();
     let mut respawned_once = false;
-    let mut session = {
-        let (s, declared) = spawn_fresh(initial, None, cols, rows, tx.clone())?;
-        child_session = declared;
-        s
+    let mut session = match resume {
+        Some(id) => {
+            child_session = Some(id.to_string());
+            spawn_session(initial, SpawnMode::Resume(id), None, cols, rows, tx.clone())?
+        }
+        None => {
+            let (s, declared) = spawn_fresh(initial, None, cols, rows, tx.clone())?;
+            child_session = declared;
+            s
+        }
     };
     banner(&mut out, session.runtime, &prefix_label);
 

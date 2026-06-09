@@ -11,7 +11,7 @@ mod trail;
 
 use anyhow::{Context, Result, bail};
 use runtime::Runtime;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -22,6 +22,7 @@ fn main() -> Result<()> {
         // internal step is still called distillation).
         Some("carry") | Some("distill") => run_carry(&args[1..]),
         Some("sessions") | Some("ls") => run_sessions(&args[1..]),
+        Some("resume") => run_resume_cmd(&args[1..]),
         Some("export") => run_export(&args[1..]),
         Some("doctor") => run_doctor(&args[1..]),
         Some("status") => run_status(&args[1..]),
@@ -88,7 +89,7 @@ fn run_host(rest: &[String]) -> Result<()> {
     }
 
     let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
-    host::run(Runtime::parse(&runtime_str)?, prefix_byte, prefix_label)
+    host::run(Runtime::parse(&runtime_str)?, None, prefix_byte, prefix_label)
 }
 
 fn run_carry(rest: &[String]) -> Result<()> {
@@ -411,6 +412,162 @@ fn run_trail(rest: &[String]) -> Result<()> {
     }
 }
 
+/// `constant resume [QUERY]` — re-host a conversation from the trail: pick its
+/// latest projection and open it live in the harness (identity declared from
+/// birth, no filesystem detection). If every projection is gone, reprint one
+/// from the latest record volume first. Without a TTY, prints the native
+/// resume command instead so it stays scriptable.
+fn run_resume_cmd(rest: &[String]) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let mut query: Option<String> = None;
+    let mut runtime_in: Option<Runtime> = None;
+    let mut all = false;
+    let mut list = false;
+    let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
+
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--in" => {
+                runtime_in = Some(Runtime::parse(&flag_value(rest, i, "--in")?)?);
+                i += 2;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--list" => {
+                list = true;
+                i += 1;
+            }
+            "--prefix" | "-p" => {
+                prefix_str = flag_value(rest, i, "--prefix")?;
+                i += 2;
+            }
+            s if !s.starts_with('-') => {
+                if query.is_some() {
+                    bail!("resume takes one query (slug or conversation id)");
+                }
+                query = Some(s.to_string());
+                i += 1;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    let convs = trail::conversations(cwd.as_deref());
+    if convs.is_empty() {
+        let scope = if all {
+            String::new()
+        } else {
+            " here (try --all)".to_string()
+        };
+        bail!("no conversations in the trail{scope} — start one with `constant host`");
+    }
+
+    if list {
+        print_resume_list(&convs);
+        return Ok(());
+    }
+
+    // Pick the conversation: newest when no query; else match slug substring
+    // or conversation-id prefix.
+    let matches: Vec<&trail::ConversationView> = match &query {
+        None => vec![&convs[0]],
+        Some(q) => {
+            let ql = q.to_lowercase();
+            convs
+                .iter()
+                .filter(|c| c.slug.to_lowercase().contains(&ql) || c.conversation.starts_with(q.as_str()))
+                .collect()
+        }
+    };
+    let conv = match matches.len() {
+        0 => {
+            print_resume_list(&convs);
+            bail!(
+                "no conversation matches `{}`",
+                term_safe(query.as_deref().unwrap_or(""))
+            );
+        }
+        1 => matches[0],
+        _ => {
+            println!("`{}` is ambiguous:", term_safe(query.as_deref().unwrap_or("")));
+            for c in &matches {
+                println!("  {}", term_safe(&c.slug));
+            }
+            bail!("narrow the query");
+        }
+    };
+
+    // Pick the projection: the requested runtime, else the latest hop's target.
+    let projection = match runtime_in {
+        Some(rt) => conv.projections.iter().find(|p| p.runtime == rt.label()),
+        None => conv.projections.iter().max_by_key(|p| p.last_n),
+    };
+
+    let (rt, id, note) = match projection {
+        Some(p) => (Runtime::parse(&p.runtime)?, p.id.clone(), None),
+        None => {
+            // Lost-record doctrine: every live projection is gone — reprint a
+            // fresh one from the conversation's latest record volume.
+            let snap = trail::latest_snapshot(&conv.conversation).with_context(|| {
+                format!(
+                    "`{}` has no live projection and no record volume to restore from",
+                    conv.slug
+                )
+            })?;
+            let restored = restore_session(&snap, runtime_in)?;
+            let note = format!(
+                "projection missing — restored from the record ({})",
+                restored.receipt.summary()
+            );
+            (restored.to, restored.id, Some(note))
+        }
+    };
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        if let Some(n) = &note {
+            println!("{}", term_safe(n));
+        }
+        println!("conversation: {}", term_safe(&conv.slug));
+        println!(
+            "not a terminal — resume manually with: {}",
+            native_resume_cmd(rt, &id)
+        );
+        return Ok(());
+    }
+
+    let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
+    if let Some(n) = &note {
+        println!("{n}");
+    }
+    host::run(rt, Some(&id), prefix_byte, prefix_label)
+}
+
+fn print_resume_list(convs: &[trail::ConversationView]) {
+    println!("resumable conversations (newest first):");
+    for c in convs {
+        let lives_in = if c.projections.is_empty() {
+            "record only".to_string()
+        } else {
+            c.projections
+                .iter()
+                .map(|p| p.runtime.as_str())
+                .collect::<Vec<_>>()
+                .join("·")
+        };
+        println!("  {:<44}  {}", term_safe(&c.slug), lives_in);
+        println!("      constant resume {}", term_safe(&c.slug));
+    }
+}
+
 fn run_snapshots(rest: &[String]) -> Result<()> {
     let mut all = false;
     for arg in rest {
@@ -427,9 +584,72 @@ fn run_snapshots(rest: &[String]) -> Result<()> {
     trail::print_snapshots(cwd.as_deref())
 }
 
-/// `constant restore <snapshot> [--to codex|claude]` — reprint a fresh native
-/// session from a record volume (or any session file). Always MINTS a new
-/// projection: certified copies circulate, the record never gets written on.
+/// A restore's outcome: the freshly minted projection and where it came from.
+struct Restored {
+    to: Runtime,
+    id: String,
+    title: String,
+    receipt: alembic::CarryReceipt,
+    cwd: Option<PathBuf>,
+    source: PathBuf,
+}
+
+/// Reprint a fresh native session from a record volume (or any session file).
+/// Always MINTS a new projection: certified copies circulate, the record never
+/// gets written on. The restore is logged to the trail so lineage stays joined.
+fn restore_session(source: &Path, to_override: Option<Runtime>) -> Result<Restored> {
+    let resolved = alembic::resolve_session(source)?;
+    let (src_rt, src_id) = alembic::identify(&resolved)
+        .with_context(|| format!("could not identify {}", resolved.display()))?;
+    // Default target: the runtime the recorded conversation came from.
+    let to = to_override.unwrap_or(src_rt);
+
+    let mut distilled = alembic::distill_source(&resolved)?;
+    let root = distilled.root_name();
+    let (conv_id, last_n, _) = trail::resume(&resolved, &src_id);
+    let slug = trail::slug(&root.unwrap_or_else(|| "conversation".to_string()));
+    let n = last_n + 1;
+    let title = trail::title(n, src_rt, &slug);
+
+    let (id, written, cwd) =
+        alembic::distill_write(&mut distilled, &resolved, to, None, Some(&title))?;
+    let here = std::env::current_dir().ok();
+    if let Err(e) = trail::record(
+        n,
+        &conv_id,
+        &slug,
+        cwd.as_deref().or(here.as_deref()),
+        &src_id,
+        &resolved,
+        src_rt,
+        to,
+        &id,
+        &written,
+        &title,
+        "restore",
+        Some(&resolved),
+    ) {
+        eprintln!("warning: trail ledger write failed: {e}");
+    }
+
+    Ok(Restored {
+        to,
+        id,
+        title,
+        receipt: distilled.receipt,
+        cwd,
+        source: resolved,
+    })
+}
+
+fn native_resume_cmd(rt: Runtime, id: &str) -> String {
+    match rt {
+        Runtime::Claude => format!("claude -r {id}"),
+        Runtime::Codex => format!("codex resume {id}"),
+    }
+}
+
+/// `constant restore <snapshot> [--to codex|claude]`.
 fn run_restore(rest: &[String]) -> Result<()> {
     let mut source: Option<PathBuf> = None;
     let mut to: Option<String> = None;
@@ -457,50 +677,17 @@ fn run_restore(rest: &[String]) -> Result<()> {
     let source = source.context(
         "restore needs a snapshot path or session id (see `constant snapshots`)",
     )?;
-    let resolved = alembic::resolve_session(&source)?;
-    let (src_rt, src_id) = alembic::identify(&resolved)
-        .with_context(|| format!("could not identify {}", resolved.display()))?;
-    // Default target: the runtime the recorded conversation came from.
-    let to = match to {
-        Some(s) => Runtime::parse(&s)?,
-        None => src_rt,
-    };
-
-    let mut distilled = alembic::distill_source(&resolved)?;
-    let root = distilled.root_name();
-    let (conv_id, last_n, _) = trail::resume(&resolved, &src_id);
-    let slug = trail::slug(&root.unwrap_or_else(|| "conversation".to_string()));
-    let n = last_n + 1;
-    let title = trail::title(n, src_rt, &slug);
-
-    // Always a fresh mint (reuse: None) — a restore must never overwrite an
-    // existing projection, let alone the record it reads from.
-    let (id, written, cwd) =
-        alembic::distill_write(&mut distilled, &resolved, to, None, Some(&title))?;
-    let here = std::env::current_dir().ok();
-    if let Err(e) = trail::record(
-        n,
-        &conv_id,
-        &slug,
-        cwd.as_deref().or(here.as_deref()),
-        &src_id,
-        &resolved,
-        src_rt,
+    let to = to.map(|s| Runtime::parse(&s)).transpose()?;
+    let Restored {
         to,
-        &id,
-        &written,
-        &title,
-        "restore",
-        Some(&resolved),
-    ) {
-        eprintln!("warning: trail ledger write failed: {e}");
-    }
+        id,
+        title,
+        receipt,
+        cwd,
+        source: resolved,
+    } = restore_session(&source, to)?;
 
-    let resume = match to {
-        Runtime::Claude => format!("claude -r {id}"),
-        Runtime::Codex => format!("codex resume {id}"),
-    };
-    let receipt = distilled.receipt;
+    let resume = native_resume_cmd(to, &id);
 
     if json {
         println!(
@@ -772,6 +959,12 @@ USAGE:
         --dry-run previews without writing; --debug shows the route decision;
         --new creates a fresh target continuation instead of refreshing one.
         (`distill` is an alias.)
+
+  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t]
+        Re-host a conversation from the trail: wakes its latest projection live
+        (prefix switching ready). No QUERY = the newest conversation here;
+        QUERY matches the slug or conversation id. If every projection is gone,
+        reprints one from the latest record volume first.
 
   constant sessions [--from codex|claude] [--all] [--titles] [--json]
         List carryable sessions (this directory, or --all). --titles adds a preview

@@ -49,6 +49,15 @@ carry pipeline made definite.
   moved to a per-process temp path.
 
 ### Added
+- **`constant resume [QUERY]`** — re-host a conversation straight from the
+  trail: picks its latest projection and opens it live in the harness with the
+  session identity declared from birth (no filesystem detection). No QUERY
+  resumes the newest conversation in the current directory; QUERY matches the
+  slug or conversation id (`--in codex|claude` picks a side, `--list` shows
+  candidates, `--all` widens scope). If every live projection has been
+  deleted, resume reprints one from the conversation's latest record volume
+  first. Without a TTY it prints the native resume command instead, so it
+  stays scriptable.
 - **The record: per-hop IR snapshots.** Every carry now writes the distilled
   conversation to `~/.constant/snapshots/<conversation>/tNN-from-<runtime>.json`
   (atomic, owner-only, post-redaction) BEFORE materializing the native copy,

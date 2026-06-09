@@ -741,6 +741,20 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The newest record volume for a conversation that still exists on disk —
+/// the lost-record fallback for `constant resume`: when every live projection
+/// is gone, the conversation is reprinted from its latest record.
+pub fn latest_snapshot(conv_id: &str) -> Option<PathBuf> {
+    let mut rows: Vec<TrailEntry> = load_entries(None)
+        .into_iter()
+        .filter(|e| e.conversation == conv_id && e.snapshot.is_some())
+        .collect();
+    rows.sort_by_key(|e| std::cmp::Reverse((e.ts, e.n)));
+    rows.into_iter()
+        .filter_map(|e| e.snapshot.map(PathBuf::from))
+        .find(|p| p.exists())
+}
+
 /// `constant snapshots` — list the record volumes (per-hop IR snapshots) the
 /// ledger knows about, grouped by conversation. A volume the ledger doesn't
 /// reference is effectively lost in the archive, so this lists from the

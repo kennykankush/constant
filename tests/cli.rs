@@ -34,21 +34,27 @@ fn tmpdir() -> PathBuf {
 /// A minimal neutral IR conversation with a known origin runtime, so `carry` can
 /// re-hydrate it and label the trail.
 fn ir_fixture(dir: &Path) -> PathBuf {
-    let path = dir.join("fixture.json");
-    let ir = r#"{
+    ir_fixture_named(dir, "fixture.json", "fixture-0001", "hello from the fixture")
+}
+
+fn ir_fixture_named(dir: &Path, file: &str, id: &str, text: &str) -> PathBuf {
+    let path = dir.join(file);
+    let ir = format!(
+        r#"{{
   "ir_version": "transession/v1",
-  "metadata": {
-    "session_id": "fixture-0001",
+  "metadata": {{
+    "session_id": "{id}",
     "source_format": "codex",
     "cwd": "/tmp/constant-cli-proj"
-  },
+  }},
   "events": [
-    { "kind": "message", "role": "user",
-      "blocks": [ { "kind": "text", "text": "hello from the fixture" } ] },
-    { "kind": "message", "role": "assistant",
-      "blocks": [ { "kind": "text", "text": "acknowledged" } ] }
+    {{ "kind": "message", "role": "user",
+      "blocks": [ {{ "kind": "text", "text": "{text}" }} ] }},
+    {{ "kind": "message", "role": "assistant",
+      "blocks": [ {{ "kind": "text", "text": "acknowledged" }} ] }}
   ]
-}"#;
+}}"#
+    );
     std::fs::write(&path, ir).unwrap();
     path
 }
@@ -795,6 +801,115 @@ fn status_reports_runtime_trail_and_latest_sessions() {
     assert!(
         !text.contains("hello-from-the-fixture"),
         "status should not print prompt-derived trail slugs: {text}"
+    );
+}
+
+// --- constant resume: the ledger as the front door ---
+
+#[test]
+fn resume_picks_the_latest_projection_and_prints_native_cmd_without_a_tty() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(c.status.success(), "carry failed: {}", err(&c));
+    let v: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+    let id = v["id"].as_str().unwrap();
+
+    // No query: newest conversation. Tests run without a TTY, so resume must
+    // degrade to printing the native command for exactly this projection.
+    let r = run(&dir, &["resume", "--all"]);
+    assert!(r.status.success(), "resume failed: {}", err(&r));
+    let text = out(&r);
+    assert!(
+        text.contains(&format!("claude -r {id}")),
+        "resume picked the wrong projection: {text}"
+    );
+    assert!(text.contains("not a terminal"), "{text}");
+
+    // Slug query selects the same conversation; unknown query fails.
+    let q = run(&dir, &["resume", "hello", "--all"]);
+    assert!(q.status.success(), "{}", err(&q));
+    assert!(out(&q).contains(&format!("claude -r {id}")));
+
+    let bad = run(&dir, &["resume", "zzz-nope", "--all"]);
+    assert!(!bad.status.success(), "unknown query should fail");
+    assert!(err(&bad).contains("no conversation matches"), "{}", err(&bad));
+
+    // --list shows the conversation and the command to resume it.
+    let ls = run(&dir, &["resume", "--list", "--all"]);
+    assert!(ls.status.success(), "{}", err(&ls));
+    assert!(out(&ls).contains("hello-from-the-fixture"), "{}", out(&ls));
+    assert!(out(&ls).contains("constant resume"), "{}", out(&ls));
+}
+
+#[test]
+fn resume_with_ambiguous_query_lists_candidates_and_fails() {
+    let dir = tmpdir();
+    let one = ir_fixture(&dir);
+    let two = ir_fixture_named(&dir, "fixture2.json", "fixture-0002", "goodbye fixture two");
+    for fix in [&one, &two] {
+        let c = run(
+            &dir,
+            &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+        );
+        assert!(c.status.success(), "{}", err(&c));
+    }
+
+    let r = run(&dir, &["resume", "fixture", "--all"]);
+    assert!(!r.status.success(), "ambiguous query should fail");
+    assert!(err(&r).contains("narrow the query"), "{}", err(&r));
+    let listed = out(&r);
+    assert!(
+        listed.contains("hello-from-the-fixture") && listed.contains("goodbye-fixture-two"),
+        "candidates not listed: {listed}"
+    );
+}
+
+#[test]
+fn resume_restores_from_the_record_when_every_projection_is_gone() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(c.status.success(), "carry failed: {}", err(&c));
+    let v: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+    let carried_id = v["id"].as_str().unwrap();
+
+    // Simulate cleanup wiping the live projection (isolated test store).
+    std::fs::remove_dir_all(dir.join("claude").join("projects")).unwrap();
+
+    // Lost-record doctrine: resume reprints from the latest record volume —
+    // defaulting to the runtime the record came from (codex) — and offers it.
+    let r = run(&dir, &["resume", "--all"]);
+    assert!(r.status.success(), "resume failed: {}", err(&r));
+    let text = out(&r);
+    assert!(
+        text.contains("restored from the record"),
+        "no restore note: {text}"
+    );
+    assert!(text.contains("codex resume"), "no resume command: {text}");
+    assert!(
+        !text.contains(carried_id),
+        "restore must mint a fresh id: {text}"
     );
 }
 
