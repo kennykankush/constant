@@ -10,8 +10,14 @@ env:
 
 jobs:
   test:
-    name: build · clippy · test
-    runs-on: ubuntu-latest
+    name: build · clippy · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux for breadth; macOS because that's where Constant actually
+        # lives (PTY/file semantics differ).
+        os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,3 +28,20 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test (unit + integration)
         run: cargo test --all
+
+  opencode-roundtrip:
+    # The real-binary integration tests skip when opencode is absent; this job
+    # installs it so the import→export round trip (and any opencode drift)
+    # is exercised on every push, not just on dev machines.
+    name: opencode round-trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install opencode
+        run: |
+          npm install -g opencode-ai
+          opencode --version
+      - name: run opencode integration tests
+        run: cargo test --test cli opencode -- --nocapture

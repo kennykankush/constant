@@ -1790,6 +1790,149 @@ mod tests {
         roundtrip(SessionFormat::Codex);
     }
 
+    // --- codex loader: torn tail tolerated, mid-file corruption fails ---
+
+    #[test]
+    fn codex_loader_tolerates_torn_tail_but_not_mid_file_corruption() {
+        let dir = unique_tmp();
+        let mut session =
+            UniversalSession::new("01970000-0000-7000-8000-000000000001".to_string());
+        session.metadata.cwd = Some(PathBuf::from("/tmp/x"));
+        session.metadata.platform_version = Some("0.137.0".to_string());
+        session.metadata.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0);
+        session.events.push(msg("user", "hello codex"));
+        session.events.push(msg("assistant", "hi"));
+        let written =
+            formats::materialize(&session, SessionFormat::Codex, &dir).expect("materialize");
+
+        let mut text = fs::read_to_string(&written).unwrap();
+        text.push_str("{\"type\":\"response_item\",\"payl");
+        fs::write(&written, &text).unwrap();
+        let reloaded =
+            formats::load_session(&written, SourceFormat::Auto).expect("torn tail tolerated");
+        assert!(
+            reloaded
+                .events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Message(_))),
+            "conversation lost"
+        );
+
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.insert(1, "{\"type\":\"resp");
+        fs::write(&written, lines.join("\n")).unwrap();
+        assert!(
+            formats::load_session(&written, SourceFormat::Auto).is_err(),
+            "mid-file corruption swallowed"
+        );
+    }
+
+    // --- symlink attack: a reuse target that LINKS to the source is refused ---
+
+    #[test]
+    #[cfg(unix)]
+    fn carry_refuses_symlinked_reuse_target_pointing_at_source() {
+        let dir = unique_tmp();
+        let src = dir.join("source.json");
+        let mut session = UniversalSession::new("sym-0001".to_string());
+        session.metadata.cwd = Some(PathBuf::from("/tmp/x"));
+        session.events.push(msg("user", "keep me intact"));
+        session.events.push(msg("assistant", "ok"));
+        formats::write_ir(&session, &src).expect("write IR source");
+        let before = fs::read(&src).unwrap();
+
+        let link = dir.join("sneaky-link.jsonl");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+        let err = distill_path(&src, Runtime::Claude, Some(("sneaky", &link)), None)
+            .expect_err("symlinked reuse target must be refused");
+        assert!(
+            format!("{err:#}").contains("refusing to overwrite source"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(before, fs::read(&src).unwrap(), "source was modified");
+    }
+
+    // --- gemini loader: messages, thoughts, tool calls map to the IR ---
+
+    #[test]
+    fn gemini_loader_maps_the_full_shape() {
+        let dir = unique_tmp();
+        let path = dir.join("gem.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessionId": "abc12345-0000-0000-0000-000000000001",
+  "projectHash": "deadbeef", "startTime": "2026-06-01T10:00:00.000Z",
+  "lastUpdated": "2026-06-01T10:05:00.000Z", "kind": "main",
+  "messages": [
+    {"id":"m1","timestamp":"2026-06-01T10:00:01.000Z","type":"user",
+     "content":[{"text":"part one"},{"text":"part two"}]},
+    {"id":"m2","timestamp":"2026-06-01T10:00:05.000Z","type":"gemini",
+     "content":"the reply",
+     "thoughts":[{"subject":"S","description":"D"}],
+     "toolCalls":[{"id":"t1","name":"shell","args":{"command":"ls"},"result":[{"ok":true}]}],
+     "model":"gemini-3-pro"},
+    {"id":"m3","timestamp":"2026-06-01T10:01:00.000Z","type":"info","content":"notice"}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let d = distill_source(&path, true).expect("gemini load");
+        assert_eq!(d.receipt.turns, 2, "{:?}", d.receipt);
+        assert_eq!(d.receipt.tools, 2, "{:?}", d.receipt);
+        assert_eq!(d.receipt.dropped_reasoning, 1, "{:?}", d.receipt);
+        assert_eq!(d.session.metadata.model.as_deref(), Some("gemini-3-pro"));
+        let user_text = d
+            .session
+            .events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Message(m) if m.role == "user" => Some(
+                    m.blocks
+                        .iter()
+                        .filter_map(|b| b.text.clone())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(user_text, "part one|part two");
+    }
+
+    // --- opencode export parser: tolerates the trailing status line ---
+
+    #[test]
+    fn opencode_parse_export_tolerates_status_trailer() {
+        let text = r#"{"info":{"id":"ses_x1","directory":"/tmp/p","title":"t","version":"1.14.48",
+"time":{"created":1700000000000,"updated":1700000001000}},
+"messages":[{"info":{"id":"msg_1","role":"user","time":{"created":1700000000100}},
+"parts":[{"type":"text","text":"hi there"}]}]}
+Exporting session: ses_x1"#;
+        let session = formats::opencode::parse_export(text).expect("trailer tolerated");
+        assert_eq!(session.metadata.session_id, "ses_x1");
+        assert_eq!(session.events.len(), 1);
+    }
+
+    // --- IR forward-compat: unknown fields in future IR files are ignored ---
+
+    #[test]
+    fn ir_with_unknown_future_fields_still_loads() {
+        let text = r#"{
+  "ir_version": "transession/v1",
+  "some_future_top_field": {"x": 1},
+  "metadata": {"session_id": "f-1", "future_meta": true},
+  "events": [
+    {"kind": "message", "role": "user", "future_event_field": 7,
+     "blocks": [{"kind": "text", "text": "hello", "future_block_field": []}]}
+  ]
+}"#;
+        let session: UniversalSession =
+            serde_json::from_str(text).expect("unknown fields must not break old readers");
+        assert_eq!(session.events.len(), 1);
+    }
+
     // --- F1: a carry must NEVER modify the source session (data-loss guard) ---
 
     #[test]

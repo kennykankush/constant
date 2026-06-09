@@ -74,6 +74,44 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .expect("failed to run constant")
 }
 
+/// Like `run`, but from a specific working directory (for cwd-scoped discovery).
+fn run_in(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", dir)
+        .env("CODEX_HOME", dir.join("codex"))
+        .env("CLAUDE_HOME", dir.join("claude"))
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env_remove("TRANSESSION_CODEX_HOME")
+        .env_remove("TRANSESSION_CLAUDE_HOME")
+        .env_remove("CONSTANT_GEMINI_HOME")
+        .output()
+        .expect("failed to run constant")
+}
+
+/// Find the claude projection file for a session id in the isolated store.
+fn find_claude_projection(dir: &Path, id: &str) -> Option<PathBuf> {
+    let mut stack = vec![dir.join("claude").join("projects")];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().map(|n| n.to_string_lossy() == format!("{id}.jsonl"))
+                == Some(true)
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).to_string()
 }
@@ -803,6 +841,265 @@ fn status_reports_runtime_trail_and_latest_sessions() {
     assert!(
         !text.contains("hello-from-the-fixture"),
         "status should not print prompt-derived trail slugs: {text}"
+    );
+}
+
+// --- integrity: adversarial inputs, durability, and trust boundaries ---
+
+#[test]
+fn hostile_session_id_cannot_escape_the_record_vault() {
+    let dir = tmpdir();
+    let fix = ir_fixture_named(
+        &dir,
+        "evil.json",
+        "../../../../tmp/constant-escape-attempt",
+        "trying to escape",
+    );
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let snap = v["snapshot"].as_str().expect("no snapshot");
+    let vault = dir.join(".constant").join("snapshots");
+    assert!(
+        std::path::Path::new(snap).starts_with(&vault),
+        "record escaped the vault: {snap}"
+    );
+    assert!(!snap.contains(".."), "traversal survived: {snap}");
+    assert!(
+        !std::path::Path::new("/tmp/constant-escape-attempt").exists(),
+        "hostile id wrote outside the vault"
+    );
+}
+
+#[test]
+fn ansi_in_conversation_never_reaches_the_terminal() {
+    let dir = tmpdir();
+    // Title-bar set + color + BEL embedded in the first user message: every
+    // human-output path must neutralize them.
+    let fix = ir_fixture_named(
+        &dir,
+        "ansi.json",
+        "ansi-0001",
+        r"\u001b]0;own-your-title\u0007 hello \u001b[31mred\u001b[0m",
+    );
+    let dry = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--dry-run"],
+    );
+    assert!(dry.status.success(), "{}", err(&dry));
+    assert!(
+        !out(&dry).contains('\u{1b}') && !out(&dry).contains('\u{7}'),
+        "dry-run leaked control bytes: {:?}",
+        out(&dry)
+    );
+
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    for cmd in [vec!["trail", "--all"], vec!["sessions", "--all", "--titles"]] {
+        let o = run(&dir, &cmd);
+        assert!(o.status.success(), "{}", err(&o));
+        assert!(
+            !out(&o).contains('\u{1b}') && !out(&o).contains('\u{7}'),
+            "{cmd:?} leaked control bytes: {:?}",
+            out(&o)
+        );
+    }
+}
+
+#[test]
+fn secrets_are_redacted_in_projection_and_record_alike() {
+    let dir = tmpdir();
+    let fix = ir_fixture_named(
+        &dir,
+        "leaky.json",
+        "leaky-0001",
+        "my key is sk-PLAINLEAK1234567890abcd please remember it",
+    );
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+
+    let projection = find_claude_projection(&dir, v["id"].as_str().unwrap())
+        .expect("projection missing");
+    let ptext = std::fs::read_to_string(projection).unwrap();
+    assert!(!ptext.contains("sk-PLAINLEAK"), "projection leaked the secret");
+
+    let stext = std::fs::read_to_string(v["snapshot"].as_str().unwrap()).unwrap();
+    assert!(!stext.contains("sk-PLAINLEAK"), "record leaked the secret");
+    assert_eq!(v["receipt"]["redactions"].as_u64(), Some(1), "{v}");
+}
+
+#[test]
+#[cfg(unix)]
+fn the_record_vault_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    for p in [dir.join(".constant"), dir.join(".constant").join("snapshots")] {
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{} is not owner-only: {mode:o}", p.display());
+    }
+}
+
+#[test]
+fn corrupted_ledger_lines_are_tolerated() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let first = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(first.status.success(), "{}", err(&first));
+    let fv: serde_json::Value = serde_json::from_str(&out(&first)).unwrap();
+
+    // Garbage and half-written lines in the ledger must not break anything.
+    let ledger = dir.join(".constant").join("trail.jsonl");
+    let mut text = std::fs::read_to_string(&ledger).unwrap();
+    text.push_str("this is not json at all\n{\"ts\": 12, \"half\nnull\n");
+    std::fs::write(&ledger, text).unwrap();
+
+    let t = run(&dir, &["trail", "--all"]);
+    assert!(t.status.success(), "trail broke on corrupt ledger: {}", err(&t));
+
+    let second = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json", "--debug"],
+    );
+    assert!(second.status.success(), "{}", err(&second));
+    let sv: serde_json::Value = serde_json::from_str(&out(&second)).unwrap();
+    assert_eq!(
+        sv["id"].as_str(),
+        fv["id"].as_str(),
+        "stable pair lost after ledger corruption"
+    );
+}
+
+#[test]
+fn blocked_record_warns_but_never_blocks_the_carry() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    // Sabotage: the snapshots location is a FILE, so no volume can be written.
+    std::fs::create_dir_all(dir.join(".constant")).unwrap();
+    std::fs::write(dir.join(".constant").join("snapshots"), "in the way").unwrap();
+
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(o.status.success(), "carry must proceed without the record: {}", err(&o));
+    assert!(
+        err(&o).contains("record not written"),
+        "the gap must be announced: {}",
+        err(&o)
+    );
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert!(v["snapshot"].is_null(), "{v}");
+}
+
+#[test]
+fn codex_discovery_picks_the_right_cwd_not_the_newest_file() {
+    let dir = tmpdir();
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let proj_str = proj.canonicalize().unwrap().display().to_string();
+
+    let day = dir.join("codex").join("sessions").join("2026").join("06").join("01");
+    std::fs::create_dir_all(&day).unwrap();
+    let mk = |name: &str, id: &str, cwd: &str, text: &str| {
+        let body = format!(
+            "{{\"timestamp\":\"2026-06-01T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"2026-06-01T10:00:00.000Z\",\"cwd\":\"{cwd}\",\"originator\":\"codex-tui\",\"cli_version\":\"0.137.0\",\"source\":\"cli\"}}}}\n{{\"timestamp\":\"2026-06-01T10:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n"
+        );
+        std::fs::write(day.join(name), body).unwrap();
+    };
+    // Right cwd, written FIRST (older mtime).
+    mk(
+        "rollout-2026-06-01T10-00-00-01970000-0000-7000-8000-00000000000b.jsonl",
+        "01970000-0000-7000-8000-00000000000b",
+        &proj_str,
+        "pick me from the right cwd",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Wrong cwd, NEWER — newest-mtime alone would wrongly pick this one.
+    mk(
+        "rollout-2026-06-01T10-00-02-01970000-0000-7000-8000-00000000000a.jsonl",
+        "01970000-0000-7000-8000-00000000000a",
+        "/somewhere/else",
+        "do not pick me",
+    );
+
+    let o = run_in(
+        &dir,
+        &proj,
+        &["carry", "--from", "codex", "--to", "claude", "--dry-run", "--json"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(
+        v["root"].as_str(),
+        Some("pick me from the right cwd"),
+        "cwd scoping failed: {v}"
+    );
+}
+
+#[test]
+fn ambiguous_session_id_across_stores_is_refused() {
+    let dir = tmpdir();
+    let id = "99999999-9999-9999-9999-999999999999";
+    let day = dir.join("codex").join("sessions").join("2026").join("06").join("01");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(day.join(format!("rollout-2026-06-01T10-00-00-{id}.jsonl")), "x").unwrap();
+    let proj = dir.join("claude").join("projects").join("-tmp-p");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join(format!("{id}.jsonl")), "x").unwrap();
+
+    let o = run(&dir, &["carry", "--to", "claude", "--session", id]);
+    assert!(!o.status.success(), "ambiguous id must be refused");
+    assert!(
+        err(&o).contains("more than one"),
+        "wrong error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn carrying_into_gemini_is_refused_with_a_clear_error() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &["carry", "--to", "gemini", "--session", fix.to_str().unwrap()],
+    );
+    assert!(!o.status.success(), "gemini target must be gated");
+    assert!(
+        err(&o).contains("isn't supported yet"),
+        "wrong error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn restore_from_nonexistent_source_errors_cleanly() {
+    let dir = tmpdir();
+    let o = run(&dir, &["restore", "/nope/does-not-exist.json"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("could not resolve") || err(&o).contains("Error"),
+        "{}",
+        err(&o)
     );
 }
 

@@ -3,6 +3,25 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Integrity test suite.** Sixteen new regression tests covering the
+  adversarial surface: hostile session ids cannot escape the record vault
+  (path traversal), embedded ANSI/control bytes never reach the terminal,
+  secrets are verified redacted in BOTH the projection and the record, the
+  vault is owner-only, corrupted ledger lines are tolerated, a blocked record
+  warns but never blocks a carry, codex discovery picks the right cwd over the
+  newest file, ambiguous ids across stores are refused, symlinked reuse
+  targets pointing at the source are refused, codex torn-tail tolerance,
+  gemini loader shape mapping, opencode export-trailer parsing, and IR
+  forward-compatibility with unknown future fields. (Plus a hardening the
+  tests forced: record-vault directory components now allow only
+  `[A-Za-z0-9_-]`.)
+- **CI matrix.** Tests now run on macOS as well as Linux, and a dedicated CI
+  job installs the real opencode binary so the import→export round trip (and
+  upstream drift) is exercised on every push.
+
 ## [0.2.0] - The record, the third runtime, and the hardened carry
 
 One release, three layers: a bank-grade hardening pass over every write,

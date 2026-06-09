@@ -133,23 +133,23 @@ fn restrict_dir(dir: &Path) {
 }
 
 /// A conversation id used as a directory name: anything outside
-/// [A-Za-z0-9._-] becomes `-` so a hostile id can't traverse paths.
+/// [A-Za-z0-9_-] becomes `-` — no separators, no dots, so a hostile id can
+/// never traverse paths or even *resemble* a traversal.
 fn safe_dir_component(id: &str) -> String {
     let cleaned: String = id
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
             } else {
                 '-'
             }
         })
         .collect();
-    let trimmed = cleaned.trim_matches('.').to_string();
-    if trimmed.is_empty() {
+    if cleaned.chars().all(|c| c == '-') {
         "conversation".to_string()
     } else {
-        trimmed
+        cleaned
     }
 }
 
@@ -1073,6 +1073,19 @@ mod tests {
             title(12, Runtime::Claude, "x"),
             "constant·t12·from-claude·x"
         );
+    }
+
+    #[test]
+    fn hostile_conversation_ids_cannot_traverse_paths() {
+        // conv ids become directory names in the record vault — a crafted
+        // session id must never escape ~/.constant/snapshots.
+        assert_eq!(safe_dir_component("../../etc/passwd"), "------etc-passwd");
+        assert_eq!(safe_dir_component("a/b\\c"), "a-b-c");
+        assert_eq!(safe_dir_component("..."), "conversation");
+        assert_eq!(safe_dir_component(""), "conversation");
+        assert_eq!(safe_dir_component("normal-id_1.2"), "normal-id_1-2");
+        assert!(!safe_dir_component("../../x").contains('.'));
+        assert!(!safe_dir_component("a/b").contains('/'));
     }
 
     // --- resume_from_entries: the ledger-reconciliation core ---
