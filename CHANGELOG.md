@@ -3,10 +3,12 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] - Bank-logic hardening
+## [0.2.0] - The record, the third runtime, and the hardened carry
 
-The round-2 audit pass: every write, identity decision, and failure path in the
-carry pipeline made definite.
+One release, three layers: a bank-grade hardening pass over every write,
+identity decision, and failure path in the carry pipeline; the record (per-hop
+neutral snapshots that make native sessions reprintable projections); and two
+new runtimes — OpenCode in full, Gemini as a carry source.
 
 ### Fixed
 - **Atomic projection writes.** Both codec writers now materialize into a tmp
