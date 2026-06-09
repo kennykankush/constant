@@ -49,6 +49,14 @@ carry pipeline made definite.
   moved to a per-process temp path.
 
 ### Added
+- **Persistent status bar.** A tmux-style bar lives on the terminal's bottom
+  row while hosting: active runtime (`+tools` when carrying tool history),
+  trail position and conversation slug, and the prefix keys. Constant stays a
+  pass-through proxy — the child PTY is simply told the terminal is one row
+  shorter, a scroll region protects the bar row from inline scrolling, and the
+  bar repaints only when the child has been idle for a beat (no escape
+  injection mid-paint). Auto-disables on tiny terminals; `--no-bar` (on `host`
+  and `resume`) turns it off.
 - **`--with-tools` carry (experimental).** Opt-in on `carry`, `host`, and
   `resume`: tool calls and results are carried across the runtime boundary
   instead of dropped. Every string anywhere in their JSON payloads goes through

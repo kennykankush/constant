@@ -462,7 +462,7 @@ fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
 /// turned on — alt-screen, mouse tracking, focus reporting, bracketed paste, and
 /// the Kitty keyboard protocol. Required because we SIGKILL children, so they
 /// never run their own cleanup and would otherwise leave the terminal wedged.
-const TERM_RESET: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[0m";
+const TERM_RESET: &[u8] = b"\x1b[?1049l\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[0m";
 
 fn write_reset(out: &mut impl Write) {
     let _ = out.write_all(TERM_RESET);
@@ -529,6 +529,89 @@ pub fn debug_keys() -> Result<()> {
     Ok(())
 }
 
+// ---- status bar ---------------------------------------------------------
+//
+// Constant stays a pass-through proxy, NOT a compositor. The bar works by
+// telling the child PTY the terminal is ONE ROW SHORTER — a full-screen TUI
+// then never addresses the real last row — and protecting that row from
+// inline scrolling with a DECSTBM scroll region. The bar itself is repainted
+// only when the child has been idle for a beat, so we never inject escape
+// sequences (and clobber a saved-cursor slot) while the child is mid-paint.
+
+/// Below this the bar costs more than it gives.
+fn bar_fits(rows: u16) -> bool {
+    rows >= 4
+}
+
+/// Rows the CHILD believes the terminal has.
+fn child_rows(rows: u16, bar: bool) -> u16 {
+    if bar && bar_fits(rows) {
+        rows - 1
+    } else {
+        rows
+    }
+}
+
+/// Compose the bar line, truncated and padded to exactly `cols` columns.
+fn bar_text(
+    runtime: Runtime,
+    with_tools: bool,
+    trail_n: u32,
+    slug: Option<&str>,
+    prefix_label: &str,
+    cols: u16,
+) -> String {
+    let tools = if with_tools { "+tools" } else { "" };
+    let thread = match slug {
+        Some(s) if trail_n > 0 => format!("t{trail_n:02}\u{b7}{s}"),
+        Some(s) => s.to_string(),
+        None => "no thread yet".to_string(),
+    };
+    let full = format!(
+        " constant \u{b7} {}{tools} \u{b7} {thread} \u{b7} {prefix_label} c/x=switch d=quit ",
+        runtime.label()
+    );
+    let width = cols as usize;
+    let mut text: String = full.chars().take(width).collect();
+    let pad = width.saturating_sub(text.chars().count());
+    text.extend(std::iter::repeat_n(' ', pad));
+    text
+}
+
+/// Paint the bar on the real last row: re-establish the scroll region (the
+/// child may have reset it), draw inverse-video, put the cursor back.
+fn draw_bar(out: &mut impl Write, rows: u16, text: &str) {
+    let top = rows - 1;
+    let _ = write!(out, "\x1b7\x1b[1;{top}r\x1b[{rows};1H\x1b[7m{text}\x1b[0m\x1b8");
+    let _ = out.flush();
+}
+
+/// Redraw the bar from current state (no-op when disabled or terminal too small).
+#[allow(clippy::too_many_arguments)]
+fn refresh_bar(
+    out: &mut impl Write,
+    enabled: bool,
+    runtime: Runtime,
+    with_tools: bool,
+    trail_n: u32,
+    slug: Option<&str>,
+    prefix_label: &str,
+    fallback: (u16, u16),
+) {
+    if !enabled {
+        return;
+    }
+    let (c, r) = size().unwrap_or(fallback);
+    if !bar_fits(r) {
+        return;
+    }
+    draw_bar(
+        out,
+        r,
+        &bar_text(runtime, with_tools, trail_n, slug, prefix_label, c),
+    );
+}
+
 /// Entry point for `constant host [runtime] [--prefix ...]` and
 /// `constant resume` (which passes the projection id to wake up — the child's
 /// identity is then declared from birth, no detection needed).
@@ -536,6 +619,7 @@ pub fn run(
     initial: Runtime,
     resume: Option<&str>,
     with_tools: bool,
+    bar: bool,
     prefix: u8,
     prefix_label: String,
 ) -> Result<()> {
@@ -630,13 +714,22 @@ pub fn run(
     // instead of silently tearing the harness down.
     let mut watchdog = std::time::Instant::now();
     let mut respawned_once = false;
+    let mut bar_dirty = bar;
     let mut session = match resume {
         Some(id) => {
             child_session = Some(id.to_string());
-            spawn_session(initial, SpawnMode::Resume(id), None, cols, rows, tx.clone())?
+            spawn_session(
+                initial,
+                SpawnMode::Resume(id),
+                None,
+                cols,
+                child_rows(rows, bar),
+                tx.clone(),
+            )?
         }
         None => {
-            let (s, declared) = spawn_fresh(initial, None, cols, rows, tx.clone())?;
+            let (s, declared) =
+                spawn_fresh(initial, None, cols, child_rows(rows, bar), tx.clone())?;
             child_session = declared;
             s
         }
@@ -649,9 +742,32 @@ pub fn run(
     let mut pending_out: Vec<u8> = Vec::new();
     let mut quitting = false;
 
-    for ev in rx.iter() {
+    loop {
+        let ev = match rx.recv_timeout(std::time::Duration::from_millis(120)) {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The child has been quiet for a beat: safe to repaint the bar
+                // (never inject while it might be mid-paint).
+                if bar_dirty && mode == M_NORMAL {
+                    refresh_bar(
+                        &mut out,
+                        bar,
+                        session.runtime,
+                        with_tools,
+                        trail_n,
+                        root_slug.as_deref(),
+                        &prefix_label,
+                        (cols, rows),
+                    );
+                    bar_dirty = false;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match ev {
             Ev::Pty(bytes) => {
+                bar_dirty = bar;
                 if mode == M_COMMAND {
                     // Bounded: a chatty child while the user sits in the command
                     // line must not grow memory forever. Past the cap, flush
@@ -678,6 +794,7 @@ pub fn run(
                     let from = session.runtime;
                     let _ = session.child.wait();
                     let (c, r) = size().unwrap_or((cols, rows));
+                    let r = child_rows(r, bar);
                     write_reset(&mut out); // undo outgoing child's terminal modes
                     let _ = out.write_all(b"\x1b[2J\x1b[H");
 
@@ -896,6 +1013,19 @@ pub fn run(
                     watchdog = std::time::Instant::now();
                     respawned_once = false;
                     banner(&mut out, session.runtime, &prefix_label);
+                    // Establish the protected bar row BEFORE the child starts
+                    // writing (an inline-scrolling child must never reach it).
+                    refresh_bar(
+                        &mut out,
+                        bar,
+                        session.runtime,
+                        with_tools,
+                        trail_n,
+                        root_slug.as_deref(),
+                        &prefix_label,
+                        (cols, rows),
+                    );
+                    bar_dirty = false;
                 } else if watchdog.elapsed() < std::time::Duration::from_secs(2)
                     && !respawned_once
                 {
@@ -916,12 +1046,23 @@ pub fn run(
                     );
                     let (c, r) = size().unwrap_or((cols, rows));
                     child_spawned_at = std::time::SystemTime::now();
-                    match spawn_fresh(rt, None, c, r, tx.clone()) {
+                    match spawn_fresh(rt, None, c, child_rows(r, bar), tx.clone()) {
                         Ok((s, declared)) => {
                             session = s;
                             child_session = declared;
                             watchdog = std::time::Instant::now();
                             banner(&mut out, session.runtime, &prefix_label);
+                            refresh_bar(
+                                &mut out,
+                                bar,
+                                session.runtime,
+                                with_tools,
+                                trail_n,
+                                root_slug.as_deref(),
+                                &prefix_label,
+                                (cols, rows),
+                            );
+                            bar_dirty = false;
                         }
                         Err(_) => break,
                     }
@@ -933,11 +1074,22 @@ pub fn run(
             Ev::Resize => {
                 let (c, r) = size().unwrap_or((cols, rows));
                 let _ = session.master.resize(PtySize {
-                    rows: r,
+                    rows: child_rows(r, bar),
                     cols: c,
                     pixel_width: 0,
                     pixel_height: 0,
                 });
+                refresh_bar(
+                    &mut out,
+                    bar,
+                    session.runtime,
+                    with_tools,
+                    trail_n,
+                    root_slug.as_deref(),
+                    &prefix_label,
+                    (cols, rows),
+                );
+                bar_dirty = false;
             }
 
             Ev::Stdin(bytes) => {
@@ -972,6 +1124,7 @@ pub fn run(
                         M_PREFIX => {
                             clear_bottom(&mut out);
                             mode = M_NORMAL;
+                            bar_dirty = bar; // the hint borrowed the bar's row
                             if matches!(tok, Token::Prefix) {
                                 passthrough.push(prefix); // literal prefix to child
                             } else {
@@ -1048,6 +1201,7 @@ pub fn run(
                             if submit || cancel {
                                 clear_bottom(&mut out);
                                 mode = M_NORMAL;
+                                bar_dirty = bar;
                                 if !pending_out.is_empty() {
                                     let _ = out.write_all(&pending_out);
                                     let _ = out.flush();
@@ -1146,6 +1300,39 @@ mod tests {
         // A normal byte passes through.
         let toks = classify_all(b"a", 0x02);
         assert!(matches!(toks.as_slice(), [Token::Byte(b'a')]));
+    }
+
+    #[test]
+    fn bar_text_is_exactly_terminal_width() {
+        // Fits: padded to width.
+        let t = bar_text(Runtime::Codex, false, 4, Some("fix-the-bug"), "Ctrl-B", 80);
+        assert_eq!(t.chars().count(), 80);
+        assert!(t.contains("codex"), "{t}");
+        assert!(t.contains("t04\u{b7}fix-the-bug"), "{t}");
+        // Tools mode is visible.
+        let t = bar_text(Runtime::Claude, true, 1, Some("x"), "Ctrl-B", 80);
+        assert!(t.contains("claude+tools"), "{t}");
+        // No thread yet.
+        let t = bar_text(Runtime::Codex, false, 0, None, "Ctrl-B", 80);
+        assert!(t.contains("no thread yet"), "{t}");
+        // Narrow terminal: truncated to width, never wider.
+        let t = bar_text(
+            Runtime::Codex,
+            false,
+            12,
+            Some("a-very-long-slug-here"),
+            "Ctrl-B",
+            20,
+        );
+        assert_eq!(t.chars().count(), 20);
+    }
+
+    #[test]
+    fn child_rows_reserves_one_line_only_when_the_bar_fits() {
+        assert_eq!(child_rows(24, true), 23);
+        assert_eq!(child_rows(24, false), 24);
+        // Tiny terminal: the bar steps aside.
+        assert_eq!(child_rows(3, true), 3);
     }
 
     #[test]
