@@ -1,6 +1,12 @@
 # Constant Product Vision
 
-Status: spark promoted to project handoff.
+Status: founding vision document (2026-05). The product has since shipped and
+evolved past the "continuation packet" mechanics described below: Constant is
+now a live PTY harness with a tmux-style runtime switch, a neutral-IR carry
+pipeline (`alembic`), a durable per-hop record under `~/.constant/snapshots/`,
+and four runtimes (Codex, Claude Code, OpenCode full; Gemini as carry source).
+See `README.md` for current behavior. This document is preserved as the
+original product thinking — the *why* still stands; the *how* moved on.
 
 Constant was born in Warroom from a specific frustration: a conversation can become rich inside Codex, but if Hadi wants Claude Code's continuation, he has to start a new room and explain everything again. The same is true in the other direction. The agent runtime changes, and the thread breaks.
 
