@@ -754,6 +754,21 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                             );
                             let _ = out.flush();
 
+                            // The record comes first: write this hop's snapshot
+                            // volume (distilled IR) BEFORE materializing any native
+                            // copy. If the record can't be written the switch still
+                            // proceeds — but the gap is announced, never silent.
+                            let snapshot = crate::trail::snapshot_path(&conv_id, n, from)
+                                .and_then(|p| {
+                                    match crate::alembic::write_snapshot(&distilled.session, &p) {
+                                        Ok(()) => Some(p),
+                                        Err(e) => {
+                                            dim(&mut out, &format!("record not written — {e}"));
+                                            None
+                                        }
+                                    }
+                                });
+
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.
                             let reuse_owned = if request.new {
@@ -801,6 +816,7 @@ pub fn run(initial: Runtime, prefix: u8, prefix_label: String) -> Result<()> {
                                         } else {
                                             "new-fork"
                                         },
+                                        snapshot.as_deref(),
                                     ) {
                                         // The carry is fine; the LEDGER diverged —
                                         // say so, or the next re-host silently forks.

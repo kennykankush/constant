@@ -28,6 +28,7 @@ struct TrailEntry {
     path: String,
     title: String,
     mode: Option<String>,
+    snapshot: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +118,55 @@ fn ledger_path_for_write() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let dir = PathBuf::from(home).join(".constant");
     let _ = fs::create_dir_all(&dir);
+    restrict_dir(&dir);
     Some(dir.join("trail.jsonl"))
+}
+
+/// The record vault aggregates every conversation in one place — keep it
+/// owner-only on unix.
+fn restrict_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// A conversation id used as a directory name: anything outside
+/// [A-Za-z0-9._-] becomes `-` so a hostile id can't traverse paths.
+fn safe_dir_component(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "conversation".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Where this hop's record volume lives:
+/// `~/.constant/snapshots/<conversation>/tNN-from-<runtime>.json`.
+/// Creates the directories (owner-only).
+pub fn snapshot_path(conv_id: &str, n: u32, from: Runtime) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let constant = PathBuf::from(home).join(".constant");
+    let _ = fs::create_dir_all(&constant);
+    restrict_dir(&constant);
+    let snapshots = constant.join("snapshots");
+    let dir = snapshots.join(safe_dir_component(conv_id));
+    let _ = fs::create_dir_all(&dir);
+    restrict_dir(&snapshots);
+    restrict_dir(&dir);
+    Some(dir.join(format!("t{n:02}-from-{}.json", from.label())))
 }
 
 fn parse_entry(line: &str) -> Option<TrailEntry> {
@@ -172,6 +221,10 @@ fn parse_entry(line: &str) -> Option<TrailEntry> {
             .unwrap_or("")
             .to_string(),
         mode: v.get("mode").and_then(|x| x.as_str()).map(str::to_string),
+        snapshot: v
+            .get("snapshot")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -462,6 +515,7 @@ pub fn record(
     path: &Path,
     title: &str,
     mode: &str,
+    snapshot: Option<&Path>,
 ) -> anyhow::Result<()> {
     let ledger =
         ledger_path_for_write().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
@@ -488,6 +542,7 @@ pub fn record(
         "target_path": path.display().to_string(),
         "title": title,
         "mode": mode,
+        "snapshot": snapshot.map(|p| p.display().to_string()),
     });
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -681,6 +736,80 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
             let id = crate::term_safe(&e.id);
             let title = crate::term_safe(&e.title);
             println!("  t{n:02}  {from:>6} \u{2192} {to:<6}  {id}  {title}");
+        }
+    }
+    Ok(())
+}
+
+/// `constant snapshots` — list the record volumes (per-hop IR snapshots) the
+/// ledger knows about, grouped by conversation. A volume the ledger doesn't
+/// reference is effectively lost in the archive, so this lists from the
+/// ledger and marks files that have since gone missing.
+pub fn print_snapshots(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    let entries: Vec<TrailEntry> = load_entries(cwd_filter)
+        .into_iter()
+        .filter(|e| e.snapshot.is_some())
+        .collect();
+    if entries.is_empty() {
+        match cwd_filter {
+            Some(c) => println!(
+                "no records for {}\n(records are written at every carry; try `constant snapshots --all`)",
+                crate::term_safe(&c.display().to_string())
+            ),
+            None => println!("no records yet (records are written at every carry)"),
+        }
+        return Ok(());
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<TrailEntry>> = HashMap::new();
+    for entry in entries {
+        if !groups.contains_key(&entry.conversation) {
+            order.push(entry.conversation.clone());
+        }
+        groups
+            .entry(entry.conversation.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    for conv in order {
+        let rows = groups.get_mut(&conv).unwrap();
+        rows.sort_by_key(|e| (e.ts, e.n));
+        let display = crate::term_safe(
+            rows.iter()
+                .find(|e| e.slug != "?")
+                .map(|e| e.slug.as_str())
+                .unwrap_or(conv.as_str()),
+        );
+        let cwd = crate::term_safe(rows.first().and_then(|e| e.cwd.as_deref()).unwrap_or(""));
+        println!("\nconversation: {display}   ({cwd})");
+        for e in rows.iter() {
+            let snap = e.snapshot.as_deref().unwrap_or("");
+            let status = if Path::new(snap).exists() {
+                "ok     "
+            } else {
+                "missing"
+            };
+            println!(
+                "  t{:02}  from {:<6}  {status}  {}",
+                e.n,
+                crate::term_safe(&e.from),
+                crate::term_safe(snap)
+            );
+        }
+        if let Some(last) = rows.iter().rev().find(|e| {
+            e.snapshot
+                .as_deref()
+                .map(|s| Path::new(s).exists())
+                .unwrap_or(false)
+        }) {
+            println!(
+                "  restore latest: constant restore {}",
+                crate::term_safe(last.snapshot.as_deref().unwrap_or(""))
+            );
         }
     }
     Ok(())

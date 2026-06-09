@@ -26,6 +26,8 @@ fn main() -> Result<()> {
         Some("doctor") => run_doctor(&args[1..]),
         Some("status") => run_status(&args[1..]),
         Some("trail") => run_trail(&args[1..]),
+        Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
+        Some("restore") => run_restore(&args[1..]),
         Some("route") | Some("routes") => run_route(&args[1..]),
         Some("keys") => host::debug_keys(),
         Some("-V") | Some("--version") => {
@@ -246,6 +248,18 @@ fn run_carry(rest: &[String]) -> Result<()> {
     if debug && !json {
         trail::print_carry_debug(&src_path, &src_id, &conv_id, &slug, from_rt, to, n, reuse);
     }
+    // The record comes first: write this hop's snapshot volume (distilled IR)
+    // before materializing the native copy. A failed record never blocks the
+    // carry, but it is announced — a silent gap is the one unforgivable thing.
+    let snapshot = trail::snapshot_path(&conv_id, n, from_rt).and_then(|p| {
+        match alembic::write_snapshot(&distilled.session, &p) {
+            Ok(()) => Some(p),
+            Err(e) => {
+                eprintln!("warning: record not written: {e}");
+                None
+            }
+        }
+    });
     let (id, written, cwd) =
         alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
     // Record the trail under the CONVERSATION's own cwd (carried from the source
@@ -266,6 +280,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
         &written,
         &title,
         mode,
+        snapshot.as_deref(),
     ) {
         eprintln!("warning: trail ledger write failed: {e}");
     }
@@ -284,6 +299,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "resume": &resume,
             "trail": &title,
             "receipt": receipt_json,
+            "snapshot": snapshot.as_ref().map(|p| p.display().to_string()),
         });
         if debug {
             out["debug"] = serde_json::json!({
@@ -393,6 +409,131 @@ fn run_trail(rest: &[String]) -> Result<()> {
     } else {
         trail::print(cwd.as_deref())
     }
+}
+
+fn run_snapshots(rest: &[String]) -> Result<()> {
+    let mut all = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--all" => all = true,
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+    let cwd = if all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    trail::print_snapshots(cwd.as_deref())
+}
+
+/// `constant restore <snapshot> [--to codex|claude]` — reprint a fresh native
+/// session from a record volume (or any session file). Always MINTS a new
+/// projection: certified copies circulate, the record never gets written on.
+fn run_restore(rest: &[String]) -> Result<()> {
+    let mut source: Option<PathBuf> = None;
+    let mut to: Option<String> = None;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--to" => {
+                to = Some(flag_value(rest, i, "--to")?);
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            s if !s.starts_with("--") => {
+                source = Some(PathBuf::from(s));
+                i += 1;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+
+    let source = source.context(
+        "restore needs a snapshot path or session id (see `constant snapshots`)",
+    )?;
+    let resolved = alembic::resolve_session(&source)?;
+    let (src_rt, src_id) = alembic::identify(&resolved)
+        .with_context(|| format!("could not identify {}", resolved.display()))?;
+    // Default target: the runtime the recorded conversation came from.
+    let to = match to {
+        Some(s) => Runtime::parse(&s)?,
+        None => src_rt,
+    };
+
+    let mut distilled = alembic::distill_source(&resolved)?;
+    let root = distilled.root_name();
+    let (conv_id, last_n, _) = trail::resume(&resolved, &src_id);
+    let slug = trail::slug(&root.unwrap_or_else(|| "conversation".to_string()));
+    let n = last_n + 1;
+    let title = trail::title(n, src_rt, &slug);
+
+    // Always a fresh mint (reuse: None) — a restore must never overwrite an
+    // existing projection, let alone the record it reads from.
+    let (id, written, cwd) =
+        alembic::distill_write(&mut distilled, &resolved, to, None, Some(&title))?;
+    let here = std::env::current_dir().ok();
+    if let Err(e) = trail::record(
+        n,
+        &conv_id,
+        &slug,
+        cwd.as_deref().or(here.as_deref()),
+        &src_id,
+        &resolved,
+        src_rt,
+        to,
+        &id,
+        &written,
+        &title,
+        "restore",
+        Some(&resolved),
+    ) {
+        eprintln!("warning: trail ledger write failed: {e}");
+    }
+
+    let resume = match to {
+        Runtime::Claude => format!("claude -r {id}"),
+        Runtime::Codex => format!("codex resume {id}"),
+    };
+    let receipt = distilled.receipt;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "restored": true,
+                "id": &id,
+                "to": to.label(),
+                "from_record": resolved.display().to_string(),
+                "cwd": cwd.as_ref().map(|p| p.display().to_string()),
+                "resume": &resume,
+                "trail": &title,
+                "receipt": {
+                    "turns": receipt.turns,
+                    "dropped_tools": receipt.dropped_tools,
+                    "dropped_scaffold": receipt.dropped_scaffold,
+                    "redactions": receipt.redactions,
+                },
+            })
+        );
+    } else {
+        println!("restored → {} session {id}  ({title})", to.label());
+        println!("{}", receipt.summary());
+        println!(
+            "from record: {}",
+            term_safe(&resolved.display().to_string())
+        );
+        if let Some(cwd) = cwd {
+            println!("cwd: {}", term_safe(&cwd.display().to_string()));
+        }
+        println!("resume with: {resume}");
+    }
+    Ok(())
 }
 
 fn run_route(rest: &[String]) -> Result<()> {
@@ -648,6 +789,13 @@ USAGE:
 
   constant trail [--all] [--events]
         Show current projections by conversation. --events shows the raw switch ledger.
+
+  constant snapshots [--all]
+        List the record volumes (per-hop IR snapshots, written at every carry).
+
+  constant restore SNAPSHOT [--to codex|claude] [--json]
+        Reprint a fresh native session from a record volume (never overwrites
+        anything). Default target: the runtime the record came from.
 
   constant route [--all] [--session PATH_OR_ID]
         Show the reconstructed fork graph with aliases like codex[1] and claude[1.1].

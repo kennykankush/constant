@@ -798,6 +798,95 @@ fn status_reports_runtime_trail_and_latest_sessions() {
     );
 }
 
+// --- the record: per-hop IR snapshots + restore ---
+
+#[test]
+fn carry_writes_a_record_volume_and_restore_reprints_it() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(c.status.success(), "carry failed: {}", err(&c));
+    let v: serde_json::Value = serde_json::from_str(&out(&c)).expect("carry emitted invalid JSON");
+
+    // The carry recorded a snapshot volume and reported its path.
+    let snap = v["snapshot"].as_str().expect("carry reported no snapshot");
+    let snap_path = std::path::PathBuf::from(snap);
+    assert!(snap_path.exists(), "record volume missing: {snap}");
+    assert!(
+        snap.contains(".constant") && snap.contains("snapshots"),
+        "record not in the vault: {snap}"
+    );
+    let content = std::fs::read_to_string(&snap_path).unwrap();
+    assert!(content.contains("\"ir_version\""), "record is not IR");
+    assert!(
+        content.contains("hello from the fixture"),
+        "record lost the conversation"
+    );
+
+    // `snapshots` lists it from the ledger.
+    let ls = run(&dir, &["snapshots", "--all"]);
+    assert!(ls.status.success(), "{}", err(&ls));
+    let ls_out = out(&ls);
+    assert!(ls_out.contains("t01"), "listing missing the volume: {ls_out}");
+    assert!(ls_out.contains("ok"), "volume not marked ok: {ls_out}");
+    assert!(
+        ls_out.contains("restore latest:"),
+        "listing missing restore hint: {ls_out}"
+    );
+
+    // Restore reprints a FRESH projection from the record — new id, record
+    // untouched, lineage joined (the restore shows up as another event).
+    let before = std::fs::read(&snap_path).unwrap();
+    let carried_id = v["id"].as_str().unwrap();
+    let r = run(&dir, &["restore", snap, "--to", "claude", "--json"]);
+    assert!(r.status.success(), "restore failed: {}", err(&r));
+    let rv: serde_json::Value =
+        serde_json::from_str(&out(&r)).expect("restore emitted invalid JSON");
+    let restored_id = rv["id"].as_str().expect("restore reported no id");
+    assert_ne!(restored_id, carried_id, "restore must mint, not reuse");
+    assert_eq!(
+        before,
+        std::fs::read(&snap_path).unwrap(),
+        "restore modified the record"
+    );
+    assert_eq!(rv["receipt"]["turns"].as_u64(), Some(2));
+
+    let events = run(&dir, &["trail", "--all", "--events"]);
+    assert!(events.status.success(), "{}", err(&events));
+    assert!(
+        out(&events).contains("t02"),
+        "restore not recorded in the ledger: {}",
+        out(&events)
+    );
+}
+
+#[test]
+fn restore_defaults_to_the_record_source_runtime() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    // The fixture's IR declares source_format codex — restoring with no --to
+    // must reprint a codex session.
+    let r = run(&dir, &["restore", fix.to_str().unwrap(), "--json"]);
+    assert!(r.status.success(), "restore failed: {}", err(&r));
+    let rv: serde_json::Value =
+        serde_json::from_str(&out(&r)).expect("restore emitted invalid JSON");
+    assert_eq!(rv["to"].as_str(), Some("codex"));
+    assert!(
+        rv["resume"].as_str().unwrap_or("").starts_with("codex resume"),
+        "wrong resume command: {rv}"
+    );
+}
+
 #[test]
 fn export_to_stdout_is_ir() {
     let dir = tmpdir();

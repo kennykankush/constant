@@ -49,6 +49,19 @@ carry pipeline made definite.
   moved to a per-process temp path.
 
 ### Added
+- **The record: per-hop IR snapshots.** Every carry now writes the distilled
+  conversation to `~/.constant/snapshots/<conversation>/tNN-from-<runtime>.json`
+  (atomic, owner-only, post-redaction) BEFORE materializing the native copy,
+  and the trail row references its volume. The IR becomes the durable record;
+  native sessions become reprintable projections of it — crash recovery and
+  format-drift immunity in one move. A failed record write never blocks a
+  switch, but is always announced.
+- **`constant snapshots [--all]`** — list the record volumes per conversation
+  (from the ledger, with missing files marked).
+- **`constant restore SNAPSHOT [--to codex|claude] [--json]`** — reprint a
+  fresh native session from any record volume (always mints; never overwrites
+  anything, least of all the record). Defaults to the runtime the record came
+  from; the restore is logged to the trail so lineage stays joined.
 - **Carry receipt.** Every switch and headless carry reports what the
   distillation did: `carried N turns · dropped M tool events · K redactions` —
   in the host trail line, `carry` output, and `--json` (`receipt`).

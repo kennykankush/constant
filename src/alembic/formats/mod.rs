@@ -174,6 +174,8 @@ pub fn load_session(path: &Path, format: SourceFormat) -> Result<UniversalSessio
 }
 
 pub fn write_ir(session: &UniversalSession, output: &Path) -> Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create parent directory for {}", output.display())
@@ -181,7 +183,21 @@ pub fn write_ir(session: &UniversalSession, output: &Path) -> Result<()> {
     }
 
     let text = serde_json::to_string_pretty(session).context("failed to encode IR JSON")?;
-    fs::write(output, text).with_context(|| format!("failed to write {}", output.display()))
+    // Atomic, like every other materialization: an IR file is either the
+    // previous complete document or the new one, never a torn half.
+    let tmp = tmp_sibling(output);
+    let mut guard = TmpCleanup::new(&tmp);
+    let mut file = fs::File::create(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, output)
+        .with_context(|| format!("failed to move {} into place", output.display()))?;
+    guard.keep();
+    Ok(())
 }
 
 pub fn load_ir(path: &Path) -> Result<UniversalSession> {

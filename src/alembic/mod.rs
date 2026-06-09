@@ -151,6 +151,14 @@ impl Distilled {
     }
 }
 
+/// Write a distilled conversation as a record volume (neutral IR snapshot).
+/// Called BEFORE materializing any native copy — the record comes first; the
+/// copies are derived. The snapshot is the post-sanitize payload (sealed
+/// before it enters the record), and the write is atomic.
+pub fn write_snapshot(session: &UniversalSession, path: &Path) -> Result<()> {
+    formats::write_ir(session, path)
+}
+
 /// Phase 1: load a source session and distill it (sanitize + redact).
 pub fn distill_source(src: &Path) -> Result<Distilled> {
     let mut session = formats::load_session(src, SourceFormat::Auto)
