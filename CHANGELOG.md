@@ -3,7 +3,14 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - Names, the control room, and conversations that travel
+
+The identity release: every conversation gets a stable handle, a human title,
+and chapters; the host gets a control room (trail graph, switch theater, a
+real `:` line); `constant ps` shows every live agent on the machine; and
+`pack`/`unpack` carry a whole conversation — record and lineage — across
+machines. Underneath, sixteen adversarial integrity tests and a wider CI
+matrix (macOS + real opencode) guard all of it.
 
 ### Added
 - **`constant pack` / `constant unpack` — conversations cross machines.**
