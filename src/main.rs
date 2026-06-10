@@ -30,6 +30,7 @@ fn main() -> Result<()> {
         Some("trail") => run_trail(&args[1..]),
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
         Some("ps") | Some("live") => run_ps(&args[1..]),
+        Some("rename") => run_rename(&args[1..]),
         Some("restore") => run_restore(&args[1..]),
         Some("route") | Some("routes") => run_route(&args[1..]),
         Some("keys") => host::debug_keys(),
@@ -199,8 +200,10 @@ fn run_carry(rest: &[String]) -> Result<()> {
     // new file every time, exactly like the interactive harness.
     let (conv_id, last_n, projs) = trail::resume(&src_path, &src_id);
     let slug = trail::slug(&root.clone().unwrap_or_else(|| "conversation".to_string()));
+    let harvested = alembic::harvested_title(&distilled.session);
+    let naming = trail::naming_for(&conv_id, &slug, harvested.as_deref());
     let n = last_n + 1;
-    let title = trail::title(n, from_rt, &slug);
+    let title = trail::title(n, from_rt, &naming.name, &naming.handle);
 
     // Reuse the conversation's existing projection for the target (stable pair)
     // unless the caller explicitly asks for a fresh continuation. Never reuse
@@ -294,21 +297,24 @@ fn run_carry(rest: &[String]) -> Result<()> {
     // `constant trail` in that project shows its own threads. Fall back to the
     // invocation dir only if the session has no recorded cwd. A failed ledger
     // append is surfaced: pair-reuse depends on it.
-    if let Err(e) = trail::record(
+    if let Err(e) = trail::record(&trail::CarryRow {
         n,
-        &conv_id,
-        &slug,
-        cwd.as_deref().or(here.as_deref()),
-        &src_id,
-        &src_path,
-        from_rt,
+        conv_id: &conv_id,
+        slug: &slug,
+        cwd: cwd.as_deref().or(here.as_deref()),
+        source_id: &src_id,
+        source_path: &src_path,
+        from: from_rt,
         to,
-        &id,
-        &written,
-        &title,
+        id: &id,
+        path: &written,
+        title: &title,
         mode,
-        snapshot.as_deref(),
-    ) {
+        snapshot: snapshot.as_deref(),
+        handle: &naming.handle,
+        name: &naming.name,
+        named: naming.named,
+    }) {
         eprintln!("warning: trail ledger write failed: {e}");
     }
 
@@ -322,6 +328,8 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "cwd": cwd.as_ref().map(|p| p.display().to_string()),
             "resume": &resume,
             "trail": &title,
+            "handle": &naming.handle,
+            "name": &naming.name,
             "receipt": receipt_json,
             "snapshot": snapshot.as_ref().map(|p| p.display().to_string()),
         });
@@ -515,10 +523,20 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         None => vec![&convs[0]],
         Some(q) => {
             let ql = q.to_lowercase();
-            convs
-                .iter()
-                .filter(|c| c.slug.to_lowercase().contains(&ql) || c.conversation.starts_with(q.as_str()))
-                .collect()
+            // Exact handle match is unambiguous by construction — short-circuit.
+            if let Some(exact) = convs.iter().find(|c| c.handle == ql) {
+                vec![exact]
+            } else {
+                convs
+                    .iter()
+                    .filter(|c| {
+                        c.slug.to_lowercase().contains(&ql)
+                            || c.name.to_lowercase().contains(&ql)
+                            || c.handle.starts_with(ql.as_str())
+                            || c.conversation.starts_with(q.as_str())
+                    })
+                    .collect()
+            }
         }
     };
     let conv = match matches.len() {
@@ -533,9 +551,9 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         _ => {
             println!("`{}` is ambiguous:", term_safe(query.as_deref().unwrap_or("")));
             for c in &matches {
-                println!("  {}", term_safe(&c.slug));
+                println!("  {}  {}", term_safe(&c.handle), term_safe(&c.name));
             }
-            bail!("narrow the query");
+            bail!("narrow the query (handles are always unambiguous)");
         }
     };
 
@@ -569,7 +587,11 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         if let Some(n) = &note {
             println!("{}", term_safe(n));
         }
-        println!("conversation: {}", term_safe(&conv.slug));
+        println!(
+            "conversation: {}  {}",
+            term_safe(&conv.handle),
+            term_safe(&conv.name)
+        );
         println!(
             "not a terminal — resume manually with: {}",
             native_resume_cmd(rt, &id)
@@ -596,14 +618,84 @@ fn print_resume_list(convs: &[trail::ConversationView]) {
                 .collect::<Vec<_>>()
                 .join("·")
         };
-        println!("  {:<44}  {}", term_safe(&c.slug), lives_in);
-        println!("      constant resume {}", term_safe(&c.slug));
+        println!(
+            "  {:<12} {:<40}  {}",
+            term_safe(&c.handle),
+            term_safe(&c.name),
+            lives_in
+        );
+        println!("      constant resume {}", term_safe(&c.handle));
     }
 }
 
 /// `constant ps` — every agent CLI process alive on this machine right now:
 /// runtime, uptime, the conversation it holds (when the ledger knows it), and
 /// how to get back in. Read-only.
+/// `constant rename [--of HANDLE] NEW NAME…` — explicitly name a conversation.
+/// An explicit rename locks the title (auto-naming stops). Native pickers are
+/// re-stamped for claude/codex projections; opencode picks it up at the next
+/// carry.
+fn run_rename(rest: &[String]) -> Result<()> {
+    let mut of: Option<String> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--of" => {
+                of = Some(flag_value(rest, i, "--of")?);
+                i += 2;
+            }
+            w => {
+                words.push(w.to_string());
+                i += 1;
+            }
+        }
+    }
+    let new_name = words.join(" ");
+    if new_name.trim().is_empty() {
+        bail!("rename needs the new name: constant rename [--of HANDLE] my new name");
+    }
+
+    let here = std::env::current_dir().ok();
+    // Target: explicit handle, else the newest conversation here.
+    let all = trail::conversations(None);
+    let conv = match &of {
+        Some(h) => all
+            .iter()
+            .find(|c| c.handle == *h)
+            .with_context(|| format!("no conversation with handle {h}"))?,
+        None => {
+            let scoped = trail::conversations(here.as_deref());
+            let Some(first) = scoped.first() else {
+                bail!("no conversation here to rename (try --of HANDLE; see `constant trail --all`)");
+            };
+            all.iter()
+                .find(|c| c.conversation == first.conversation)
+                .with_context(|| format!("conversation {} missing from the ledger", first.handle))?
+        }
+    };
+
+    trail::record_rename(&conv.conversation, &conv.handle, &new_name, here.as_deref())?;
+
+    // Re-stamp the conversation's current projections in native pickers.
+    let stamp = format!("{new_name} \u{b7} {}", conv.handle);
+    for p in &conv.projections {
+        if let Ok(rt) = Runtime::parse(&p.runtime)
+            && let Some((path, _)) = alembic::session_by_id(rt, &p.id)
+        {
+            let _ = alembic::restamp_title(rt, &p.id, &path, &stamp);
+        }
+    }
+
+    println!(
+        "renamed: {}  \u{201c}{}\u{201d}",
+        term_safe(&conv.handle),
+        term_safe(&new_name)
+    );
+    println!("(the name is now locked to your words; auto-naming stops)");
+    Ok(())
+}
+
 fn run_ps(rest: &[String]) -> Result<()> {
     let mut json = false;
     for arg in rest {
@@ -729,27 +821,32 @@ fn restore_session(source: &Path, to_override: Option<Runtime>) -> Result<Restor
     let root = distilled.root_name();
     let (conv_id, last_n, _) = trail::resume(&resolved, &src_id);
     let slug = trail::slug(&root.unwrap_or_else(|| "conversation".to_string()));
+    let harvested = alembic::harvested_title(&distilled.session);
+    let naming = trail::naming_for(&conv_id, &slug, harvested.as_deref());
     let n = last_n + 1;
-    let title = trail::title(n, src_rt, &slug);
+    let title = trail::title(n, src_rt, &naming.name, &naming.handle);
 
     let (id, written, cwd) =
         alembic::distill_write(&mut distilled, &resolved, to, None, Some(&title))?;
     let here = std::env::current_dir().ok();
-    if let Err(e) = trail::record(
+    if let Err(e) = trail::record(&trail::CarryRow {
         n,
-        &conv_id,
-        &slug,
-        cwd.as_deref().or(here.as_deref()),
-        &src_id,
-        &resolved,
-        src_rt,
+        conv_id: &conv_id,
+        slug: &slug,
+        cwd: cwd.as_deref().or(here.as_deref()),
+        source_id: &src_id,
+        source_path: &resolved,
+        from: src_rt,
         to,
-        &id,
-        &written,
-        &title,
-        "restore",
-        Some(&resolved),
-    ) {
+        id: &id,
+        path: &written,
+        title: &title,
+        mode: "restore",
+        snapshot: Some(&resolved),
+        handle: &naming.handle,
+        name: &naming.name,
+        named: naming.named,
+    }) {
         eprintln!("warning: trail ledger write failed: {e}");
     }
 
@@ -1161,6 +1258,10 @@ USAGE:
 
   constant trail [--all] [--events]
         Show current projections by conversation. --events shows the raw switch ledger.
+
+  constant rename [--of HANDLE] NEW NAME...
+        Name a conversation (locks the title; native pickers re-stamped).
+        Inside a hosted session: prefix then  :rename NEW NAME
 
   constant ps [--json]
         Every agent CLI process alive on this machine right now: runtime,

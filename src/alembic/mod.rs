@@ -392,6 +392,47 @@ pub fn distill_path(
     Ok((id, written, cwd, distilled.receipt))
 }
 
+/// A runtime-generated title worth harvesting (opencode's generated titles,
+/// a claude `/rename`), cleaned: never our own stamps (old `constant·…` or
+/// new `… · chNN ← …` formats), never empty.
+pub fn harvested_title(session: &UniversalSession) -> Option<String> {
+    let t = session.metadata.title.as_deref()?.trim();
+    if t.is_empty()
+        || t.starts_with("constant\u{b7}")
+        || t.contains(" \u{b7} ch")
+        || t.contains("\u{2190}")
+    {
+        return None;
+    }
+    Some(t.chars().take(80).collect())
+}
+
+/// Re-stamp a projection's native picker title after a rename. Claude gets a
+/// `custom-title` record; codex gets a registry UPDATE. OpenCode and gemini
+/// pick the new name up at the next carry.
+pub fn restamp_title(rt: Runtime, id: &str, path: &Path, title: &str) -> Result<()> {
+    match rt {
+        Runtime::Claude => stamp_claude_title(path, id, title),
+        Runtime::Codex => retitle_codex(id, title),
+        Runtime::OpenCode | Runtime::Gemini => Ok(()),
+    }
+}
+
+fn retitle_codex(id: &str, title: &str) -> Result<()> {
+    use rusqlite::{Connection, params};
+    let db = formats::default_output_root(SessionFormat::Codex)?.join("state_5.sqlite");
+    if !db.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open(&db)?;
+    conn.busy_timeout(std::time::Duration::from_secs(3))?;
+    conn.execute(
+        "UPDATE threads SET title = ?2, preview = ?2 WHERE id = ?1",
+        params![id, title],
+    )?;
+    Ok(())
+}
+
 /// The conversation's root handle: the first real user message in `path`,
 /// sanitized the same way a carry would. Used to name the trail.
 pub fn root_name(path: &Path, _from: Runtime) -> Option<String> {

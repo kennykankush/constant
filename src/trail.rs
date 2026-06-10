@@ -29,6 +29,9 @@ struct TrailEntry {
     title: String,
     mode: Option<String>,
     snapshot: Option<String>,
+    handle: Option<String>,
+    name: Option<String>,
+    named: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +49,10 @@ pub struct ProjectionView {
 pub struct ConversationView {
     pub conversation: String,
     pub slug: String,
+    /// The stable address (`cobalt-37`).
+    pub handle: String,
+    /// The glance title (rename > harvested > birth slug).
+    pub name: String,
     pub cwd: Option<String>,
     pub entries: usize,
     pub last_ts: u64,
@@ -82,16 +89,28 @@ pub struct RouteConversationView {
 /// Slugify a conversation's first message into a short, readable handle:
 /// lowercase alphanumerics, first ~6 words, joined by `-`.
 pub fn slug(name: &str) -> String {
+    // Humans open conversations with throat-clearing; names shouldn't.
+    const FILLER: [&str; 22] = [
+        "ok", "okay", "hey", "hi", "hello", "so", "wait", "can", "could", "you",
+        "u", "please", "pls", "um", "uh", "like", "just", "now", "right", "lets",
+        "also", "and",
+    ];
     let mut words: Vec<String> = Vec::new();
+    let mut content_started = false;
     for raw in name.split_whitespace() {
         let w: String = raw
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        if !w.is_empty() {
-            words.push(w);
+        if w.is_empty() {
+            continue;
         }
+        if !content_started && FILLER.contains(&w.as_str()) {
+            continue; // leading filler only — once content starts, keep everything
+        }
+        content_started = true;
+        words.push(w);
         if words.len() >= 6 {
             break;
         }
@@ -103,10 +122,11 @@ pub fn slug(name: &str) -> String {
     }
 }
 
-/// The native title we stamp on a projection, e.g.
-/// `constant·t01·from-codex·can-you-help-me`.
-pub fn title(n: u32, from: Runtime, root_slug: &str) -> String {
-    format!("constant·t{n:02}·from-{}·{root_slug}", from.label())
+/// The native title we stamp on a projection — leads with the human name,
+/// then the chapter, provenance, and the stable handle:
+/// `auth redirect bug · ch04 ← codex · cobalt-37`.
+pub fn title(n: u32, from: Runtime, name: &str, handle: &str) -> String {
+    format!("{name} \u{b7} ch{n:02} \u{2190} {} \u{b7} {handle}", from.label())
 }
 
 fn ledger_path() -> Option<PathBuf> {
@@ -153,8 +173,126 @@ fn safe_dir_component(id: &str) -> String {
     }
 }
 
+/// The handle lexicon: ~100 clean single-token color words. Shape is ONE
+/// color + a 2-digit tail (`cobalt-37`) — deliberately unlike opencode's
+/// adjective-noun pairs, so the two conventions can never be confused.
+const COLORS: [&str; 96] = [
+    "amber", "ash", "azure", "basalt", "beige", "bronze", "brass", "burgundy",
+    "carmine", "celadon", "cerise", "cerulean", "charcoal", "cinnabar", "citrine", "claret",
+    "cobalt", "copper", "coral", "cream", "crimson", "cyan", "denim", "ebony",
+    "ecru", "emerald", "fawn", "flax", "fuchsia", "garnet", "ginger", "gold",
+    "graphite", "gunmetal", "hazel", "heather", "henna", "indigo", "iris", "ivory",
+    "jade", "jasper", "jet", "lavender", "lilac", "lime", "linen", "madder",
+    "magenta", "mahogany", "maroon", "mauve", "mint", "moss", "mulberry", "mustard",
+    "ochre", "olive", "onyx", "opal", "orchid", "pearl", "periwinkle", "pewter",
+    "pine", "plum", "porcelain", "puce", "pumpkin", "quartz", "raspberry", "rose",
+    "ruby", "russet", "rust", "saffron", "sage", "salmon", "sand", "sapphire",
+    "scarlet", "sepia", "sienna", "silver", "slate", "smoke", "steel", "tan",
+    "taupe", "teal", "terracotta", "topaz", "turquoise", "umber", "vermilion", "viridian",
+];
+
+/// Mint the handle for a conversation: the hash SUGGESTS (`sha256(conv_id)`
+/// picks a color and a 2-digit tail, deterministically), the LEDGER decides —
+/// if another conversation already pinned that handle, the tail extends with
+/// further hash digits until free. Once written into a ledger row the handle
+/// is a registry fact: collisions are impossible by construction, not by
+/// probability.
+fn mint_handle(conv_id: &str, entries: &[TrailEntry]) -> String {
+    let hash = crate::alembic::sha256::hex(conv_id);
+    let bytes = hash.as_bytes();
+    let color = COLORS[(bytes[0] as usize * 256 + bytes[1] as usize) % COLORS.len()];
+    // Digits derived from successive hash chars, so lengthening is deterministic.
+    let hex_digits: String = hash
+        .chars()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                c
+            } else {
+                (((c as u8 - b'a') % 10) + b'0') as char
+            }
+        })
+        .collect();
+    let taken_by_other = |candidate: &str| {
+        entries
+            .iter()
+            .any(|e| e.handle.as_deref() == Some(candidate) && e.conversation != conv_id)
+    };
+    let mut len = 2;
+    loop {
+        let tail: String = hex_digits.chars().skip(2).take(len).collect();
+        let candidate = format!("{color}-{tail}");
+        if !taken_by_other(&candidate) {
+            return candidate;
+        }
+        len += 1;
+    }
+}
+
+/// A conversation's naming state, resolved from the ledger.
+#[derive(Clone, Debug)]
+pub struct Naming {
+    /// The stable address (`cobalt-37`) — pinned at first carry, never changes.
+    pub handle: String,
+    /// The semantic title — the glance layer.
+    pub name: String,
+    /// True once a human explicitly renamed it (auto-naming then stops forever).
+    pub named: bool,
+}
+
+/// Resolve (or mint) the naming for a conversation. `birth` is the smart
+/// birth-slug fallback; `harvested` is a runtime-generated title when one
+/// exists (opencode's titles, a claude /rename) — used only while the
+/// conversation hasn't been explicitly named (auto until touched).
+pub fn naming_for(conv_id: &str, birth: &str, harvested: Option<&str>) -> Naming {
+    let entries: Vec<TrailEntry> = ledger_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|t| t.lines().filter_map(parse_entry).collect())
+        .unwrap_or_default();
+    naming_from_entries(&entries, conv_id, birth, harvested)
+}
+
+/// The pure core of [`naming_for`], unit-testable against synthetic ledgers.
+fn naming_from_entries(
+    entries: &[TrailEntry],
+    conv_id: &str,
+    birth: &str,
+    harvested: Option<&str>,
+) -> Naming {
+    let handle = entries
+        .iter()
+        .find(|e| e.conversation == conv_id && e.handle.is_some())
+        .and_then(|e| e.handle.clone())
+        .unwrap_or_else(|| mint_handle(conv_id, entries));
+
+    // Latest recorded name wins; an explicit rename locks it forever.
+    let mut name: Option<String> = None;
+    let mut named = false;
+    for e in entries.iter().filter(|e| e.conversation == conv_id) {
+        if let Some(n) = &e.name {
+            name = Some(n.clone());
+            if e.named.unwrap_or(false) {
+                named = true;
+            }
+        }
+    }
+    let name = if named {
+        name.unwrap_or_else(|| birth.to_string())
+    } else {
+        harvested
+            .map(str::to_string)
+            .or(name)
+            .unwrap_or_else(|| birth.to_string())
+    };
+
+    Naming {
+        handle,
+        name,
+        named,
+    }
+}
+
 /// Where this hop's record volume lives:
-/// `~/.constant/snapshots/<conversation>/tNN-from-<runtime>.json`.
+/// `~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json`.
 /// Creates the directories (owner-only).
 pub fn snapshot_path(conv_id: &str, n: u32, from: Runtime) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -166,7 +304,7 @@ pub fn snapshot_path(conv_id: &str, n: u32, from: Runtime) -> Option<PathBuf> {
     let _ = fs::create_dir_all(&dir);
     restrict_dir(&snapshots);
     restrict_dir(&dir);
-    Some(dir.join(format!("t{n:02}-from-{}.json", from.label())))
+    Some(dir.join(format!("ch{n:02}-from-{}.json", from.label())))
 }
 
 fn parse_entry(line: &str) -> Option<TrailEntry> {
@@ -225,6 +363,12 @@ fn parse_entry(line: &str) -> Option<TrailEntry> {
             .get("snapshot")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        handle: v
+            .get("handle")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
+        named: v.get("named").and_then(|x| x.as_bool()),
     })
 }
 
@@ -296,6 +440,7 @@ pub fn conversations(cwd_filter: Option<&Path>) -> Vec<ConversationView> {
             .find(|e| e.slug != "?")
             .map(|e| e.slug.clone())
             .unwrap_or_else(|| conversation.clone());
+        let naming = naming_from_entries(&entries, &conversation, &slug, None);
         let cwd = entries.iter().find_map(|e| e.cwd.clone());
         let last_ts = entries.iter().map(|e| e.ts).max().unwrap_or(0);
 
@@ -347,6 +492,8 @@ pub fn conversations(cwd_filter: Option<&Path>) -> Vec<ConversationView> {
         out.push(ConversationView {
             conversation,
             slug,
+            handle: naming.handle,
+            name: naming.name,
             cwd,
             entries: entries.len(),
             last_ts,
@@ -505,22 +652,77 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
 /// failed append means the next re-host can silently fork the conversation, so
 /// the error is RETURNED for the caller to surface (the switch itself still
 /// proceeds — divergence is recoverable, a dead harness is not).
-#[allow(clippy::too_many_arguments)]
-pub fn record(
-    n: u32,
+pub struct CarryRow<'a> {
+    pub n: u32,
+    pub conv_id: &'a str,
+    pub slug: &'a str,
+    pub cwd: Option<&'a Path>,
+    pub source_id: &'a str,
+    pub source_path: &'a Path,
+    pub from: Runtime,
+    pub to: Runtime,
+    pub id: &'a str,
+    pub path: &'a Path,
+    pub title: &'a str,
+    pub mode: &'a str,
+    pub snapshot: Option<&'a Path>,
+    /// The conversation's pinned naming at this hop.
+    pub handle: &'a str,
+    pub name: &'a str,
+    pub named: bool,
+}
+
+/// Record an explicit rename — an append-only naming event. An explicit
+/// rename locks the title forever (auto-naming stops: "auto until touched").
+pub fn record_rename(
     conv_id: &str,
-    slug: &str,
+    handle: &str,
+    new_name: &str,
     cwd: Option<&Path>,
-    source_id: &str,
-    source_path: &Path,
-    from: Runtime,
-    to: Runtime,
-    id: &str,
-    path: &Path,
-    title: &str,
-    mode: &str,
-    snapshot: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let ledger = ledger_path_for_write().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cwd = cwd.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let entry = serde_json::json!({
+        "ts": ts,
+        "conversation": conv_id,
+        "handle": handle,
+        "name": new_name,
+        "named": true,
+        "mode": "rename",
+        "slug": slug(new_name),
+        "cwd": cwd.map(|p| p.display().to_string()),
+    });
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger)?;
+    writeln!(f, "{entry}")?;
+    Ok(())
+}
+
+pub fn record(row: &CarryRow) -> anyhow::Result<()> {
+    let CarryRow {
+        n,
+        conv_id,
+        slug,
+        cwd,
+        source_id,
+        source_path,
+        from,
+        to,
+        id,
+        path,
+        title,
+        mode,
+        snapshot,
+        handle,
+        name,
+        named,
+    } = *row;
     let ledger =
         ledger_path_for_write().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     let ts = SystemTime::now()
@@ -547,6 +749,9 @@ pub fn record(
         "title": title,
         "mode": mode,
         "snapshot": snapshot.map(|p| p.display().to_string()),
+        "handle": handle,
+        "name": name,
+        "named": named,
     });
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -739,7 +944,7 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
             let to = crate::term_safe(&e.to);
             let id = crate::term_safe(&e.id);
             let title = crate::term_safe(&e.title);
-            println!("  t{n:02}  {from:>6} \u{2192} {to:<6}  {id}  {title}");
+            println!("  ch{n:02}  {from:>6} \u{2192} {to:<6}  {id}  {title}");
         }
     }
     Ok(())
@@ -749,13 +954,17 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
 /// (as a projection or as a recorded source) — used by `constant ps` to name
 /// live processes.
 pub fn label_for_session(id: &str) -> Option<String> {
-    load_entries(None).into_iter().find_map(|e| {
-        if e.id == id || e.source_id.as_deref() == Some(id) {
-            (e.slug != "?").then_some(e.slug)
-        } else {
-            None
-        }
-    })
+    let entries = load_entries(None);
+    let conv = entries.iter().find_map(|e| {
+        (e.id == id || e.source_id.as_deref() == Some(id)).then(|| e.conversation.clone())
+    })?;
+    let slug = entries
+        .iter()
+        .find(|e| e.conversation == conv && e.slug != "?")
+        .map(|e| e.slug.clone())
+        .unwrap_or_else(|| conv.clone());
+    let naming = naming_from_entries(&entries, &conv, &slug, None);
+    Some(format!("{} \u{b7} {}", naming.handle, naming.name))
 }
 
 /// The newest record volume for a conversation that still exists on disk —
@@ -825,7 +1034,7 @@ pub fn print_snapshots(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
                 "missing"
             };
             println!(
-                "  t{:02}  from {:<6}  {status}  {}",
+                "  ch{:02}  from {:<6}  {status}  {}",
                 e.n,
                 crate::term_safe(&e.from),
                 crate::term_safe(snap)
@@ -900,7 +1109,7 @@ pub fn print_routes(
                 active
             );
             println!(
-                "       last: t{:02} from {} ({refresh}, {})",
+                "       last: ch{:02} from {} ({refresh}, {})",
                 node.last_n,
                 crate::term_safe(&node.last_from),
                 crate::term_safe(&node.mode)
@@ -989,9 +1198,10 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
 
     for conv in views {
         let cwd = crate::term_safe(conv.cwd.as_deref().unwrap_or(""));
-        let display = crate::term_safe(&conv.slug);
+        let handle = crate::term_safe(&conv.handle);
+        let name = crate::term_safe(&conv.name);
         let root = crate::term_safe(&conv.conversation);
-        println!("\nconversation: {display}   ({cwd})");
+        println!("\n{handle} \u{b7} {name}   ({cwd})");
         println!("  root: {root}");
         if conv.projections.is_empty() {
             println!("  projections: none");
@@ -1013,7 +1223,7 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
                 };
                 println!("  {runtime:<6} {id}  {title}");
                 println!(
-                    "         last: t{:02} from {} ({refresh}{older})",
+                    "         last: ch{:02} from {} ({refresh}{older})",
                     p.last_n,
                     crate::term_safe(&p.last_from)
                 );
@@ -1062,12 +1272,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slug_takes_first_six_words_lowercased() {
+    fn slug_strips_leading_filler_then_takes_six_words() {
+        // Throat-clearing is dropped until content starts; after that,
+        // everything counts (fillers mid-sentence are kept).
         assert_eq!(
             slug("ok can you help me do me a favour"),
-            "ok-can-you-help-me-do"
+            "help-me-do-me-a-favour"
         );
         assert_eq!(slug("Fix THE Bug!!"), "fix-the-bug");
+        assert_eq!(slug("hey so wait lets fix auth"), "fix-auth");
+        // All filler: falls back rather than emptying.
+        assert_eq!(slug("ok hey so"), "conversation");
     }
 
     #[test]
@@ -1079,13 +1294,64 @@ mod tests {
     #[test]
     fn title_format_is_stable() {
         assert_eq!(
-            title(1, Runtime::Codex, "can-you-help"),
-            "constant·t01·from-codex·can-you-help"
+            title(1, Runtime::Codex, "auth redirect bug", "cobalt-37"),
+            "auth redirect bug \u{b7} ch01 \u{2190} codex \u{b7} cobalt-37"
         );
-        assert_eq!(
-            title(12, Runtime::Claude, "x"),
-            "constant·t12·from-claude·x"
+    }
+
+    // --- handles: hash suggests, the ledger registry decides ---
+
+    #[test]
+    fn handle_minting_is_deterministic_and_collision_proof() {
+        // Same conversation always proposes the same handle.
+        let a = mint_handle("conv-aaaa", &[]);
+        let b = mint_handle("conv-aaaa", &[]);
+        assert_eq!(a, b);
+        assert!(a.contains('-'), "{a}");
+        let (color, tail) = a.split_once('-').unwrap();
+        assert!(COLORS.contains(&color), "{a}");
+        assert_eq!(tail.len(), 2, "{a}");
+
+        // If ANOTHER conversation pinned that exact handle, the tail extends
+        // deterministically instead of colliding.
+        let taken = entry(serde_json::json!({
+            "ts": 1, "conversation": "other-conv", "handle": a,
+        }));
+        let extended = mint_handle("conv-aaaa", &[taken]);
+        assert_ne!(extended, a);
+        assert!(extended.starts_with(&format!("{color}-")), "{extended}");
+        assert!(extended.len() > a.len(), "{extended}");
+
+        // The conversation that OWNS the handle keeps it.
+        let own = entry(serde_json::json!({
+            "ts": 1, "conversation": "conv-aaaa", "handle": a,
+        }));
+        assert_eq!(mint_handle("conv-aaaa", &[own]), a);
+    }
+
+    #[test]
+    fn naming_precedence_rename_locks_over_harvest() {
+        // Fresh conversation: birth slug, unless a harvested title exists.
+        let nm = naming_from_entries(&[], "c1", "birth-slug", None);
+        assert_eq!(nm.name, "birth-slug");
+        assert!(!nm.named);
+        let nm = naming_from_entries(&[], "c1", "birth-slug", Some("Fix auth bug"));
+        assert_eq!(nm.name, "Fix auth bug");
+
+        // An explicit rename row locks the name: harvest can't override it.
+        let renamed = entry(serde_json::json!({
+            "ts": 2, "conversation": "c1", "handle": "cobalt-37",
+            "name": "my chosen name", "named": true, "mode": "rename",
+        }));
+        let nm = naming_from_entries(
+            &[renamed],
+            "c1",
+            "birth-slug",
+            Some("Harvested title"),
         );
+        assert_eq!(nm.name, "my chosen name");
+        assert!(nm.named);
+        assert_eq!(nm.handle, "cobalt-37");
     }
 
     #[test]

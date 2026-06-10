@@ -68,7 +68,7 @@ target-native session, and starts the target runtime with its own resume
 command. Every carry prints a receipt of exactly what moved:
 
 ```text
-trail · constant·t02·from-codex·fix-the-bug · codex → claude · continue ·
+cobalt-37 · fix-the-bug · ch02 codex → claude · continue ·
 carried 14 turns · dropped 6 tool events · 2 redactions
 ```
 
@@ -167,12 +167,12 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 | `Ctrl-B` `X` | Create a new Codex continuation |
 | `Ctrl-B` `o` | Continue in OpenCode |
 | `Ctrl-B` `O` | Create a new OpenCode continuation |
-| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `new opencode`, `quit`) |
+| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `new opencode`, `rename auth bug`, `quit`) |
 | `Ctrl-B` `d` | Quit Constant (the hosted CLI exits with it) |
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
 
 A status bar on the bottom row shows the hosted runtime, the thread position
-(`t04·fix-the-bug`), and the prefix keys. The child is simply told the terminal
+(`ch04·fix-the-bug`), and the prefix keys. The child is simply told the terminal
 is one row shorter — Constant stays a pass-through proxy, not a compositor.
 Disable it with `--no-bar`.
 
@@ -181,6 +181,17 @@ If you are already inside tmux, pick another prefix:
 ```bash
 constant host codex --prefix C-t
 CONSTANT_PREFIX=C-t constant host codex
+```
+
+Every conversation gets a stable **handle** (`cobalt-37` — one color word + a
+2-digit tail, pinned in the ledger, collision-proof by registry) and a
+**title** (your `rename` wins forever; otherwise a runtime-generated title is
+harvested when one exists; otherwise the first contentful words). Carries are
+**chapters** (`ch04`): each chapter is one runtime's turn narrating the thread.
+
+```bash
+constant rename auth bug          # name it; native pickers are re-stamped
+constant resume cobalt-37         # handles are never ambiguous
 ```
 
 Re-host a conversation later, straight from the ledger:
@@ -228,7 +239,7 @@ about and labels projections with readable aliases like `codex[1]` and
 ## The Record
 
 Every carry writes the distilled conversation to
-`~/.constant/snapshots/<conversation>/tNN-from-<runtime>.json` — atomically,
+`~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json` — atomically,
 owner-only, post-redaction, BEFORE the native copy is materialized. The neutral
 snapshot is the durable record; native sessions are reprintable projections of
 it.
@@ -423,6 +434,7 @@ constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
 constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar]
 constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools]
 constant sessions [--from RT] [--all] [--titles] [--json]
+constant rename [--of HANDLE] NEW NAME...
 constant ps [--json]
 constant snapshots [--all]
 constant restore <snapshot> [--to RT] [--json]

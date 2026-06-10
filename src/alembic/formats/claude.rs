@@ -80,6 +80,13 @@ fn import_metadata(metadata: &mut SessionMetadata, value: &Value) {
     if let Some(version) = value.get("version").and_then(Value::as_str) {
         metadata.platform_version = Some(version.to_string());
     }
+    // A `/rename` inside Claude Code appends a custom-title record — the
+    // strongest naming signal there is. Latest one wins.
+    if let Some(custom) = value.get("customTitle").and_then(Value::as_str)
+        && !custom.trim().is_empty()
+    {
+        metadata.title = Some(custom.trim().to_string());
+    }
     let timestamp = value
         .get("timestamp")
         .and_then(Value::as_str)

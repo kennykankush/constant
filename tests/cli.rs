@@ -320,7 +320,7 @@ fn carry_logs_the_trail() {
     let o = run(&dir, &["trail", "--all"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(
-        out(&o).contains("hello-from-the-fixture"),
+        out(&o).contains("from-the-fixture"),
         "trail missing the conversation: {}",
         out(&o)
     );
@@ -360,11 +360,11 @@ fn trail_dedupes_projection_refreshes_and_events_shows_raw_ledger() {
     assert!(raw.status.success(), "{}", err(&raw));
     let raw_out = out(&raw);
     assert!(
-        raw_out.contains("t01"),
+        raw_out.contains("ch01"),
         "raw ledger missing first event: {raw_out}"
     );
     assert!(
-        raw_out.contains("t02"),
+        raw_out.contains("ch02"),
         "raw ledger missing second event: {raw_out}"
     );
 }
@@ -766,11 +766,11 @@ fn carry_debug_dry_run_shows_route_decision_without_writing() {
     assert!(raw.status.success(), "{}", err(&raw));
     let raw_out = out(&raw);
     assert!(
-        raw_out.contains("t01"),
+        raw_out.contains("ch01"),
         "trail lost original event: {raw_out}"
     );
     assert!(
-        !raw_out.contains("t02"),
+        !raw_out.contains("ch02"),
         "dry-run debug wrote a trail event: {raw_out}"
     );
 }
@@ -1469,8 +1469,8 @@ fn resume_picks_the_latest_projection_and_prints_native_cmd_without_a_tty() {
     );
     assert!(text.contains("not a terminal"), "{text}");
 
-    // Slug query selects the same conversation; unknown query fails.
-    let q = run(&dir, &["resume", "hello", "--all"]);
+    // Name query selects the same conversation; unknown query fails.
+    let q = run(&dir, &["resume", "fixture", "--all"]);
     assert!(q.status.success(), "{}", err(&q));
     assert!(out(&q).contains(&format!("claude -r {id}")));
 
@@ -1481,7 +1481,7 @@ fn resume_picks_the_latest_projection_and_prints_native_cmd_without_a_tty() {
     // --list shows the conversation and the command to resume it.
     let ls = run(&dir, &["resume", "--list", "--all"]);
     assert!(ls.status.success(), "{}", err(&ls));
-    assert!(out(&ls).contains("hello-from-the-fixture"), "{}", out(&ls));
+    assert!(out(&ls).contains("from-the-fixture"), "{}", out(&ls));
     assert!(out(&ls).contains("constant resume"), "{}", out(&ls));
 }
 
@@ -1503,7 +1503,7 @@ fn resume_with_ambiguous_query_lists_candidates_and_fails() {
     assert!(err(&r).contains("narrow the query"), "{}", err(&r));
     let listed = out(&r);
     assert!(
-        listed.contains("hello-from-the-fixture") && listed.contains("goodbye-fixture-two"),
+        listed.contains("from-the-fixture") && listed.contains("goodbye-fixture-two"),
         "candidates not listed: {listed}"
     );
 }
@@ -1585,7 +1585,7 @@ fn carry_writes_a_record_volume_and_restore_reprints_it() {
     let ls = run(&dir, &["snapshots", "--all"]);
     assert!(ls.status.success(), "{}", err(&ls));
     let ls_out = out(&ls);
-    assert!(ls_out.contains("t01"), "listing missing the volume: {ls_out}");
+    assert!(ls_out.contains("ch01"), "listing missing the volume: {ls_out}");
     assert!(ls_out.contains("ok"), "volume not marked ok: {ls_out}");
     assert!(
         ls_out.contains("restore latest:"),
@@ -1612,7 +1612,7 @@ fn carry_writes_a_record_volume_and_restore_reprints_it() {
     let events = run(&dir, &["trail", "--all", "--events"]);
     assert!(events.status.success(), "{}", err(&events));
     assert!(
-        out(&events).contains("t02"),
+        out(&events).contains("ch02"),
         "restore not recorded in the ledger: {}",
         out(&events)
     );

@@ -6,6 +6,22 @@ All notable changes to Constant are recorded here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **The naming redesign: handles, titles, chapters.** Every conversation now
+  has a stable **handle** — one color word + 2-digit tail (`cobalt-37`),
+  suggested by `sha256(conversation id)` but DECIDED by the ledger registry
+  (a taken handle deterministically extends its tail), so collisions are
+  impossible by construction and the shape can never be confused with
+  opencode's adjective-noun slugs. On top sits the **title** (the glance
+  layer) with strict precedence: an explicit rename — `constant rename` or
+  `:rename` inside a hosted session — locks it forever; otherwise a
+  runtime-generated title is harvested (opencode's titles, a `/rename` done
+  inside Claude Code); otherwise a smart birth-slug (leading filler words
+  stripped). Renames re-stamp claude/codex native pickers immediately. And
+  carries are now **chapters**: `ch04` everywhere `t04` used to be (events,
+  snapshots listing, status bar, record volume filenames), with the native
+  picker stamp leading with the human name: `auth bug · ch04 ← codex ·
+  cobalt-37`. Handles work as addresses everywhere (`resume cobalt-37` is
+  never ambiguous); existing conversations get handles retroactively.
 - **`constant ps`** (alias `live`) — every agent CLI process alive on the
   machine right now: runtime, uptime, the session it holds (read from its own
   args), the conversation name when the trail knows it, and its working

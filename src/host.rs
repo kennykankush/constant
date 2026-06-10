@@ -414,6 +414,7 @@ fn spawn_settled(
 enum Action {
     None,
     Quit,
+    Rename(String),
 }
 
 fn execute_command(
@@ -436,6 +437,7 @@ fn execute_command(
             Action::None
         }
         ["quit"] | ["q"] | ["detach"] => Action::Quit,
+        ["rename", rest @ ..] if !rest.is_empty() => Action::Rename(rest.join(" ")),
         _ => Action::None,
     }
 }
@@ -568,7 +570,7 @@ fn bar_text(
 ) -> String {
     let tools = if with_tools { "+tools" } else { "" };
     let thread = match slug {
-        Some(s) if trail_n > 0 => format!("t{trail_n:02}\u{b7}{s}"),
+        Some(s) if trail_n > 0 => format!("ch{trail_n:02}\u{b7}{s}"),
         Some(s) => s.to_string(),
         None => "no thread yet".to_string(),
     };
@@ -707,6 +709,9 @@ pub fn run(
     let mut trail_n: u32 = 0;
     let mut root_id: Option<String> = None;
     let mut root_slug: Option<String> = None;
+    // The conversation's naming (stable handle + glance title), refreshed at
+    // every switch and on :rename.
+    let mut naming: Option<crate::trail::Naming> = None;
     // Declared identity: the session id we POSITIVELY know the child owns —
     // the id we resumed into it, or the one we minted at a fresh claude launch.
     // Source resolution prefers this over filesystem inference.
@@ -760,7 +765,7 @@ pub fn run(
                         session.runtime,
                         with_tools,
                         trail_n,
-                        root_slug.as_deref(),
+                        naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                         &prefix_label,
                         (cols, rows),
                     );
@@ -872,16 +877,28 @@ pub fn run(
                             }
                             let conv_id = cid;
                             let slug = root_slug.clone().unwrap_or_default();
-                            // Candidate trail number; committed only on a successful
-                            // carry, so a failed carry consumes no t-number.
+                            // Naming: stable handle (registry-backed) + glance
+                            // title (rename > harvested > birth slug), refreshed
+                            // every switch so harvests and renames land.
+                            let harvested =
+                                crate::alembic::harvested_title(&distilled.session);
+                            let nm = crate::trail::naming_for(
+                                &conv_id,
+                                &slug,
+                                harvested.as_deref(),
+                            );
+                            naming = Some(nm.clone());
+                            // Candidate chapter number; committed only on a
+                            // successful carry, so a failed carry consumes none.
                             let n = trail_n + 1;
-                            let title = crate::trail::title(n, from, &slug);
+                            let title = crate::trail::title(n, from, &nm.name, &nm.handle);
 
                             let action = if request.new { "new" } else { "continue" };
                             let _ = out.write_all(
                                 format!(
-                                    "\x1b[2m  trail · {} · {} \u{2192} {} · {action} · {}\x1b[0m\r\n",
-                                    title,
+                                    "\x1b[2m  {} · {} · ch{n:02} {} \u{2192} {} · {action} · {}\x1b[0m\r\n",
+                                    nm.handle,
+                                    nm.name,
                                     from.label(),
                                     target.label(),
                                     distilled.receipt.summary(),
@@ -935,25 +952,28 @@ pub fn run(
                                     }
                                     trail_n = n; // commit only on success
                                     owned.insert(target, (id.clone(), written.clone()));
-                                    if let Err(e) = crate::trail::record(
+                                    if let Err(e) = crate::trail::record(&crate::trail::CarryRow {
                                         n,
-                                        &conv_id,
-                                        &slug,
-                                        host_cwd.as_deref(),
-                                        &src_id,
-                                        &src_path,
+                                        conv_id: &conv_id,
+                                        slug: &slug,
+                                        cwd: host_cwd.as_deref(),
+                                        source_id: &src_id,
+                                        source_path: &src_path,
                                         from,
-                                        target,
-                                        &id,
-                                        &written,
-                                        &title,
-                                        if reuse_owned.is_some() {
+                                        to: target,
+                                        id: &id,
+                                        path: &written,
+                                        title: &title,
+                                        mode: if reuse_owned.is_some() {
                                             "refresh-existing"
                                         } else {
                                             "new-fork"
                                         },
-                                        snapshot.as_deref(),
-                                    ) {
+                                        snapshot: snapshot.as_deref(),
+                                        handle: &nm.handle,
+                                        name: &nm.name,
+                                        named: nm.named,
+                                    }) {
                                         // The carry is fine; the LEDGER diverged —
                                         // say so, or the next re-host silently forks.
                                         dim(&mut out, &format!("trail ledger write failed: {e}"));
@@ -1026,7 +1046,7 @@ pub fn run(
                         session.runtime,
                         with_tools,
                         trail_n,
-                        root_slug.as_deref(),
+                        naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                         &prefix_label,
                         (cols, rows),
                     );
@@ -1063,7 +1083,7 @@ pub fn run(
                                 session.runtime,
                                 with_tools,
                                 trail_n,
-                                root_slug.as_deref(),
+                                naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                                 &prefix_label,
                                 (cols, rows),
                             );
@@ -1090,7 +1110,7 @@ pub fn run(
                     session.runtime,
                     with_tools,
                     trail_n,
-                    root_slug.as_deref(),
+                    naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                     &prefix_label,
                     (cols, rows),
                 );
@@ -1228,14 +1248,53 @@ pub fn run(
                                     let _ = out.flush();
                                     pending_out.clear();
                                 }
-                                if submit
-                                    && execute_command(
+                                if submit {
+                                    match execute_command(
                                         cmd_buf.trim(),
                                         &mut session,
                                         &mut switching_to,
-                                    ) == Action::Quit
-                                {
-                                    quitting = true;
+                                    ) {
+                                        Action::Quit => quitting = true,
+                                        Action::Rename(new_name) => {
+                                            match (&root_id, &mut naming) {
+                                                (Some(conv), Some(nm)) => {
+                                                    nm.name = new_name.clone();
+                                                    nm.named = true;
+                                                    if let Err(e) = crate::trail::record_rename(
+                                                        conv,
+                                                        &nm.handle,
+                                                        &new_name,
+                                                        host_cwd.as_deref(),
+                                                    ) {
+                                                        dim(&mut out, &format!("rename not recorded: {e}"));
+                                                    } else {
+                                                        // Re-stamp live projections so the
+                                                        // new name shows in native pickers.
+                                                        let stamp =
+                                                            format!("{new_name} · {}", nm.handle);
+                                                        for (rt, (id, path)) in owned.iter() {
+                                                            let _ = crate::alembic::restamp_title(
+                                                                *rt, id, path, &stamp,
+                                                            );
+                                                        }
+                                                        dim(
+                                                            &mut out,
+                                                            &format!(
+                                                                "renamed: {} · {new_name}",
+                                                                nm.handle
+                                                            ),
+                                                        );
+                                                        bar_dirty = bar;
+                                                    }
+                                                }
+                                                _ => dim(
+                                                    &mut out,
+                                                    "nothing to rename yet — the conversation gets its name at the first switch",
+                                                ),
+                                            }
+                                        }
+                                        Action::None => {}
+                                    }
                                 }
                             }
                         }
@@ -1329,7 +1388,7 @@ mod tests {
         let t = bar_text(Runtime::Codex, false, 4, Some("fix-the-bug"), "Ctrl-B", 80);
         assert_eq!(t.chars().count(), 80);
         assert!(t.contains("codex"), "{t}");
-        assert!(t.contains("t04\u{b7}fix-the-bug"), "{t}");
+        assert!(t.contains("ch04\u{b7}fix-the-bug"), "{t}");
         // Tools mode is visible.
         let t = bar_text(Runtime::Claude, true, 1, Some("x"), "Ctrl-B", 80);
         assert!(t.contains("claude+tools"), "{t}");
