@@ -1523,7 +1523,7 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
         .collect()
 }
 
-pub const SUPPORTED_CODEX: &str = "0.137";
+pub const SUPPORTED_CODEX: &str = "0.139";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.40";
 pub const SUPPORTED_OPENCODE: &str = "1.14";

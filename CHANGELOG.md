@@ -3,6 +3,44 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - Surviving codex 0.139
+
+The first live verification pass met real codec drift: codex 0.139 changed
+how it tracks sessions, and a switch could carry the wrong conversation, or
+silently land in an empty target. One night, three rounds of fixes — each
+one driven by evidence from a live machine.
+
+### Fixed
+- **Codex 0.139 made `/resume` invisible to file-based detection** (it reads
+  its registry without touching the resumed session file, and creates files
+  lazily). Switch-time detection for codex now reads codex's own sources, in
+  order: the **event log** (`logs_2.sqlite` — the only witness to a `/resume`
+  that hasn't been talked in yet), then the **thread registry**
+  (`state_5.sqlite`), then the file scan. Every candidate is validated: the
+  session file must exist, hold a conversation, and match the host directory.
+  A `/resume`-away inside codex now carries correctly even if you never typed
+  a word in the resumed conversation.
+- **The AGENTS.md scaffold can no longer become a conversation's name.**
+  0.139 injects project instructions as a plain user message; title
+  derivation and harvesting now reject scaffold at both layers.
+- **Closing the trail graph no longer blanks an inline-painting child.** The
+  view opens on the terminal's alternate screen when the child (codex 0.139,
+  claude) paints inline — closing restores the screen pixel-perfect, and
+  child output produced while the view was open is replayed, not discarded.
+  Full-screen children keep the resize-repaint path.
+
+### Added
+- **The carry gate.** A continue-switch with nothing carryable is cancelled
+  loudly — the child keeps running — instead of tearing it down into an
+  empty target. Uppercase switches (new continuation) always proceed.
+- **Version warnings where they matter.** The host checks installed runtime
+  versions in the background; an unvalidated runtime shows `⚠` next to its
+  name in the status bar with a held notice, instead of `doctor` knowing
+  quietly. Validated codex line bumped to **0.139.x** after a live pass.
+- **Loud degradation theater.** Failed and empty carries hold a `⚠` notice
+  in the bar (was a scroll-away dim line); a "successful" carry of ≤1 turns
+  shows `⚠` instead of `✓`.
+
 ## [0.3.0] - Names, the control room, and conversations that travel
 
 The identity release: every conversation gets a stable handle, a human title,
