@@ -195,6 +195,16 @@ constant resume --list --all    # see everything resumable
 every native projection has been deleted, it reprints one from the latest
 record snapshot first.
 
+See every agent conversation alive on the machine right now (any runtime,
+hosted or not — read-only):
+
+```bash
+constant ps
+# live agent sessions (14):
+#   claude   01-15:29:00   fix-the-bug   fefd68b4-5ee…   ~/dev/fantopy-hadi
+#   codex    01-15:27:35   -             019e9a25-91e…   ~/dev/belvedere
+```
+
 Show the current Constant projections for this directory:
 
 ```bash
@@ -413,6 +423,7 @@ constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
 constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar]
 constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools]
 constant sessions [--from RT] [--all] [--titles] [--json]
+constant ps [--json]
 constant snapshots [--all]
 constant restore <snapshot> [--to RT] [--json]
 constant export (--from RT | --session <path-or-id>) [--out FILE]

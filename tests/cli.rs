@@ -844,6 +844,21 @@ fn status_reports_runtime_trail_and_latest_sessions() {
     );
 }
 
+#[test]
+fn ps_json_is_valid_and_read_only() {
+    let dir = tmpdir();
+    let o = run(&dir, &["ps", "--json"]);
+    assert!(o.status.success(), "ps failed: {}", err(&o));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&o)).expect("ps emitted invalid JSON");
+    assert!(v.is_array());
+    // Census must never create Constant state.
+    assert!(
+        !dir.join(".constant").exists(),
+        "ps wrote state"
+    );
+}
+
 // --- integrity: adversarial inputs, durability, and trust boundaries ---
 
 #[test]

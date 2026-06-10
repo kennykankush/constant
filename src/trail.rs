@@ -745,6 +745,19 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The conversation slug a session id belongs to, if the ledger knows it
+/// (as a projection or as a recorded source) — used by `constant ps` to name
+/// live processes.
+pub fn label_for_session(id: &str) -> Option<String> {
+    load_entries(None).into_iter().find_map(|e| {
+        if e.id == id || e.source_id.as_deref() == Some(id) {
+            (e.slug != "?").then_some(e.slug)
+        } else {
+            None
+        }
+    })
+}
+
 /// The newest record volume for a conversation that still exists on disk —
 /// the lost-record fallback for `constant resume`: when every live projection
 /// is gone, the conversation is reprinted from its latest record.

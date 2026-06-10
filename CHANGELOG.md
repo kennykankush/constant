@@ -6,6 +6,13 @@ All notable changes to Constant are recorded here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **`constant ps`** (alias `live`) — every agent CLI process alive on the
+  machine right now: runtime, uptime, the session it holds (read from its own
+  args), the conversation name when the trail knows it, and its working
+  directory. Read-only — one `ps` walk plus best-effort cwd lookup; wrapper
+  processes (dtach, `sh -c`, login shells, Constant's own host) are never
+  double-counted, and an agent's launcher/native-binary pair dedupes to one
+  entry. `--json` for scripts.
 - **Integrity test suite.** Sixteen new regression tests covering the
   adversarial surface: hostile session ids cannot escape the record vault
   (path traversal), embedded ANSI/control bytes never reach the terminal,

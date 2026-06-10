@@ -6,6 +6,7 @@
 
 mod alembic;
 mod host;
+mod live;
 mod runtime;
 mod trail;
 
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
         Some("status") => run_status(&args[1..]),
         Some("trail") => run_trail(&args[1..]),
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
+        Some("ps") | Some("live") => run_ps(&args[1..]),
         Some("restore") => run_restore(&args[1..]),
         Some("route") | Some("routes") => run_route(&args[1..]),
         Some("keys") => host::debug_keys(),
@@ -599,6 +601,92 @@ fn print_resume_list(convs: &[trail::ConversationView]) {
     }
 }
 
+/// `constant ps` — every agent CLI process alive on this machine right now:
+/// runtime, uptime, the conversation it holds (when the ledger knows it), and
+/// how to get back in. Read-only.
+fn run_ps(rest: &[String]) -> Result<()> {
+    let mut json = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+
+    let agents = live::census();
+
+    if json {
+        let arr: Vec<_> = agents
+            .iter()
+            .map(|a| {
+                let conversation = a.session_id.as_deref().and_then(trail::label_for_session);
+                serde_json::json!({
+                    "runtime": a.runtime.label(),
+                    "pid": a.pid,
+                    "up": a.up,
+                    "session": a.session_id,
+                    "conversation": conversation,
+                    "cwd": a.cwd,
+                    "resume": a.session_id.as_deref().map(|id| native_resume_cmd(a.runtime, id)),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+        return Ok(());
+    }
+
+    if agents.is_empty() {
+        println!("no live agent sessions");
+        return Ok(());
+    }
+
+    println!("live agent sessions ({}):", agents.len());
+    let home = std::env::var("HOME").unwrap_or_default();
+    for a in &agents {
+        let conversation = a
+            .session_id
+            .as_deref()
+            .and_then(trail::label_for_session)
+            .unwrap_or_else(|| "-".to_string());
+        let session = a
+            .session_id
+            .as_deref()
+            .map(|id| {
+                if id.chars().count() > 14 {
+                    let head: String = id.chars().take(12).collect();
+                    format!("{head}\u{2026}")
+                } else {
+                    id.to_string()
+                }
+            })
+            .unwrap_or_else(|| "(session unknown)".to_string());
+        let cwd = a
+            .cwd
+            .as_deref()
+            .map(|c| {
+                if !home.is_empty() && c.starts_with(&home) {
+                    format!("~{}", &c[home.len()..])
+                } else {
+                    c.to_string()
+                }
+            })
+            .unwrap_or_default();
+        println!(
+            "  {:<9} {:>12}  {:<30} {:<16} {}",
+            a.runtime.label(),
+            term_safe(&a.up),
+            term_safe(&conversation),
+            term_safe(&session),
+            term_safe(&cwd),
+        );
+    }
+    println!();
+    println!(
+        "resume any of them: constant resume <conversation>, or the native command via `constant ps --json`"
+    );
+    Ok(())
+}
+
 fn run_snapshots(rest: &[String]) -> Result<()> {
     let mut all = false;
     for arg in rest {
@@ -1073,6 +1161,11 @@ USAGE:
 
   constant trail [--all] [--events]
         Show current projections by conversation. --events shows the raw switch ledger.
+
+  constant ps [--json]
+        Every agent CLI process alive on this machine right now: runtime,
+        uptime, the conversation it holds (when the trail knows it), and cwd.
+        Read-only. (`live` is an alias.)
 
   constant snapshots [--all]
         List the record volumes (per-hop IR snapshots, written at every carry).
