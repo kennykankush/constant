@@ -329,8 +329,10 @@ fn request_switch(
     {
         return;
     }
+    // Termination is deferred to the carry gate at the end of the input
+    // tick: a CONTINUE switch with nothing to carry is cancelled there
+    // instead of tearing the child down for an empty target.
     *switching_to = Some(SwitchRequest { target, new });
-    terminate(&mut session.child);
 }
 
 /// One dim parenthetical status line.
@@ -685,6 +687,31 @@ fn track_alt(active: &mut bool, tail: &mut Vec<u8>, chunk: &[u8]) {
     *tail = buf[buf.len() - keep..].to_vec();
 }
 
+/// Feed one typed byte into the /resume sniffer. Printables accumulate (a
+/// small rolling tail), backspace edits, Esc/control clears, and Enter checks:
+/// a line starting `/res` means the user ran the child's own resume picker.
+/// Navigation keys (arrow sequences) deliberately don't clear the tail — the
+/// picker is driven with arrows between typing and Enter.
+fn sniff_resume(tail: &mut Vec<u8>, resumed_away: &mut bool, b: u8) {
+    match b {
+        0x0d | 0x0a => {
+            if tail.starts_with(b"/res") {
+                *resumed_away = true;
+            }
+            tail.clear();
+        }
+        0x7f | 0x08 => {
+            tail.pop();
+        }
+        0x20..=0x7e => {
+            if tail.len() < 64 {
+                tail.push(b);
+            }
+        }
+        _ => tail.clear(),
+    }
+}
+
 /// Leave the alt-screen control room: the terminal restores the child's
 /// primary screen, then anything the child said while the view was open is
 /// replayed so no output is lost. No-op when the view wasn't on the alt screen.
@@ -984,6 +1011,13 @@ pub fn run(
     let mut mode = M_NORMAL;
     let mut cmd_buf = String::new();
     let mut switching_to: Option<SwitchRequest> = None;
+    // Set once the pending switch has actually terminated the child.
+    let mut term_sent = false;
+    // What the user is typing into the child, watched for a `/res…` command:
+    // on codex 0.139 a /resume-away leaves NO trace on disk until the user
+    // talks in the resumed conversation, so the flag powers an honest warning.
+    let mut typed_tail: Vec<u8> = Vec::new();
+    let mut resumed_away = false;
     let mut pending_out: Vec<u8> = Vec::new();
     // Installed-version preflight, off the hot path (each `--version` is a
     // subprocess). An unvalidated runtime gets a warning in the bar the moment
@@ -1379,6 +1413,9 @@ pub fn run(
                     child_session = spawned.1;
                     watchdog = std::time::Instant::now();
                     respawned_once = false;
+                    term_sent = false;
+                    resumed_away = false;
+                    typed_tail.clear();
                     banner(&mut out, session.runtime, &prefix_label);
                     // Establish the protected bar row BEFORE the child starts
                     // writing (an inline-scrolling child must never reach it).
@@ -1487,8 +1524,20 @@ pub fn run(
                                 mode = M_PREFIX;
                                 bottom_overlay(&mut out, &prefix_hint);
                             }
-                            Token::Byte(b) => passthrough.push(b),
-                            Token::Seq(s) => passthrough.extend_from_slice(&s),
+                            Token::Byte(b) => {
+                                sniff_resume(&mut typed_tail, &mut resumed_away, b);
+                                passthrough.push(b);
+                            }
+                            Token::Seq(s) => {
+                                if let Some((cp, mods, ev)) = parse_kitty_u(&s)
+                                    && ev != 3
+                                    && mods <= 2
+                                    && let Ok(b) = u8::try_from(cp)
+                                {
+                                    sniff_resume(&mut typed_tail, &mut resumed_away, b);
+                                }
+                                passthrough.extend_from_slice(&s);
+                            }
                         },
 
                         M_PREFIX => {
@@ -1809,6 +1858,44 @@ pub fn run(
                     let _ = session.writer.write_all(&passthrough);
                     let _ = session.writer.flush();
                 }
+                // Carry gate: a CONTINUE switch with nothing to carry must not
+                // tear the child down just to land in an empty target — cancel
+                // loudly and leave the child running. Uppercase/new switches
+                // always proceed (fresh is what they mean).
+                if let Some(req) = &switching_to
+                    && !term_sent
+                {
+                    let proceed = req.new || {
+                        let declared = child_session
+                            .as_deref()
+                            .and_then(|id| crate::alembic::session_by_id(session.runtime, id))
+                            .is_some();
+                        declared
+                            || owned
+                                .get(&session.runtime)
+                                .map(|(_, p)| p.exists())
+                                .unwrap_or(false)
+                            || crate::alembic::active_session(
+                                session.runtime,
+                                host_cwd.as_deref(),
+                                Some(child_spawned_at),
+                            )
+                            .is_some()
+                    };
+                    if proceed {
+                        terminate(&mut session.child);
+                        term_sent = true;
+                    } else {
+                        let msg = if resumed_away {
+                            " \u{26a0} can't carry: a /resume inside the child is invisible \u{b7} say one thing in that conversation, then switch (C/X/O = fresh) "
+                        } else {
+                            " \u{26a0} nothing to carry yet \u{b7} talk first, or C/X/O for a fresh start "
+                        };
+                        bar_notice = Some((msg.to_string(), std::time::Instant::now()));
+                        bar_dirty = bar;
+                        switching_to = None;
+                    }
+                }
                 if quitting {
                     break;
                 }
@@ -1945,6 +2032,37 @@ mod tests {
         );
         // Unknown: no completion.
         assert_eq!(complete_command("zz", None), None);
+    }
+
+    #[test]
+    fn sniff_resume_sees_the_picker() {
+        let mut tail = Vec::new();
+        let mut away = false;
+        for b in b"/resume\r" {
+            sniff_resume(&mut tail, &mut away, *b);
+        }
+        assert!(away, "typed /resume + enter missed");
+
+        // Partial command + Enter (popup completion) still counts.
+        let (mut tail, mut away) = (Vec::new(), false);
+        for b in b"/res\r" {
+            sniff_resume(&mut tail, &mut away, *b);
+        }
+        assert!(away);
+
+        // A normal chat line never trips it; Esc clears the tail.
+        let (mut tail, mut away) = (Vec::new(), false);
+        for b in b"please /resume nothing\r" {
+            sniff_resume(&mut tail, &mut away, *b);
+        }
+        assert!(!away);
+        let (mut tail, mut away) = (Vec::new(), false);
+        for b in b"/res" {
+            sniff_resume(&mut tail, &mut away, *b);
+        }
+        sniff_resume(&mut tail, &mut away, 0x1b);
+        sniff_resume(&mut tail, &mut away, 0x0d);
+        assert!(!away, "esc should clear the tail");
     }
 
     #[test]

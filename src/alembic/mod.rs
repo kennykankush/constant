@@ -128,20 +128,26 @@ fn codex_newest_thread_in(
     let cwd_canon = host_cwd
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string());
-    let path: String = conn
-        .query_row(
+    // NOTE codex 0.139 stopped maintaining has_user_event (always 0) — gate
+    // on first_user_message instead, then validate the rollout file itself.
+    let mut stmt = conn
+        .prepare(
             "SELECT rollout_path FROM threads
              WHERE (?1 IS NULL OR cwd = ?1 OR cwd = ?2)
                AND updated_at >= ?3
-               AND has_user_event = 1
+               AND first_user_message != ''
                AND archived = 0
-             ORDER BY updated_at DESC LIMIT 1",
-            rusqlite::params![cwd, cwd_canon, fence_s],
-            |r| r.get(0),
+             ORDER BY updated_at DESC LIMIT 8",
         )
         .ok()?;
-    let path = PathBuf::from(path);
-    path.exists().then_some(path)
+    let rows = stmt
+        .query_map(rusqlite::params![cwd, cwd_canon, fence_s], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    rows.flatten()
+        .map(PathBuf::from)
+        .find(|p| p.exists() && has_conversation(p, SessionFormat::Codex))
 }
 
 /// Newest opencode session for a directory (read-only sqlite), respecting the
@@ -2248,39 +2254,50 @@ Exporting session: ses_x1"#;
         let old_rollout = dir.join("old.jsonl");
         let live_rollout = dir.join("live.jsonl");
         let stub_rollout = dir.join("stub.jsonl");
-        for f in [&old_rollout, &live_rollout, &stub_rollout] {
-            fs::write(f, "{}\n").unwrap();
+        // Real conversational shape — the oracle validates the file, not just
+        // the registry row.
+        let convo_line = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#;
+        for f in [&old_rollout, &live_rollout] {
+            fs::write(f, format!("{convo_line}\n")).unwrap();
         }
+        // The stub's rollout holds no conversation at all.
+        fs::write(&stub_rollout, "{}\n").unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
+            // Mirrors the real 0.139 registry: has_user_event exists but is
+            // DEAD (always 0) — the oracle must not lean on it.
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT NOT NULL,
                 updated_at INTEGER NOT NULL, has_user_event INTEGER NOT NULL DEFAULT 0,
+                first_user_message TEXT NOT NULL DEFAULT '',
                 archived INTEGER NOT NULL DEFAULT 0
             )",
         )
         .unwrap();
-        let insert = |id: &str, path: &Path, cwd: &str, updated: i64, user: i64, archived: i64| {
+        let insert = |id: &str, path: &Path, cwd: &str, updated: i64, first: &str, archived: i64| {
             conn.execute(
-                "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![id, path.display().to_string(), cwd, updated, user, archived],
+                "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                rusqlite::params![id, path.display().to_string(), cwd, updated, first, archived],
             )
             .unwrap();
         };
         let cwd = dir.display().to_string();
         // Old conversation in this cwd: BEFORE the fence — invisible.
-        insert("old", &old_rollout, &cwd, now - 3600, 1, 0);
+        insert("old", &old_rollout, &cwd, now - 3600, "hi", 0);
         // Resumed-away conversation the user talked in just now: wins.
-        insert("live", &live_rollout, &cwd, now, 1, 0);
-        // Newer but turnless stub, and a newer archived thread: invisible.
-        insert("stub", &stub_rollout, &cwd, now + 1, 0, 0);
-        insert("arch", &stub_rollout, &cwd, now + 1, 1, 1);
+        insert("live", &live_rollout, &cwd, now, "hi", 0);
+        // Newer but messageless stub, and a newer archived thread: invisible.
+        insert("stub", &stub_rollout, &cwd, now + 1, "", 0);
+        insert("arch", &stub_rollout, &cwd, now + 1, "hi", 1);
         // Newest of all, wrong cwd: invisible.
-        insert("elsewhere", &live_rollout, "/somewhere/else", now + 2, 1, 0);
+        insert("elsewhere", &live_rollout, "/somewhere/else", now + 2, "hi", 0);
+        // Newer registry row whose rollout file has NO conversation in it
+        // (0.139 lazy writes): the oracle must skip past it to `live`.
+        insert("hollow", &stub_rollout, &cwd, now + 1, "hi", 0);
 
         let fence = SystemTime::now() - Duration::from_secs(60);
         let got = codex_newest_thread_in(&db_path, Some(&dir), Some(fence));
