@@ -859,6 +859,76 @@ fn ps_json_is_valid_and_read_only() {
     );
 }
 
+// --- pack & carry: the conversation crosses machines ---
+
+#[test]
+fn pack_and_unpack_moves_a_conversation_between_machines() {
+    // "Machine one": carry a conversation so it has a ledger + record volume.
+    let dir1 = tmpdir();
+    let fix = ir_fixture(&dir1);
+    let c = run(
+        &dir1,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    let cv: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+    let handle = cv["handle"].as_str().expect("carry reported no handle").to_string();
+
+    // Pack it.
+    let pack_file = dir1.join("travel.constant-pack.json");
+    let p = run(
+        &dir1,
+        &["pack", &handle, "--out", pack_file.to_str().unwrap()],
+    );
+    assert!(p.status.success(), "pack failed: {}", err(&p));
+    assert!(pack_file.exists());
+    assert!(out(&p).contains(&handle), "{}", out(&p));
+
+    // Refuses to overwrite an existing pack.
+    let again = run(
+        &dir1,
+        &["pack", &handle, "--out", pack_file.to_str().unwrap()],
+    );
+    assert!(!again.status.success(), "pack overwrote a file");
+
+    // "Machine two": fresh HOME, nothing but the pack file.
+    let dir2 = tmpdir();
+    let u = run(&dir2, &["unpack", pack_file.to_str().unwrap()]);
+    assert!(u.status.success(), "unpack failed: {}", err(&u));
+    let utext = out(&u);
+    assert!(utext.contains(&handle), "handle lost in transit: {utext}");
+    assert!(utext.contains("constant resume"), "{utext}");
+
+    // The record arrived: volumes listed ok from the LOCAL vault.
+    let snaps = run(&dir2, &["snapshots", "--all"]);
+    assert!(snaps.status.success(), "{}", err(&snaps));
+    let stext = out(&snaps);
+    assert!(stext.contains("ch01"), "volume missing on machine two: {stext}");
+    assert!(stext.contains("ok"), "{stext}");
+
+    // And the conversation WAKES on machine two: no native projection exists
+    // here, so resume reprints from the record (the lost-record doctrine,
+    // now doing cross-machine duty).
+    let r = run(&dir2, &["resume", &handle, "--all"]);
+    assert!(r.status.success(), "resume on machine two failed: {}", err(&r));
+    let rtext = out(&r);
+    assert!(
+        rtext.contains("restored from the record"),
+        "no record restore: {rtext}"
+    );
+
+    // Idempotent: unpacking again adds nothing.
+    let u2 = run(&dir2, &["unpack", pack_file.to_str().unwrap()]);
+    assert!(u2.status.success(), "{}", err(&u2));
+    assert!(
+        out(&u2).contains("0 rows added") || out(&u2).contains("rows added, "),
+        "{}",
+        out(&u2)
+    );
+    let u2text = out(&u2);
+    assert!(u2text.contains("0 rows added"), "not idempotent: {u2text}");
+}
+
 // --- integrity: adversarial inputs, durability, and trust boundaries ---
 
 #[test]

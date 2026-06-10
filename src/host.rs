@@ -638,7 +638,7 @@ fn render_graph(
     }
 
     out.push_str(&format!(
-        "\r\n  {DIM}t/q close \u{b7} chapters are record volumes: constant snapshots \u{b7} checkout coming{RESET}\r\n"
+        "\r\n  {DIM}c/x/o switch (shift=new) \u{b7} r rename \u{b7} t/q close{RESET}\r\n"
     ));
     out
 }
@@ -891,6 +891,9 @@ pub fn run(
     // `:` line history (up/down recall).
     let mut cmd_history: Vec<String> = Vec::new();
     let mut hist_ix: Option<usize> = None;
+    // The command line was opened from the control room: repaint the child
+    // when it closes (the graph is still on screen behind it).
+    let mut from_view = false;
     let mut session = match resume {
         Some(id) => {
             child_session = Some(id.to_string());
@@ -1510,6 +1513,13 @@ pub fn run(
                                 clear_bottom(&mut out);
                                 mode = M_NORMAL;
                                 bar_dirty = bar;
+                                if from_view {
+                                    from_view = false;
+                                    let _ = out.write_all(b"[2J[H");
+                                    let _ = out.flush();
+                                    let (c, r) = size().unwrap_or((cols, rows));
+                                    force_repaint(&session, c, child_rows(r, bar));
+                                }
                                 if !pending_out.is_empty() {
                                     let _ = out.write_all(&pending_out);
                                     let _ = out.flush();
@@ -1574,17 +1584,63 @@ pub fn run(
                         }
 
                         M_VIEW => {
-                            let close = match &tok {
-                                Token::Byte(b) => {
-                                    matches!(*b, b't' | b'q' | 0x0d | 0x0a | b' ' | 0x03)
-                                }
-                                Token::Seq(seq) => parse_kitty_u(seq)
-                                    .map(|(cp, _, ev)| {
-                                        ev != 3 && matches!(cp, 113 | 116 | 13 | 27)
-                                    })
-                                    .unwrap_or(true), // any other escape (incl. Esc) closes
-                                Token::Prefix => false,
+                            // The cockpit: act from inside the graph. Letter
+                            // keys arrive as bytes or kitty presses — normalize.
+                            let key: Option<u8> = match &tok {
+                                Token::Byte(b) => Some(*b),
+                                Token::Seq(seq) => match parse_kitty_u(seq) {
+                                    Some((cp, mods, ev)) if ev != 3 && mods <= 2 => {
+                                        u8::try_from(cp).ok()
+                                    }
+                                    Some(_) => None,
+                                    // any unrecognized escape (incl. bare Esc) closes
+                                    None => Some(b'q'),
+                                },
+                                Token::Prefix => None,
                             };
+                            let mut close = false;
+                            match key {
+                                Some(b't') | Some(b'q') | Some(0x0d) | Some(0x0a)
+                                | Some(b' ') | Some(0x03) | Some(27) => close = true,
+                                // Switch straight from the graph: the switch
+                                // flow owns the screen from here.
+                                Some(b'c') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::Claude, false, &mut session, &mut switching_to);
+                                }
+                                Some(b'C') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::Claude, true, &mut session, &mut switching_to);
+                                }
+                                Some(b'x') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::Codex, false, &mut session, &mut switching_to);
+                                }
+                                Some(b'X') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::Codex, true, &mut session, &mut switching_to);
+                                }
+                                Some(b'o') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::OpenCode, false, &mut session, &mut switching_to);
+                                }
+                                Some(b'O') => {
+                                    mode = M_NORMAL;
+                                    request_switch(Runtime::OpenCode, true, &mut session, &mut switching_to);
+                                }
+                                // Rename without leaving: command line over the
+                                // graph, prefilled with the current name.
+                                Some(b'r') => {
+                                    mode = M_COMMAND;
+                                    from_view = true;
+                                    cmd_buf = match naming.as_ref() {
+                                        Some(nm) => format!("rename {}", nm.name),
+                                        None => "rename ".to_string(),
+                                    };
+                                    bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                                }
+                                _ => {}
+                            }
                             if close {
                                 mode = M_NORMAL;
                                 let _ = out.write_all(b"\x1b[2J\x1b[H");

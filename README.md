@@ -167,7 +167,7 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 | `Ctrl-B` `X` | Create a new Codex continuation |
 | `Ctrl-B` `o` | Continue in OpenCode |
 | `Ctrl-B` `O` | Create a new OpenCode continuation |
-| `Ctrl-B` `t` | Toggle the trail graph — the conversation's chapters as a colored branch view |
+| `Ctrl-B` `t` | Toggle the cockpit — the chapter graph, with actions: `c`/`x`/`o` switch from inside it, `r` rename |
 | `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `rename auth bug`, `quit`; Tab completes, ↑/↓ recall history) |
 | `Ctrl-B` `d` | Quit Constant (the hosted CLI exits with it) |
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
@@ -236,6 +236,16 @@ constant trail --events
 `constant route` is the debug view. It reconstructs the fork graph Constant knows
 about and labels projections with readable aliases like `codex[1]` and
 `claude[1.1]`.
+
+Move a conversation to another machine — the record travels, native sessions
+reprint on arrival:
+
+```bash
+constant pack cobalt-37                  # → cobalt-37.constant-pack.json
+# copy the file to the other machine, then:
+constant unpack cobalt-37.constant-pack.json
+constant resume cobalt-37                # wakes from the record, same handle
+```
 
 ## The Record
 
@@ -436,6 +446,8 @@ constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools]
 constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools]
 constant sessions [--from RT] [--all] [--titles] [--json]
 constant rename [--of HANDLE] NEW NAME...
+constant pack HANDLE [--out FILE]
+constant unpack FILE
 constant ps [--json]
 constant snapshots [--all]
 constant restore <snapshot> [--to RT] [--json]

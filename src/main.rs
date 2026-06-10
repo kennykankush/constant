@@ -31,6 +31,8 @@ fn main() -> Result<()> {
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
         Some("ps") | Some("live") => run_ps(&args[1..]),
         Some("rename") => run_rename(&args[1..]),
+        Some("pack") => run_pack(&args[1..]),
+        Some("unpack") => run_unpack(&args[1..]),
         Some("restore") => run_restore(&args[1..]),
         Some("route") | Some("routes") => run_route(&args[1..]),
         Some("keys") => host::debug_keys(),
@@ -696,6 +698,182 @@ fn run_rename(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `constant pack HANDLE [--out FILE]` — bundle a conversation (its ledger
+/// rows + every record volume) into one portable file. The conversation
+/// crosses machines: `constant unpack` on the other side, then
+/// `constant resume <handle>` reprints it from the record.
+fn run_pack(rest: &[String]) -> Result<()> {
+    let mut query: Option<String> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--out" => {
+                out_path = Some(PathBuf::from(flag_value(rest, i, "--out")?));
+                i += 2;
+            }
+            s if !s.starts_with("--") => {
+                if query.is_some() {
+                    bail!("pack takes one conversation handle");
+                }
+                query = Some(s.to_string());
+                i += 1;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+    let q = query.context("pack needs a conversation handle (see `constant trail --all`)")?;
+
+    let convs = trail::conversations(None);
+    let conv = convs
+        .iter()
+        .find(|c| c.handle == q)
+        .or_else(|| convs.iter().find(|c| c.conversation == q))
+        .with_context(|| format!("no conversation with handle {q} (see `constant trail --all`)"))?;
+
+    let rows = trail::raw_rows(&conv.conversation);
+    if rows.is_empty() {
+        bail!("nothing recorded for {q} yet — packs carry the ledger + record volumes");
+    }
+
+    // Volumes: every record file the rows reference and that still exists.
+    let mut volumes = serde_json::Map::new();
+    for line in &rows {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(snap) = v.get("snapshot").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let path = Path::new(snap);
+        let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if volumes.contains_key(fname) || !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read record volume {}", path.display()))?;
+        let vol: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("record volume {} is not valid JSON", path.display()))?;
+        volumes.insert(fname.to_string(), vol);
+    }
+
+    let doc = serde_json::json!({
+        "constant_pack": 1,
+        "packed_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "conversation": conv.conversation,
+        "handle": conv.handle,
+        "name": conv.name,
+        "rows": rows,
+        "volumes": volumes,
+    });
+
+    let out_path =
+        out_path.unwrap_or_else(|| PathBuf::from(format!("{}.constant-pack.json", conv.handle)));
+    if out_path.exists() {
+        bail!(
+            "refusing to overwrite {} — pick another --out",
+            term_safe(&out_path.display().to_string())
+        );
+    }
+    std::fs::write(&out_path, serde_json::to_string_pretty(&doc)?)
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
+
+    let n_vols = doc["volumes"].as_object().map(|m| m.len()).unwrap_or(0);
+    println!(
+        "packed {} \u{b7} {}  ({} ledger rows, {} record volumes)",
+        term_safe(&conv.handle),
+        term_safe(&conv.name),
+        doc["rows"].as_array().map(|a| a.len()).unwrap_or(0),
+        n_vols,
+    );
+    println!("\u{2192} {}", term_safe(&out_path.display().to_string()));
+    println!("on the other machine: constant unpack {}", term_safe(&out_path.display().to_string()));
+    println!("                      constant resume {}", term_safe(&conv.handle));
+    Ok(())
+}
+
+/// `constant unpack FILE` — import a packed conversation: volumes land in the
+/// local vault (never overwriting existing ones — volumes are immutable),
+/// ledger rows append idempotently with snapshot paths rewritten, and the
+/// handle re-mints if the local registry already gave it to someone else.
+fn run_unpack(rest: &[String]) -> Result<()> {
+    let file = rest
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .context("unpack needs a pack file: constant unpack <file>")?;
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("failed to read {file}"))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{file} is not a pack file"))?;
+    if doc.get("constant_pack").and_then(serde_json::Value::as_u64) != Some(1) {
+        bail!("{file} is not a constant pack (or a newer pack version this build can't read)");
+    }
+    let conv_id = doc
+        .get("conversation")
+        .and_then(serde_json::Value::as_str)
+        .context("pack missing conversation id")?;
+
+    // Volumes first (record before ledger — same law as carries).
+    let vault = trail::vault_dir(conv_id).context("HOME is not set")?;
+    let mut volume_paths: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    let mut vols_written = 0usize;
+    let mut vols_kept = 0usize;
+    if let Some(vols) = doc.get("volumes").and_then(serde_json::Value::as_object) {
+        for (fname, vol) in vols {
+            if fname.contains('/') || fname.contains("..") {
+                bail!("pack volume has a hostile filename: {}", term_safe(fname));
+            }
+            // A volume must BE a neutral IR session — validated by parsing.
+            let session: alembic::ir::UniversalSession =
+                serde_json::from_value(vol.clone())
+                    .with_context(|| format!("pack volume {fname} is not valid IR"))?;
+            let target = vault.join(fname);
+            if target.exists() {
+                vols_kept += 1; // volumes are immutable: the local copy stands
+            } else {
+                alembic::write_snapshot(&session, &target)?;
+                vols_written += 1;
+            }
+            volume_paths.insert(fname.clone(), target);
+        }
+    }
+
+    let rows: Vec<String> = doc
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let summary = trail::import_rows(conv_id, &rows, &volume_paths)?;
+
+    println!(
+        "unpacked {} \u{b7} {}",
+        term_safe(&summary.handle),
+        term_safe(doc.get("name").and_then(serde_json::Value::as_str).unwrap_or("conversation")),
+    );
+    println!(
+        "  ledger: {} rows added, {} already present \u{b7} volumes: {} written, {} kept",
+        summary.rows_added, summary.rows_skipped, vols_written, vols_kept
+    );
+    if summary.rehandled {
+        println!(
+            "  note: the packed handle was taken here \u{2192} re-minted as {}",
+            term_safe(&summary.handle)
+        );
+    }
+    println!("wake it: constant resume {}", term_safe(&summary.handle));
+    Ok(())
+}
+
 fn run_ps(rest: &[String]) -> Result<()> {
     let mut json = false;
     for arg in rest {
@@ -1262,6 +1440,14 @@ USAGE:
   constant rename [--of HANDLE] NEW NAME...
         Name a conversation (locks the title; native pickers re-stamped).
         Inside a hosted session: prefix then  :rename NEW NAME
+
+  constant pack HANDLE [--out FILE]
+        Bundle a conversation (ledger rows + record volumes) into one portable
+        file — move conversations between machines.
+
+  constant unpack FILE
+        Import a packed conversation; then `constant resume <handle>` reprints
+        it from the record.
 
   constant ps [--json]
         Every agent CLI process alive on this machine right now: runtime,

@@ -6,6 +6,20 @@ All notable changes to Constant are recorded here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **`constant pack` / `constant unpack` — conversations cross machines.**
+  `pack HANDLE` bundles a conversation (its ledger rows, verbatim, plus every
+  record volume) into one portable file; `unpack` on another machine writes
+  the volumes into the local vault (never overwriting — volumes are
+  immutable), appends the rows idempotently with snapshot paths rewritten to
+  the local vault and foreign projection paths blanked (a pack carries the
+  RECORD; native sessions reprint on arrival), and re-mints the handle only
+  if the local registry already gave it to a different conversation. Then
+  `constant resume <handle>` wakes the conversation from the record. The
+  slogan, completed: the conversation stays constant while the machine
+  changes.
+- **The cockpit.** The trail graph (`Ctrl-B t`) now acts: `c`/`x`/`o`
+  (shift = new fork) switch runtimes straight from the graph, and `r` opens
+  the command line over it prefilled with `rename <current name>`.
 - **The control room.** `Ctrl-B t` toggles Constant's own full-screen view of
   the conversation: a colored, GitLab-style chapter graph — one dot per
   chapter, rails between them, fork/restore glyphs, relative times, record

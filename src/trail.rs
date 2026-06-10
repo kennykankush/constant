@@ -984,6 +984,136 @@ pub fn chapters(conv_id: &str) -> Vec<ChapterRow> {
     rows
 }
 
+/// Raw ledger lines (verbatim) for one conversation — the pack's row payload.
+/// Verbatim strings, not re-serialized values: the pack carries exactly what
+/// the ledger said.
+pub fn raw_rows(conv_id: &str) -> Vec<String> {
+    ledger_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|t| {
+            t.lines()
+                .filter(|l| {
+                    parse_entry(l)
+                        .map(|e| e.conversation == conv_id)
+                        .unwrap_or(false)
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The local vault directory for a conversation's record volumes (created,
+/// owner-only) — where `unpack` lands imported volumes.
+pub fn vault_dir(conv_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let constant = PathBuf::from(home).join(".constant");
+    let _ = fs::create_dir_all(&constant);
+    restrict_dir(&constant);
+    let snapshots = constant.join("snapshots");
+    let dir = snapshots.join(safe_dir_component(conv_id));
+    let _ = fs::create_dir_all(&dir);
+    restrict_dir(&snapshots);
+    restrict_dir(&dir);
+    Some(dir)
+}
+
+pub struct UnpackSummary {
+    pub handle: String,
+    /// True when the packed handle was already pinned to a DIFFERENT
+    /// conversation locally — the registry re-minted one (never two owners).
+    pub rehandled: bool,
+    pub rows_added: usize,
+    pub rows_skipped: usize,
+}
+
+/// Import packed ledger rows for a conversation onto THIS machine:
+/// - snapshot paths are rewritten to the local vault (`volume_paths`)
+/// - the handle is re-minted if the local registry already gave it away
+/// - rows already present locally are skipped (idempotent unpack)
+pub fn import_rows(
+    conv_id: &str,
+    packed: &[String],
+    volume_paths: &std::collections::HashMap<String, PathBuf>,
+) -> anyhow::Result<UnpackSummary> {
+    let local: Vec<TrailEntry> = ledger_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|t| t.lines().filter_map(parse_entry).collect())
+        .unwrap_or_default();
+    let existing: std::collections::HashSet<(String, u64, u32, String)> = local
+        .iter()
+        .map(|e| (e.conversation.clone(), e.ts, e.n, e.id.clone()))
+        .collect();
+
+    let pack_handle = packed
+        .iter()
+        .filter_map(|l| parse_entry(l))
+        .find_map(|e| e.handle);
+    let conflict = pack_handle
+        .as_ref()
+        .map(|h| {
+            local
+                .iter()
+                .any(|e| e.handle.as_deref() == Some(h) && e.conversation != conv_id)
+        })
+        .unwrap_or(false);
+    let handle = if conflict || pack_handle.is_none() {
+        mint_handle(conv_id, &local)
+    } else {
+        pack_handle.clone().unwrap()
+    };
+
+    let ledger = ledger_path_for_write().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger)?;
+    let mut rows_added = 0usize;
+    let mut rows_skipped = 0usize;
+    for line in packed {
+        let Some(e) = parse_entry(line) else {
+            rows_skipped += 1;
+            continue;
+        };
+        if e.conversation != conv_id
+            || existing.contains(&(e.conversation.clone(), e.ts, e.n, e.id.clone()))
+        {
+            rows_skipped += 1;
+            continue;
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) else {
+            rows_skipped += 1;
+            continue;
+        };
+        // Uniform handle on imported rows (registry law: one owner).
+        v["handle"] = serde_json::Value::String(handle.clone());
+        // A pack carries the RECORD, not projections: the source machine's
+        // projection paths mean nothing here (and could even collide with
+        // local files). Blank them — the conversation wakes via restore.
+        for key in ["path", "target_path"] {
+            if v.get(key).is_some() {
+                v[key] = serde_json::Value::String(String::new());
+            }
+        }
+        // Snapshot paths follow the volumes to the LOCAL vault.
+        if let Some(old) = v.get("snapshot").and_then(serde_json::Value::as_str)
+            && let Some(fname) = Path::new(old).file_name().and_then(|n| n.to_str())
+            && let Some(local_path) = volume_paths.get(fname)
+        {
+            v["snapshot"] = serde_json::Value::String(local_path.display().to_string());
+        }
+        writeln!(f, "{v}")?;
+        rows_added += 1;
+    }
+
+    Ok(UnpackSummary {
+        handle,
+        rehandled: conflict,
+        rows_added,
+        rows_skipped,
+    })
+}
+
 /// The conversation slug a session id belongs to, if the ledger knows it
 /// (as a projection or as a recorded source) — used by `constant ps` to name
 /// live processes.
