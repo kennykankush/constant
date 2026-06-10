@@ -76,10 +76,17 @@ pub fn active_session(
         return Some((path, id));
     }
     if from == Runtime::Codex {
-        // Codex's own registry (state_5.sqlite) sees what file mtimes can't:
+        // First: codex's LOGS (logs_2.sqlite) — the only place a silent
+        // /resume-away exists. Codex 0.139 logs thread/start, thread/resume,
+        // and every session_loop event with the thread id, even when it has
+        // written nothing to the session store yet. This answers "which
+        // conversation is the child LOOKING at right now".
+        if let Some(found) = codex_thread_from_logs(host_cwd, since) {
+            return Some(found);
+        }
+        // Second: the registry (state_5.sqlite) sees what file mtimes can't:
         // since 0.139, `/resume` inside codex reads the db WITHOUT touching the
-        // resumed rollout file, so a resume-away is invisible to the file scan.
-        // The registry's updated_at moves the moment the user talks there.
+        // resumed rollout file. Its updated_at moves the moment the user talks.
         if let Some(path) = codex_newest_thread(host_cwd, since)
             && let Some(id) = session_id_of(&path, SessionFormat::Codex)
         {
@@ -91,6 +98,72 @@ pub fn active_session(
     let path = find_child_session(from_fmt, host_cwd, since)?;
     let id = session_id_of(&path, from_fmt)?;
     Some((path, id))
+}
+
+/// Which thread is the hosted codex LOOKING AT right now, from codex's own
+/// event log (read-only). The log is shared by every codex process on the
+/// machine, so each candidate is validated against the rollout store: the
+/// file must exist, hold a conversation, and match the host cwd.
+fn codex_thread_from_logs(
+    host_cwd: Option<&Path>,
+    since: Option<SystemTime>,
+) -> Option<(PathBuf, String)> {
+    let db = formats::default_output_root(SessionFormat::Codex)
+        .ok()?
+        .join("logs_2.sqlite");
+    codex_thread_from_logs_in(&db, host_cwd, since, |id| {
+        formats::resolve_codex_session_id(id).ok()
+    })
+}
+
+/// Testable core of [`codex_thread_from_logs`]: explicit db path + resolver.
+fn codex_thread_from_logs_in(
+    db: &Path,
+    host_cwd: Option<&Path>,
+    since: Option<SystemTime>,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Option<(PathBuf, String)> {
+    use rusqlite::{Connection, OpenFlags};
+    if !db.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // logs.ts is unix SECONDS; same 2s slack as every other fence.
+    let fence_s = since
+        .map(|s| s.checked_sub(Duration::from_secs(2)).unwrap_or(s))
+        .and_then(|s| s.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = conn
+        .prepare(
+            "SELECT thread_id, MAX(id) AS newest FROM logs
+             WHERE thread_id IS NOT NULL AND thread_id != '' AND ts >= ?1
+             GROUP BY thread_id ORDER BY newest DESC LIMIT 8",
+        )
+        .ok()?;
+    let ids = stmt
+        .query_map(rusqlite::params![fence_s], |r| r.get::<_, String>(0))
+        .ok()?;
+    for id in ids.flatten() {
+        let Some(path) = resolve(&id) else {
+            continue;
+        };
+        if !path.exists() || !has_conversation(&path, SessionFormat::Codex) {
+            continue;
+        }
+        if let Some(here) = host_cwd {
+            match codex_session_cwd(&path) {
+                Some(recorded) if same_dir(&recorded, here) => {}
+                _ => continue,
+            }
+        }
+        return Some((path, id));
+    }
+    None
 }
 
 /// Newest codex thread for a directory straight from codex's own registry
@@ -2240,6 +2313,64 @@ Exporting session: ses_x1"#;
         let json = serde_json::to_string(&distilled.session).unwrap();
         assert!(!json.contains("AGENTS.md instructions"), "scaffold carried");
         assert!(!json.contains("Collaboration Mode"), "developer message carried");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The logs oracle: a SILENT /resume-away (no new turn — nothing written
+    /// to any session store) must still be seen, because codex logs the
+    /// thread/resume event. Foreign-cwd and conversationless candidates are
+    /// skipped even when their log rows are newer.
+    #[test]
+    fn codex_logs_oracle_sees_a_silent_resume_away() {
+        let dir = std::env::temp_dir().join(format!("constant-logs-oracle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let meta = |cwd: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"x\",\"cwd\":\"{cwd}\"}}}}\n"
+            )
+        };
+        let convo = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#;
+        // The resumed conversation: an OLD rollout (untouched since long ago).
+        let resumed = dir.join("resumed.jsonl");
+        fs::write(&resumed, format!("{}{convo}\n", meta(&dir.display().to_string()))).unwrap();
+        // A concurrent codex in another directory, logging newer events.
+        let foreign = dir.join("foreign.jsonl");
+        fs::write(&foreign, format!("{}{convo}\n", meta("/somewhere/else"))).unwrap();
+        // The hosted child's own fresh thread: no conversation anywhere yet.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let db = dir.join("logs_2.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL, thread_id TEXT
+            )",
+        )
+        .unwrap();
+        let log = |ts: i64, id: &str| {
+            conn.execute(
+                "INSERT INTO logs (ts, thread_id) VALUES (?1, ?2)",
+                rusqlite::params![ts, id],
+            )
+            .unwrap();
+        };
+        log(now - 3600, "ancient"); // before the fence
+        log(now - 1, "fresh-stub"); // the child's own thread/start (no file)
+        log(now, "resumed-id");     // the /resume event — should win
+        log(now, "foreign-id");     // newer row, wrong cwd — skipped
+
+        let fence = SystemTime::now() - Duration::from_secs(60);
+        let got = codex_thread_from_logs_in(&db, Some(&dir), Some(fence), |id| match id {
+            "resumed-id" => Some(resumed.clone()),
+            "foreign-id" => Some(foreign.clone()),
+            _ => None,
+        });
+        let (path, id) = got.expect("silent resume-away not seen");
+        assert_eq!(id, "resumed-id");
+        assert_eq!(path, resumed);
         let _ = fs::remove_dir_all(&dir);
     }
 
