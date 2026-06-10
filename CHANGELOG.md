@@ -6,6 +6,16 @@ All notable changes to Constant are recorded here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **The control room.** `Ctrl-B t` toggles Constant's own full-screen view of
+  the conversation: a colored, GitLab-style chapter graph — one dot per
+  chapter, rails between them, fork/restore glyphs, relative times, record
+  markers, and a "you are here" head. No compositing: the child's output is
+  paused while the view is open and the child repaints on exit via a resize
+  wiggle. **Switch theater:** after every carry, the receipt is held in the
+  status bar for a few seconds (`✓ ch04 → claude · auth bug · carried 14
+  turns …`) instead of flashing past. **`:` line quality:** Tab completion
+  for verbs and runtimes, `rename ` + Tab prefills the current name for
+  editing, and ↑/↓ recall command history.
 - **The naming redesign: handles, titles, chapters.** Every conversation now
   has a stable **handle** — one color word + 2-digit tail (`cobalt-37`),
   suggested by `sha256(conversation id)` but DECIDED by the ledger registry

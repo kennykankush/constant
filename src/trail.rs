@@ -950,6 +950,40 @@ pub fn print_events(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One hop of a conversation, shaped for the control-room graph.
+#[derive(Clone, Debug)]
+pub struct ChapterRow {
+    pub n: u32,
+    pub from: String,
+    pub to: String,
+    pub ts: u64,
+    pub mode: String,
+    /// The hop's record volume still exists on disk.
+    pub recorded: bool,
+}
+
+/// The chapters of a conversation, oldest first (rename events excluded).
+pub fn chapters(conv_id: &str) -> Vec<ChapterRow> {
+    let mut rows: Vec<ChapterRow> = load_entries(None)
+        .into_iter()
+        .filter(|e| e.conversation == conv_id && e.mode.as_deref() != Some("rename"))
+        .map(|e| ChapterRow {
+            n: e.n,
+            from: e.from.clone(),
+            to: e.to.clone(),
+            ts: e.ts,
+            mode: e.mode.clone().unwrap_or_else(|| "carry".to_string()),
+            recorded: e
+                .snapshot
+                .as_deref()
+                .map(|p| Path::new(p).exists())
+                .unwrap_or(false),
+        })
+        .collect();
+    rows.sort_by_key(|r| (r.ts, r.n));
+    rows
+}
+
 /// The conversation slug a session id belongs to, if the ledger knows it
 /// (as a projection or as a recorded source) — used by `constant ps` to name
 /// live processes.

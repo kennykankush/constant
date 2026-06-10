@@ -31,6 +31,10 @@ use crate::runtime::Runtime;
 const M_NORMAL: u8 = 0;
 const M_PREFIX: u8 = 1;
 const M_COMMAND: u8 = 2;
+/// The control room: Constant's own full-screen view (the trail graph),
+/// toggled from prefix mode. Child output is dropped while open — the child
+/// repaints on exit via a resize wiggle.
+const M_VIEW: u8 = 3;
 
 // Largest escape sequence we'll buffer before giving up and flushing it as-is,
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
@@ -459,7 +463,7 @@ fn clear_bottom(out: &mut impl Write) {
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  :=command  d=quit\x1b[0m\r\n",
+        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  t=trail  :=command  d=quit\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();
@@ -534,6 +538,162 @@ pub fn debug_keys() -> Result<()> {
     let _ = write!(out, "\r\nprobe done.\r\n");
     let _ = out.flush();
     Ok(())
+}
+
+// ---- control room --------------------------------------------------------
+
+/// "2h ago" / "yesterday" / "jun 09" — the graph's time column.
+fn relative_time(ts: u64, now: u64) -> String {
+    if ts == 0 || ts > now {
+        return String::new();
+    }
+    let d = now - ts;
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", d / 60),
+        3600..=86_399 => format!("{}h ago", d / 3600),
+        86_400..=172_799 => "yesterday".to_string(),
+        _ => format!("{}d ago", d / 86_400),
+    }
+}
+
+/// A 256-color accent per runtime (the graph's rail colors).
+fn runtime_color(runtime: &str) -> &'static str {
+    match runtime {
+        "claude" => "\x1b[38;5;208m",  // orange
+        "codex" => "\x1b[38;5;39m",    // blue
+        "opencode" => "\x1b[38;5;77m", // green
+        "gemini" => "\x1b[38;5;177m",  // violet
+        _ => "\x1b[0m",
+    }
+}
+
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+/// Render the trail graph — newest chapter on top, GitLab-style rails, one
+/// dot per chapter colored by the narrator that produced it. Pure: testable.
+fn render_graph(
+    naming: Option<&crate::trail::Naming>,
+    chapters: &[crate::trail::ChapterRow],
+    hosting: &str,
+    rows: u16,
+    now: u64,
+) -> String {
+    let mut out = String::new();
+    out.push_str("\x1b[2J\x1b[H");
+
+    match naming {
+        Some(nm) => {
+            out.push_str(&format!(
+                "\r\n  {DIM}constant \u{b7}{RESET} \x1b[1m{}\x1b[0m {DIM}\u{b7}{RESET} {}\r\n\r\n",
+                crate::term_safe(&nm.name),
+                crate::term_safe(&nm.handle),
+            ));
+        }
+        None => {
+            out.push_str(&format!(
+                "\r\n  {DIM}constant \u{b7} no thread yet — chapters appear after your first switch{RESET}\r\n\r\n"
+            ));
+        }
+    }
+
+    // Head: where you are right now (the chapter being written).
+    let head_color = runtime_color(hosting);
+    out.push_str(&format!(
+        "  {head_color}\u{25c9}{RESET}  \x1b[1mch{:02}\x1b[0m  {head_color}{}{RESET}  {DIM}\u{2190} you are here{RESET}\r\n",
+        chapters.len() + 1,
+        hosting,
+    ));
+
+    // Budget: header(4) + head(1) + footer(2).
+    let budget = rows.saturating_sub(8) as usize;
+    let shown = chapters.len().min(budget.max(1));
+    let hidden = chapters.len() - shown;
+
+    for ch in chapters.iter().rev().take(shown) {
+        let color = runtime_color(&ch.from);
+        let rail = format!("  {DIM}\u{2502}{RESET}\r\n");
+        out.push_str(&rail);
+        let glyph = match ch.mode.as_str() {
+            "new-fork" => format!("{DIM}\u{251c}\u{2500}{RESET}\u{25cf}"),
+            "restore" => format!("{DIM}\u{2570}\u{2500}{RESET}\u{25cb}"),
+            _ => format!("{color}\u{25cf}{RESET}"),
+        };
+        let record = if ch.recorded {
+            format!("  {DIM}rec \u{2713}{RESET}")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  {glyph}  ch{:02}  {color}{:<8}{RESET} {DIM}\u{2192}{RESET} {:<8}  {DIM}{}{RESET}{record}\r\n",
+            ch.n,
+            crate::term_safe(&ch.from),
+            crate::term_safe(&ch.to),
+            relative_time(ch.ts, now),
+        ));
+    }
+    if hidden > 0 {
+        out.push_str(&format!("  {DIM}\u{2502}  \u{2026} {hidden} earlier chapters{RESET}\r\n"));
+    }
+
+    out.push_str(&format!(
+        "\r\n  {DIM}t/q close \u{b7} chapters are record volumes: constant snapshots \u{b7} checkout coming{RESET}\r\n"
+    ));
+    out
+}
+
+/// Force the child to repaint after the control room owned the screen: a
+/// resize wiggle (one row down, back up) delivers SIGWINCH twice — every
+/// hosted TUI redraws on it. We never composite, so this is how the child's
+/// frame comes back.
+fn force_repaint(session: &Session, cols: u16, rows: u16) {
+    let _ = session.master.resize(PtySize {
+        rows: rows.saturating_sub(1).max(1),
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    let _ = session.master.resize(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+}
+
+/// Tab-completion for the `:` command line. Returns the completed buffer.
+fn complete_command(buf: &str, current_name: Option<&str>) -> Option<String> {
+    const VERBS: [&str; 5] = ["switch", "new", "rename", "quit", "fork"];
+    const RUNTIMES: [&str; 4] = ["claude", "codex", "opencode", "gemini"];
+    let ends_space = buf.ends_with(' ');
+    let words: Vec<&str> = buf.split_whitespace().collect();
+    match (words.len(), ends_space) {
+        // completing the verb
+        (1, false) => {
+            let matches: Vec<&str> = VERBS
+                .iter()
+                .filter(|v| v.starts_with(words[0]) && **v != words[0])
+                .copied()
+                .collect();
+            (matches.len() == 1).then(|| format!("{} ", matches[0]))
+        }
+        // `rename ` → prefill the current name for editing
+        (1, true) if words[0] == "rename" => {
+            current_name.map(|n| format!("rename {n}"))
+        }
+        // completing the runtime after switch/new/fork
+        (1, true) => None,
+        (2, false) if matches!(words[0], "switch" | "new" | "fork" | "s" | "n") => {
+            let matches: Vec<&str> = RUNTIMES
+                .iter()
+                .filter(|r| r.starts_with(words[1]) && **r != words[1])
+                .copied()
+                .collect();
+            (matches.len() == 1).then(|| format!("{} {}", words[0], matches[0]))
+        }
+        _ => None,
+    }
 }
 
 // ---- status bar ---------------------------------------------------------
@@ -674,7 +834,7 @@ pub fn run(
     }
 
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   x=codex   o=opencode   (shift=new)   :=command   d=quit "
+        " {prefix_label} ▸  c=claude   x=codex   o=opencode   (shift=new)   t=trail   :=command   d=quit "
     );
 
     let mut out = std::io::stdout();
@@ -725,6 +885,12 @@ pub fn run(
     let mut watchdog = std::time::Instant::now();
     let mut respawned_once = false;
     let mut bar_dirty = bar;
+    // Switch theater: the carry summary held in the bar for a few seconds
+    // after each switch, so the receipt is felt, not just flashed.
+    let mut bar_notice: Option<(String, std::time::Instant)> = None;
+    // `:` line history (up/down recall).
+    let mut cmd_history: Vec<String> = Vec::new();
+    let mut hist_ix: Option<usize> = None;
     let mut session = match resume {
         Some(id) => {
             child_session = Some(id.to_string());
@@ -756,19 +922,37 @@ pub fn run(
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(120)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Theater notice expiry: hand the bar back to the standard text.
+                if let Some((_, since)) = &bar_notice
+                    && since.elapsed() > std::time::Duration::from_secs(6)
+                {
+                    bar_notice = None;
+                    bar_dirty = bar;
+                }
                 // The child has been quiet for a beat: safe to repaint the bar
                 // (never inject while it might be mid-paint).
                 if bar_dirty && mode == M_NORMAL {
-                    refresh_bar(
-                        &mut out,
-                        bar,
-                        session.runtime,
-                        with_tools,
-                        trail_n,
-                        naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
-                        &prefix_label,
-                        (cols, rows),
-                    );
+                    if let Some((notice, _)) = &bar_notice {
+                        let (c, r) = size().unwrap_or((cols, rows));
+                        if bar && bar_fits(r) {
+                            let width = c as usize;
+                            let mut text: String = notice.chars().take(width).collect();
+                            let pad = width.saturating_sub(text.chars().count());
+                            text.extend(std::iter::repeat_n(' ', pad));
+                            draw_bar(&mut out, r, &text);
+                        }
+                    } else {
+                        refresh_bar(
+                            &mut out,
+                            bar,
+                            session.runtime,
+                            with_tools,
+                            trail_n,
+                            naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
+                            &prefix_label,
+                            (cols, rows),
+                        );
+                    }
                     bar_dirty = false;
                 }
                 continue;
@@ -778,6 +962,11 @@ pub fn run(
         match ev {
             Ev::Pty(bytes) => {
                 bar_dirty = bar;
+                if mode == M_VIEW {
+                    // The control room owns the screen; the child repaints on
+                    // exit (resize wiggle), so buffering would only duplicate.
+                    continue;
+                }
                 if mode == M_COMMAND {
                     // Bounded: a chatty child while the user sits in the command
                     // line must not grow memory forever. Past the cap, flush
@@ -978,6 +1167,15 @@ pub fn run(
                                         // say so, or the next re-host silently forks.
                                         dim(&mut out, &format!("trail ledger write failed: {e}"));
                                     }
+                                    bar_notice = Some((
+                                        format!(
+                                            " \u{2713} ch{n:02} \u{2192} {} \u{b7} {} \u{b7} {} ",
+                                            target.label(),
+                                            nm.name,
+                                            distilled.receipt.summary(),
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
                                     child_spawned_at = std::time::SystemTime::now();
                                     spawn_settled(
                                         target,
@@ -1194,6 +1392,27 @@ pub fn run(
                                         &mut out,
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
+                                    Some(b't') => {
+                                        mode = M_VIEW;
+                                        let (_, r) = size().unwrap_or((cols, rows));
+                                        let chapters = root_id
+                                            .as_deref()
+                                            .map(crate::trail::chapters)
+                                            .unwrap_or_default();
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        let view = render_graph(
+                                            naming.as_ref(),
+                                            &chapters,
+                                            session.runtime.label(),
+                                            r,
+                                            now,
+                                        );
+                                        let _ = out.write_all(view.as_bytes());
+                                        let _ = out.flush();
+                                    }
                                     Some(b'd') => quitting = true,
                                     Some(b':') => {
                                         mode = M_COMMAND;
@@ -1214,11 +1433,27 @@ pub fn run(
                                     0x1b => cancel = true,
                                     0x7f | 0x08 => {
                                         cmd_buf.pop();
+                                        hist_ix = None;
                                         bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                                    }
+                                    // Tab: complete verbs/runtimes; `rename `
+                                    // prefills the current name for editing.
+                                    0x09 => {
+                                        if let Some(completed) = complete_command(
+                                            &cmd_buf,
+                                            naming.as_ref().map(|nm| nm.name.as_str()),
+                                        ) {
+                                            cmd_buf = completed;
+                                            bottom_overlay(
+                                                &mut out,
+                                                &format!(" constant ▸ {cmd_buf}"),
+                                            );
+                                        }
                                     }
                                     _ => {
                                         if b == b' ' || b.is_ascii_graphic() {
                                             cmd_buf.push(b as char);
+                                            hist_ix = None;
                                             bottom_overlay(
                                                 &mut out,
                                                 &format!(" constant ▸ {cmd_buf}"),
@@ -1227,7 +1462,39 @@ pub fn run(
                                     }
                                 },
                                 Token::Seq(s) => {
-                                    if let Some((cp, _, event)) = parse_kitty_u(&s)
+                                    // Arrow recall: ↑/↓ walk the command history
+                                    // (legacy ESC[A/B, SS3 ESCOA/OB, and kitty all
+                                    // end in A/B).
+                                    let last = s.last().copied();
+                                    if last == Some(b'A') && !cmd_history.is_empty() {
+                                        let ix = match hist_ix {
+                                            None => cmd_history.len() - 1,
+                                            Some(0) => 0,
+                                            Some(i) => i - 1,
+                                        };
+                                        hist_ix = Some(ix);
+                                        cmd_buf = cmd_history[ix].clone();
+                                        bottom_overlay(
+                                            &mut out,
+                                            &format!(" constant ▸ {cmd_buf}"),
+                                        );
+                                    } else if last == Some(b'B') {
+                                        match hist_ix {
+                                            Some(i) if i + 1 < cmd_history.len() => {
+                                                hist_ix = Some(i + 1);
+                                                cmd_buf = cmd_history[i + 1].clone();
+                                            }
+                                            Some(_) => {
+                                                hist_ix = None;
+                                                cmd_buf.clear();
+                                            }
+                                            None => {}
+                                        }
+                                        bottom_overlay(
+                                            &mut out,
+                                            &format!(" constant ▸ {cmd_buf}"),
+                                        );
+                                    } else if let Some((cp, _, event)) = parse_kitty_u(&s)
                                         && event != 3
                                     {
                                         if cp == 13 {
@@ -1249,6 +1516,13 @@ pub fn run(
                                     pending_out.clear();
                                 }
                                 if submit {
+                                    let line = cmd_buf.trim().to_string();
+                                    if !line.is_empty()
+                                        && cmd_history.last() != Some(&line)
+                                    {
+                                        cmd_history.push(line);
+                                    }
+                                    hist_ix = None;
                                     match execute_command(
                                         cmd_buf.trim(),
                                         &mut session,
@@ -1299,6 +1573,27 @@ pub fn run(
                             }
                         }
 
+                        M_VIEW => {
+                            let close = match &tok {
+                                Token::Byte(b) => {
+                                    matches!(*b, b't' | b'q' | 0x0d | 0x0a | b' ' | 0x03)
+                                }
+                                Token::Seq(seq) => parse_kitty_u(seq)
+                                    .map(|(cp, _, ev)| {
+                                        ev != 3 && matches!(cp, 113 | 116 | 13 | 27)
+                                    })
+                                    .unwrap_or(true), // any other escape (incl. Esc) closes
+                                Token::Prefix => false,
+                            };
+                            if close {
+                                mode = M_NORMAL;
+                                let _ = out.write_all(b"\x1b[2J\x1b[H");
+                                let _ = out.flush();
+                                let (c, r) = size().unwrap_or((cols, rows));
+                                force_repaint(&session, c, child_rows(r, bar));
+                                bar_dirty = bar;
+                            }
+                        }
                         _ => unreachable!(),
                     }
                     if quitting {
@@ -1380,6 +1675,72 @@ mod tests {
         // A normal byte passes through.
         let toks = classify_all(b"a", 0x02);
         assert!(matches!(toks.as_slice(), [Token::Byte(b'a')]));
+    }
+
+    #[test]
+    fn relative_time_buckets() {
+        let now = 1_000_000u64;
+        assert_eq!(relative_time(now - 30, now), "just now");
+        assert_eq!(relative_time(now - 120, now), "2m ago");
+        assert_eq!(relative_time(now - 7200, now), "2h ago");
+        assert_eq!(relative_time(now - 100_000, now), "yesterday");
+        assert_eq!(relative_time(now - 300_000, now), "3d ago");
+        assert_eq!(relative_time(0, now), "");
+    }
+
+    #[test]
+    fn graph_renders_chapters_with_head_and_truncation() {
+        let nm = crate::trail::Naming {
+            handle: "cobalt-37".to_string(),
+            name: "auth redirect bug".to_string(),
+            named: true,
+        };
+        let chapters: Vec<crate::trail::ChapterRow> = (1..=4)
+            .map(|n| crate::trail::ChapterRow {
+                n,
+                from: if n % 2 == 1 { "codex" } else { "claude" }.to_string(),
+                to: if n % 2 == 1 { "claude" } else { "codex" }.to_string(),
+                ts: 1_000_000 + n as u64,
+                mode: if n == 3 { "new-fork" } else { "refresh-existing" }.to_string(),
+                recorded: n > 1,
+            })
+            .collect();
+        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000);
+        assert!(view.contains("cobalt-37"), "{view}");
+        assert!(view.contains("auth redirect bug"));
+        assert!(view.contains("ch05"), "head chapter missing: {view}");
+        assert!(view.contains("you are here"));
+        assert!(view.contains("ch01") && view.contains("ch04"));
+        assert!(view.contains("rec \u{2713}"), "record marker missing");
+
+        // Tiny terminal: old chapters truncate with an honest count.
+        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000);
+        assert!(small.contains("earlier chapters"), "{small}");
+
+        // No thread yet: says so instead of pretending.
+        let empty = render_graph(None, &[], "codex", 40, 2_000_000);
+        assert!(empty.contains("no thread yet"));
+    }
+
+    #[test]
+    fn command_completion_verbs_runtimes_and_rename_prefill() {
+        assert_eq!(complete_command("sw", None), Some("switch ".to_string()));
+        assert_eq!(complete_command("s", None), Some("switch ".to_string()));
+        assert_eq!(
+            complete_command("switch cl", None),
+            Some("switch claude".to_string())
+        );
+        assert_eq!(
+            complete_command("new o", None),
+            Some("new opencode".to_string())
+        );
+        // `rename ` prefills the current name for editing.
+        assert_eq!(
+            complete_command("rename ", Some("auth redirect bug")),
+            Some("rename auth redirect bug".to_string())
+        );
+        // Unknown: no completion.
+        assert_eq!(complete_command("zz", None), None);
     }
 
     #[test]

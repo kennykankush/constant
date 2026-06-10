@@ -167,7 +167,8 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 | `Ctrl-B` `X` | Create a new Codex continuation |
 | `Ctrl-B` `o` | Continue in OpenCode |
 | `Ctrl-B` `O` | Create a new OpenCode continuation |
-| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `new opencode`, `rename auth bug`, `quit`) |
+| `Ctrl-B` `t` | Toggle the trail graph — the conversation's chapters as a colored branch view |
+| `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `rename auth bug`, `quit`; Tab completes, ↑/↓ recall history) |
 | `Ctrl-B` `d` | Quit Constant (the hosted CLI exits with it) |
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
 
