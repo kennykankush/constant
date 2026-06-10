@@ -737,10 +737,14 @@ fn derive_title(session: &UniversalSession) -> Option<String> {
         if message.role != "user" {
             return None;
         }
+        // Skip injected scaffold (codex 0.139 prepends AGENTS.md as a plain
+        // user message: "# AGENTS.md instructions for <dir> <INSTRUCTIONS> …")
+        // so the title comes from the first REAL user message.
         message
             .blocks
             .iter()
             .filter_map(|block| block.text.as_deref())
+            .filter(|text| !crate::alembic::is_scaffold(text))
             .map(collapse_whitespace)
             .find(|text| !text.is_empty())
     })

@@ -75,10 +75,73 @@ pub fn active_session(
         let path = formats::export_opencode_to_cache(&id).ok()?;
         return Some((path, id));
     }
+    if from == Runtime::Codex {
+        // Codex's own registry (state_5.sqlite) sees what file mtimes can't:
+        // since 0.139, `/resume` inside codex reads the db WITHOUT touching the
+        // resumed rollout file, so a resume-away is invisible to the file scan.
+        // The registry's updated_at moves the moment the user talks there.
+        if let Some(path) = codex_newest_thread(host_cwd, since)
+            && let Some(id) = session_id_of(&path, SessionFormat::Codex)
+        {
+            return Some((path, id));
+        }
+        // Registry missing or silent: fall through to the file scan.
+    }
     let from_fmt = session_format(from);
     let path = find_child_session(from_fmt, host_cwd, since)?;
     let id = session_id_of(&path, from_fmt)?;
     Some((path, id))
+}
+
+/// Newest codex thread for a directory straight from codex's own registry
+/// (read-only), respecting the spawn-time fence and requiring at least one
+/// real user turn. Returns the thread's rollout file.
+fn codex_newest_thread(host_cwd: Option<&Path>, since: Option<SystemTime>) -> Option<PathBuf> {
+    let db = formats::default_output_root(SessionFormat::Codex)
+        .ok()?
+        .join("state_5.sqlite");
+    codex_newest_thread_in(&db, host_cwd, since)
+}
+
+/// Testable core of [`codex_newest_thread`]: query an explicit db path.
+fn codex_newest_thread_in(
+    db: &Path,
+    host_cwd: Option<&Path>,
+    since: Option<SystemTime>,
+) -> Option<PathBuf> {
+    use rusqlite::{Connection, OpenFlags};
+    if !db.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // threads.updated_at is unix SECONDS (not ms); same 2s slack as the file fence.
+    let fence_s = since
+        .map(|s| s.checked_sub(Duration::from_secs(2)).unwrap_or(s))
+        .and_then(|s| s.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cwd = host_cwd.map(|p| p.display().to_string());
+    let cwd_canon = host_cwd
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string());
+    let path: String = conn
+        .query_row(
+            "SELECT rollout_path FROM threads
+             WHERE (?1 IS NULL OR cwd = ?1 OR cwd = ?2)
+               AND updated_at >= ?3
+               AND has_user_event = 1
+               AND archived = 0
+             ORDER BY updated_at DESC LIMIT 1",
+            rusqlite::params![cwd, cwd_canon, fence_s],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let path = PathBuf::from(path);
+    path.exists().then_some(path)
 }
 
 /// Newest opencode session for a directory (read-only sqlite), respecting the
@@ -401,6 +464,7 @@ pub fn harvested_title(session: &UniversalSession) -> Option<String> {
         || t.starts_with("constant\u{b7}")
         || t.contains(" \u{b7} ch")
         || t.contains("\u{2190}")
+        || is_scaffold(t)
     {
         return None;
     }
@@ -810,7 +874,7 @@ fn truncate_tool_output(output: &mut serde_json::Value) {
     ));
 }
 
-fn is_scaffold(text: &str) -> bool {
+pub(crate) fn is_scaffold(text: &str) -> bool {
     let t = text.trim_start();
     const MARKERS: &[&str] = &[
         "<environment_context>",
@@ -1384,6 +1448,28 @@ pub const SUPPORTED_CODEX: &str = "0.137";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.40";
 pub const SUPPORTED_OPENCODE: &str = "1.14";
+
+/// Is this installed version one the codec was validated against?
+/// (Prefix match on the validated release line: "0.137" accepts "0.137.4".)
+pub fn version_validated(version: &str, supported: &str) -> bool {
+    version == supported
+        || version
+            .strip_prefix(supported)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Installed-version preflight for one runtime: (version, validated).
+/// Runs the CLI's `--version` (subprocess) — call off the hot path.
+pub fn version_status(rt: Runtime) -> Option<(String, bool)> {
+    let (version, supported) = match rt {
+        Runtime::Codex => (detect_codex_version()?, SUPPORTED_CODEX),
+        Runtime::Claude => (detect_claude_version()?, SUPPORTED_CLAUDE),
+        Runtime::Gemini => (detect_gemini_version()?, SUPPORTED_GEMINI),
+        Runtime::OpenCode => (detect_opencode_version()?, SUPPORTED_OPENCODE),
+    };
+    let ok = version_validated(&version, supported);
+    Some((version, ok))
+}
 
 /// Environment preflight (for `constant doctor`).
 pub struct DoctorReport {
@@ -2091,5 +2177,118 @@ Exporting session: ses_x1"#;
         assert!(!json.contains("sk-METALEAK"), "message metadata leaked");
         assert!(!json.contains("sk-EXTRALEAK"), "metadata.extra leaked");
         assert!(json.contains("[redacted-key]"), "text not redacted");
+    }
+
+    #[test]
+    fn version_validated_is_a_release_line_prefix() {
+        assert!(version_validated("0.137.0", "0.137"));
+        assert!(version_validated("0.137", "0.137"));
+        assert!(version_validated("2.1.170", "2.1"));
+        // 0.139 is NOT on the 0.137 line — this is the drift that bit on
+        // 2026-06-11 (codex 0.139 resume/format changes).
+        assert!(!version_validated("0.139.0", "0.137"));
+        // Naive starts_with would wrongly accept these:
+        assert!(!version_validated("0.1370.0", "0.137"));
+        assert!(!version_validated("2.10.0", "2.1"));
+    }
+
+    #[test]
+    fn harvested_title_rejects_scaffold() {
+        let mut session = UniversalSession::new("h-0001".to_string());
+        session.metadata.title = Some(
+            "# AGENTS.md instructions for /tmp/x <INSTRUCTIONS> # Constant".to_string(),
+        );
+        assert_eq!(harvested_title(&session), None, "scaffold harvested as a name");
+        session.metadata.title = Some("ship the cli release".to_string());
+        assert_eq!(harvested_title(&session).as_deref(), Some("ship the cli release"));
+    }
+
+    /// Codex 0.139 prepends AGENTS.md as a plain user message; the title (and
+    /// so the conversation's birth name) must come from the first REAL message,
+    /// and neither the scaffold nor developer-role messages may be carried.
+    #[test]
+    fn codex_0139_scaffold_never_becomes_the_title() {
+        let dir = std::env::temp_dir().join(format!("constant-0139-title-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-06-11T03-29-19-019eb302-b44a-7f52-b183-8fe0add5af27.jsonl");
+        let line = |role: &str, text: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-06-11T03:29:19.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"{role}\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        let mut body = String::from(
+            "{\"timestamp\":\"2026-06-11T03:29:19.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019eb302-b44a-7f52-b183-8fe0add5af27\",\"timestamp\":\"2026-06-11T03:29:19.000Z\",\"cwd\":\"/tmp/x\",\"originator\":\"codex-tui\",\"cli_version\":\"0.139.0\",\"source\":\"cli\"}}\n",
+        );
+        body.push_str(&line("user", "# AGENTS.md instructions for /tmp/x <INSTRUCTIONS> # Constant repo rules"));
+        body.push_str(&line("developer", "# Collaboration Mode: Default"));
+        body.push_str(&line("user", "ship the cli release"));
+        fs::write(&path, body).unwrap();
+
+        let distilled = distill_source(&path, false).unwrap();
+        assert_eq!(
+            distilled.root_name().as_deref(),
+            Some("ship the cli release"),
+            "title harvested from scaffold: {:?}",
+            distilled.session.metadata.title
+        );
+        let json = serde_json::to_string(&distilled.session).unwrap();
+        assert!(!json.contains("AGENTS.md instructions"), "scaffold carried");
+        assert!(!json.contains("Collaboration Mode"), "developer message carried");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The codex registry oracle: newest cwd-matching thread inside the spawn
+    /// fence wins; threads without a user turn, archived threads, and threads
+    /// last touched before the fence are invisible.
+    #[test]
+    fn codex_registry_oracle_respects_fence_cwd_and_user_turns() {
+        let dir = std::env::temp_dir().join(format!("constant-oracle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state_5.sqlite");
+        let old_rollout = dir.join("old.jsonl");
+        let live_rollout = dir.join("live.jsonl");
+        let stub_rollout = dir.join("stub.jsonl");
+        for f in [&old_rollout, &live_rollout, &stub_rollout] {
+            fs::write(f, "{}\n").unwrap();
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL, has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+        let insert = |id: &str, path: &Path, cwd: &str, updated: i64, user: i64, archived: i64| {
+            conn.execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, path.display().to_string(), cwd, updated, user, archived],
+            )
+            .unwrap();
+        };
+        let cwd = dir.display().to_string();
+        // Old conversation in this cwd: BEFORE the fence — invisible.
+        insert("old", &old_rollout, &cwd, now - 3600, 1, 0);
+        // Resumed-away conversation the user talked in just now: wins.
+        insert("live", &live_rollout, &cwd, now, 1, 0);
+        // Newer but turnless stub, and a newer archived thread: invisible.
+        insert("stub", &stub_rollout, &cwd, now + 1, 0, 0);
+        insert("arch", &stub_rollout, &cwd, now + 1, 1, 1);
+        // Newest of all, wrong cwd: invisible.
+        insert("elsewhere", &live_rollout, "/somewhere/else", now + 2, 1, 0);
+
+        let fence = SystemTime::now() - Duration::from_secs(60);
+        let got = codex_newest_thread_in(&db_path, Some(&dir), Some(fence));
+        assert_eq!(got.as_deref(), Some(live_rollout.as_path()));
+
+        // Nothing inside the fence: the oracle stays silent (file scan takes over).
+        let tight = SystemTime::now() + Duration::from_secs(120);
+        assert_eq!(codex_newest_thread_in(&db_path, Some(&dir), Some(tight)), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

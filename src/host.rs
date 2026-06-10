@@ -209,6 +209,8 @@ enum Ev {
     Pty(Vec<u8>),
     PtyClosed,
     Resize,
+    /// Background installed-version preflight: (runtime, version, validated).
+    Versions(Vec<(Runtime, String, bool)>),
 }
 
 struct Session {
@@ -647,6 +649,58 @@ fn render_graph(
 /// resize wiggle (one row down, back up) delivers SIGWINCH twice — every
 /// hosted TUI redraws on it. We never composite, so this is how the child's
 /// frame comes back.
+/// The validated release line for a runtime (mirrors `constant doctor`).
+fn supported_line(rt: Runtime) -> &'static str {
+    match rt {
+        Runtime::Codex => crate::alembic::SUPPORTED_CODEX,
+        Runtime::Claude => crate::alembic::SUPPORTED_CLAUDE,
+        Runtime::Gemini => crate::alembic::SUPPORTED_GEMINI,
+        Runtime::OpenCode => crate::alembic::SUPPORTED_OPENCODE,
+    }
+}
+
+/// Cap on output held while the control room is open (a chatty child must not
+/// grow memory without bound; past the cap the freshest output wins nothing —
+/// the view is a pause, not a recorder).
+const VIEW_BUF_CAP: usize = 1 << 20;
+
+/// Track the child's alternate-screen state from its output stream. Escape
+/// sequences can split across reads, so a small tail carries between calls.
+fn track_alt(active: &mut bool, tail: &mut Vec<u8>, chunk: &[u8]) {
+    const ON: &[u8] = b"\x1b[?1049h";
+    const OFF: &[u8] = b"\x1b[?1049l";
+    let mut buf = Vec::with_capacity(tail.len() + chunk.len());
+    buf.extend_from_slice(tail);
+    buf.extend_from_slice(chunk);
+    let mut i = 0;
+    while i + ON.len() <= buf.len() {
+        if &buf[i..i + ON.len()] == ON {
+            *active = true;
+        } else if &buf[i..i + OFF.len()] == OFF {
+            *active = false;
+        }
+        i += 1;
+    }
+    let keep = buf.len().min(ON.len() - 1);
+    *tail = buf[buf.len() - keep..].to_vec();
+}
+
+/// Leave the alt-screen control room: the terminal restores the child's
+/// primary screen, then anything the child said while the view was open is
+/// replayed so no output is lost. No-op when the view wasn't on the alt screen.
+fn leave_view(out: &mut impl Write, view_alt: &mut bool, view_buf: &mut Vec<u8>) {
+    if !*view_alt {
+        return;
+    }
+    let _ = out.write_all(b"\x1b[?1049l");
+    if !view_buf.is_empty() {
+        let _ = out.write_all(view_buf);
+        view_buf.clear();
+    }
+    let _ = out.flush();
+    *view_alt = false;
+}
+
 fn force_repaint(session: &Session, cols: u16, rows: u16) {
     let _ = session.master.resize(PtySize {
         rows: rows.saturating_sub(1).max(1),
@@ -723,6 +777,7 @@ fn child_rows(rows: u16, bar: bool) -> u16 {
 fn bar_text(
     runtime: Runtime,
     with_tools: bool,
+    warn: bool,
     trail_n: u32,
     slug: Option<&str>,
     prefix_label: &str,
@@ -734,8 +789,9 @@ fn bar_text(
         Some(s) => s.to_string(),
         None => "no thread yet".to_string(),
     };
+    let warn_mark = if warn { "\u{26a0}" } else { "" };
     let full = format!(
-        " constant \u{b7} {}{tools} \u{b7} {thread} \u{b7} {prefix_label} c/x=switch d=quit ",
+        " constant \u{b7} {}{tools}{warn_mark} \u{b7} {thread} \u{b7} {prefix_label} c/x=switch d=quit ",
         runtime.label()
     );
     let width = cols as usize;
@@ -760,6 +816,7 @@ fn refresh_bar(
     enabled: bool,
     runtime: Runtime,
     with_tools: bool,
+    warn: bool,
     trail_n: u32,
     slug: Option<&str>,
     prefix_label: &str,
@@ -775,7 +832,7 @@ fn refresh_bar(
     draw_bar(
         out,
         r,
-        &bar_text(runtime, with_tools, trail_n, slug, prefix_label, c),
+        &bar_text(runtime, with_tools, warn, trail_n, slug, prefix_label, c),
     );
 }
 
@@ -888,6 +945,15 @@ pub fn run(
     // Switch theater: the carry summary held in the bar for a few seconds
     // after each switch, so the receipt is felt, not just flashed.
     let mut bar_notice: Option<(String, std::time::Instant)> = None;
+    // Child alternate-screen tracking + the control room's own alt-screen use:
+    // an inline-painting child can't repaint the primary screen after the view
+    // closes, so the view goes on the ALT screen and the terminal restores it.
+    let mut child_alt_active = false;
+    let mut child_alt_tail: Vec<u8> = Vec::new();
+    let mut view_alt = false;
+    let mut view_buf: Vec<u8> = Vec::new();
+    // Installed-version preflight results (filled by a background sweep).
+    let mut versions: HashMap<Runtime, (String, bool)> = HashMap::new();
     // `:` line history (up/down recall).
     let mut cmd_history: Vec<String> = Vec::new();
     let mut hist_ix: Option<usize> = None;
@@ -919,6 +985,25 @@ pub fn run(
     let mut cmd_buf = String::new();
     let mut switching_to: Option<SwitchRequest> = None;
     let mut pending_out: Vec<u8> = Vec::new();
+    // Installed-version preflight, off the hot path (each `--version` is a
+    // subprocess). An unvalidated runtime gets a warning in the bar the moment
+    // the sweep lands — doctor's quiet knowledge, surfaced where it matters.
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let v: Vec<(Runtime, String, bool)> = [
+                Runtime::Codex,
+                Runtime::Claude,
+                Runtime::OpenCode,
+                Runtime::Gemini,
+            ]
+            .into_iter()
+            .filter_map(|rt| crate::alembic::version_status(rt).map(|(ver, ok)| (rt, ver, ok)))
+            .collect();
+            let _ = tx.send(Ev::Versions(v));
+        });
+    }
+
     let mut quitting = false;
 
     loop {
@@ -950,6 +1035,7 @@ pub fn run(
                             bar,
                             session.runtime,
                             with_tools,
+                    versions.get(&session.runtime).map(|v| !v.1).unwrap_or(false),
                             trail_n,
                             naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                             &prefix_label,
@@ -964,10 +1050,18 @@ pub fn run(
         };
         match ev {
             Ev::Pty(bytes) => {
+                track_alt(&mut child_alt_active, &mut child_alt_tail, &bytes);
                 bar_dirty = bar;
                 if mode == M_VIEW {
-                    // The control room owns the screen; the child repaints on
-                    // exit (resize wiggle), so buffering would only duplicate.
+                    if view_alt {
+                        // Inline child: hold its output and replay it after the
+                        // alt-screen restore, so nothing is lost while viewing.
+                        if view_buf.len() < VIEW_BUF_CAP {
+                            view_buf.extend_from_slice(&bytes);
+                        }
+                    }
+                    // A full-screen (alt-screen) child instead repaints itself
+                    // on exit via the resize wiggle; buffering would duplicate.
                     continue;
                 }
                 if mode == M_COMMAND {
@@ -990,6 +1084,25 @@ pub fn run(
                 }
             }
 
+            Ev::Versions(list) => {
+                for (rt, ver, ok) in list {
+                    versions.insert(rt, (ver, ok));
+                }
+                if let Some((ver, false)) = versions
+                    .get(&session.runtime)
+                    .map(|(v, ok)| (v.clone(), *ok))
+                {
+                    bar_notice = Some((
+                        format!(
+                            " \u{26a0} {} {ver} unvalidated (codec validated against {}.x) \u{b7} carries may misbehave ",
+                            session.runtime.label(),
+                            supported_line(session.runtime),
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                    bar_dirty = bar;
+                }
+            }
             Ev::PtyClosed => {
                 if let Some(request) = switching_to.take() {
                     let target = request.target;
@@ -1170,9 +1283,16 @@ pub fn run(
                                         // say so, or the next re-host silently forks.
                                         dim(&mut out, &format!("trail ledger write failed: {e}"));
                                     }
+                                    // A carry of nothing is technically a success
+                                    // and humanly a failure — make it look like one.
+                                    let sym = if distilled.receipt.turns <= 1 {
+                                        "\u{26a0}"
+                                    } else {
+                                        "\u{2713}"
+                                    };
                                     bar_notice = Some((
                                         format!(
-                                            " \u{2713} ch{n:02} \u{2192} {} \u{b7} {} \u{b7} {} ",
+                                            " {sym} ch{n:02} \u{2192} {} \u{b7} {} \u{b7} {} ",
                                             target.label(),
                                             nm.name,
                                             distilled.receipt.summary(),
@@ -1205,6 +1325,13 @@ pub fn run(
                                     root_id = None;
                                     root_slug = None;
                                     dim(&mut out, &format!("couldn't carry — {e}; starting fresh"));
+                                    bar_notice = Some((
+                                        format!(
+                                            " \u{26a0} couldn't carry \u{b7} {} started fresh ",
+                                            target.label()
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
                                     child_spawned_at = std::time::SystemTime::now();
                                     spawn_settled(
                                         target,
@@ -1225,11 +1352,25 @@ pub fn run(
                             // tolerated torn tail). Don't kill recovered state we
                             // might still need; start the target fresh.
                             dim(&mut out, &format!("couldn't read the conversation — {e}; starting fresh"));
+                            bar_notice = Some((
+                                format!(
+                                    " \u{26a0} couldn't read the conversation \u{b7} {} started fresh ",
+                                    target.label()
+                                ),
+                                std::time::Instant::now(),
+                            ));
                             child_spawned_at = std::time::SystemTime::now();
                             spawn_settled(target, None, from, Some(&src_id), None, c, r, &tx, &mut out)?
                         }
                         _ => {
                             dim(&mut out, "no conversation here to carry; starting fresh");
+                            bar_notice = Some((
+                                format!(
+                                    " \u{26a0} nothing to carry \u{b7} {} started fresh ",
+                                    target.label()
+                                ),
+                                std::time::Instant::now(),
+                            ));
                             child_spawned_at = std::time::SystemTime::now();
                             spawn_settled(target, None, from, None, None, c, r, &tx, &mut out)?
                         }
@@ -1246,12 +1387,13 @@ pub fn run(
                         bar,
                         session.runtime,
                         with_tools,
+                    versions.get(&session.runtime).map(|v| !v.1).unwrap_or(false),
                         trail_n,
                         naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                         &prefix_label,
                         (cols, rows),
                     );
-                    bar_dirty = false;
+                    bar_dirty = bar_notice.is_some() && bar;
                 } else if watchdog.elapsed() < std::time::Duration::from_secs(2)
                     && !respawned_once
                 {
@@ -1283,6 +1425,7 @@ pub fn run(
                                 bar,
                                 session.runtime,
                                 with_tools,
+                    versions.get(&session.runtime).map(|v| !v.1).unwrap_or(false),
                                 trail_n,
                                 naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                                 &prefix_label,
@@ -1310,6 +1453,7 @@ pub fn run(
                     bar,
                     session.runtime,
                     with_tools,
+                    versions.get(&session.runtime).map(|v| !v.1).unwrap_or(false),
                     trail_n,
                     naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                     &prefix_label,
@@ -1397,6 +1541,11 @@ pub fn run(
                                     ),
                                     Some(b't') => {
                                         mode = M_VIEW;
+                                        view_alt = !child_alt_active;
+                                        if view_alt {
+                                            view_buf.clear();
+                                            let _ = out.write_all(b"\x1b[?1049h");
+                                        }
                                         let (_, r) = size().unwrap_or((cols, rows));
                                         let chapters = root_id
                                             .as_deref()
@@ -1515,10 +1664,14 @@ pub fn run(
                                 bar_dirty = bar;
                                 if from_view {
                                     from_view = false;
-                                    let _ = out.write_all(b"[2J[H");
-                                    let _ = out.flush();
-                                    let (c, r) = size().unwrap_or((cols, rows));
-                                    force_repaint(&session, c, child_rows(r, bar));
+                                    if view_alt {
+                                        leave_view(&mut out, &mut view_alt, &mut view_buf);
+                                    } else {
+                                        let _ = out.write_all(b"\x1b[2J\x1b[H");
+                                        let _ = out.flush();
+                                        let (c, r) = size().unwrap_or((cols, rows));
+                                        force_repaint(&session, c, child_rows(r, bar));
+                                    }
                                 }
                                 if !pending_out.is_empty() {
                                     let _ = out.write_all(&pending_out);
@@ -1599,35 +1752,21 @@ pub fn run(
                                 Token::Prefix => None,
                             };
                             let mut close = false;
+                            // Switch straight from the graph: leave the view
+                            // first (restoring the child's screen), then the
+                            // switch flow owns the screen from there.
+                            let switch_to: Option<(Runtime, bool)> = match key {
+                                Some(b'c') => Some((Runtime::Claude, false)),
+                                Some(b'C') => Some((Runtime::Claude, true)),
+                                Some(b'x') => Some((Runtime::Codex, false)),
+                                Some(b'X') => Some((Runtime::Codex, true)),
+                                Some(b'o') => Some((Runtime::OpenCode, false)),
+                                Some(b'O') => Some((Runtime::OpenCode, true)),
+                                _ => None,
+                            };
                             match key {
                                 Some(b't') | Some(b'q') | Some(0x0d) | Some(0x0a)
                                 | Some(b' ') | Some(0x03) | Some(27) => close = true,
-                                // Switch straight from the graph: the switch
-                                // flow owns the screen from here.
-                                Some(b'c') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::Claude, false, &mut session, &mut switching_to);
-                                }
-                                Some(b'C') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::Claude, true, &mut session, &mut switching_to);
-                                }
-                                Some(b'x') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::Codex, false, &mut session, &mut switching_to);
-                                }
-                                Some(b'X') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::Codex, true, &mut session, &mut switching_to);
-                                }
-                                Some(b'o') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::OpenCode, false, &mut session, &mut switching_to);
-                                }
-                                Some(b'O') => {
-                                    mode = M_NORMAL;
-                                    request_switch(Runtime::OpenCode, true, &mut session, &mut switching_to);
-                                }
                                 // Rename without leaving: command line over the
                                 // graph, prefilled with the current name.
                                 Some(b'r') => {
@@ -1641,12 +1780,21 @@ pub fn run(
                                 }
                                 _ => {}
                             }
+                            if let Some((rt, fork)) = switch_to {
+                                leave_view(&mut out, &mut view_alt, &mut view_buf);
+                                mode = M_NORMAL;
+                                request_switch(rt, fork, &mut session, &mut switching_to);
+                            }
                             if close {
                                 mode = M_NORMAL;
-                                let _ = out.write_all(b"\x1b[2J\x1b[H");
-                                let _ = out.flush();
-                                let (c, r) = size().unwrap_or((cols, rows));
-                                force_repaint(&session, c, child_rows(r, bar));
+                                if view_alt {
+                                    leave_view(&mut out, &mut view_alt, &mut view_buf);
+                                } else {
+                                    let _ = out.write_all(b"\x1b[2J\x1b[H");
+                                    let _ = out.flush();
+                                    let (c, r) = size().unwrap_or((cols, rows));
+                                    force_repaint(&session, c, child_rows(r, bar));
+                                }
                                 bar_dirty = bar;
                             }
                         }
@@ -1800,21 +1948,43 @@ mod tests {
     }
 
     #[test]
+    fn track_alt_survives_split_sequences() {
+        let mut active = false;
+        let mut tail = Vec::new();
+        // The 1049h sequence arrives split across two reads.
+        track_alt(&mut active, &mut tail, b"\x1b[?10");
+        assert!(!active);
+        track_alt(&mut active, &mut tail, b"49h\x1b[2J");
+        assert!(active, "split alt-screen enter missed");
+        // Leaving, also split.
+        track_alt(&mut active, &mut tail, b"bye\x1b[?1049");
+        assert!(active);
+        track_alt(&mut active, &mut tail, b"l");
+        assert!(!active, "split alt-screen leave missed");
+        // Unrelated output never flips it.
+        track_alt(&mut active, &mut tail, b"plain text \x1b[31mred\x1b[0m");
+        assert!(!active);
+    }
+
+    #[test]
     fn bar_text_is_exactly_terminal_width() {
         // Fits: padded to width.
-        let t = bar_text(Runtime::Codex, false, 4, Some("fix-the-bug"), "Ctrl-B", 80);
+        let t = bar_text(Runtime::Codex, false, false, 4, Some("fix-the-bug"), "Ctrl-B", 80);
         assert_eq!(t.chars().count(), 80);
         assert!(t.contains("codex"), "{t}");
         assert!(t.contains("ch04\u{b7}fix-the-bug"), "{t}");
         // Tools mode is visible.
-        let t = bar_text(Runtime::Claude, true, 1, Some("x"), "Ctrl-B", 80);
+        let t = bar_text(Runtime::Claude, true, false, 1, Some("x"), "Ctrl-B", 80);
         assert!(t.contains("claude+tools"), "{t}");
-        // No thread yet.
-        let t = bar_text(Runtime::Codex, false, 0, None, "Ctrl-B", 80);
+        // An unvalidated runtime is marked right next to its name.
+        let t = bar_text(Runtime::Codex, false, true, 0, None, "Ctrl-B", 80);
+        assert!(t.contains("codex\u{26a0}"), "{t}");
+        let t = bar_text(Runtime::Codex, false, false, 0, None, "Ctrl-B", 80);
         assert!(t.contains("no thread yet"), "{t}");
         // Narrow terminal: truncated to width, never wider.
         let t = bar_text(
             Runtime::Codex,
+            false,
             false,
             12,
             Some("a-very-long-slug-here"),
