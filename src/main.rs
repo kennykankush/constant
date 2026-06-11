@@ -104,6 +104,7 @@ fn run_host(rest: &[String]) -> Result<()> {
     }
 
     let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
+    maybe_offer_update();
     host::run(
         Runtime::parse(&runtime_str)?,
         None,
@@ -112,6 +113,99 @@ fn run_host(rest: &[String]) -> Result<()> {
         prefix_byte,
         prefix_label,
     )
+}
+
+/// The claude-code-style startup offer: when a newer release is already known
+/// (cache only — never a network call here) and we're on a real terminal, ask
+/// once before hosting. `y` runs the right updater for how this binary was
+/// installed and relaunches the NEW constant with the same arguments; anything
+/// else continues with the current one. Quiet no-op otherwise.
+fn maybe_offer_update() {
+    use std::io::{IsTerminal, Write};
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(latest) = alembic::cached_release_version() else {
+        return;
+    };
+    if !alembic::version_newer(&latest, current)
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+    {
+        return;
+    }
+    print!("constant v{latest} is available (you have v{current}). update now? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return;
+    }
+
+    let exe = std::env::current_exe().ok();
+    let exe_str = exe
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let status = match install_channel(&exe_str) {
+        InstallChannel::Brew => {
+            println!("running: brew upgrade kennykankush/constant/constant");
+            std::process::Command::new("brew")
+                .args(["upgrade", "kennykankush/constant/constant"])
+                .status()
+        }
+        InstallChannel::Cargo => {
+            println!(
+                "this constant was installed with cargo — update with:
+  cargo install --git https://github.com/kennykankush/constant --locked"
+            );
+            return;
+        }
+        InstallChannel::Standalone => {
+            println!("running the installer (downloads the latest release binary)…");
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "curl -fsSL https://raw.githubusercontent.com/kennykankush/constant/main/scripts/install.sh | sh",
+                ])
+                .status()
+        }
+    };
+    match status {
+        Ok(st) if st.success() => {
+            // Relaunch as the new binary with the same arguments (the path is
+            // stable across both brew and installer upgrades).
+            if let Some(exe) = exe {
+                println!("updated — restarting constant");
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(exe)
+                    .args(std::env::args_os().skip(1))
+                    .exec();
+                eprintln!("couldn't restart automatically ({err}); continuing with v{current}");
+            }
+        }
+        Ok(_) | Err(_) => {
+            eprintln!("update didn't complete; continuing with v{current}");
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+enum InstallChannel {
+    Brew,
+    Cargo,
+    Standalone,
+}
+
+/// How this binary got onto the machine, judged from its own path.
+fn install_channel(exe: &str) -> InstallChannel {
+    if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
+        InstallChannel::Brew
+    } else if exe.contains("/.cargo/") {
+        InstallChannel::Cargo
+    } else {
+        InstallChannel::Standalone
+    }
 }
 
 fn run_carry(rest: &[String]) -> Result<()> {
@@ -605,6 +699,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     if let Some(n) = &note {
         println!("{n}");
     }
+    maybe_offer_update();
     host::run(rt, Some(&id), with_tools, bar, prefix_byte, prefix_label)
 }
 
@@ -1502,4 +1597,28 @@ INSIDE A HOSTED SESSION (press the prefix, then):
   <prefix> again send a literal prefix key to the child
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn install_channel_judges_paths() {
+        use super::{install_channel, InstallChannel};
+        assert_eq!(
+            install_channel("/opt/homebrew/Cellar/constant/0.3.1/bin/constant"),
+            InstallChannel::Brew
+        );
+        assert_eq!(
+            install_channel("/home/linuxbrew/.linuxbrew/bin/constant"),
+            InstallChannel::Brew
+        );
+        assert_eq!(
+            install_channel("/Users/x/.cargo/bin/constant"),
+            InstallChannel::Cargo
+        );
+        assert_eq!(
+            install_channel("/Users/x/.local/bin/constant"),
+            InstallChannel::Standalone
+        );
+    }
 }
