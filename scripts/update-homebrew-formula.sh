@@ -82,9 +82,31 @@ raise SystemExit(f"error: release asset not found: {want}")
 PY
 }
 
+# GitHub's digest field can briefly serve a WRONG value right after publish
+# (observed live on v0.3.3, 2026-06-11: api said c0667d…, bytes were a6f5c9…;
+# brew 6 then failed every install with an opaque sandbox error). The .sha256
+# assets are computed IN CI from the artifact itself — the source of truth.
+# Refuse to write a formula whose digests don't match them.
+verify_sha() {
+  target="$1"
+  sha="$2"
+  asset="constant-$tag-$target.tar.gz"
+  published="$(curl -fsSL "https://github.com/$repo/releases/download/$tag/$asset.sha256" | awk '{print $1}')"
+  if [ "$published" != "$sha" ]; then
+    echo "error: digest mismatch for $asset" >&2
+    echo "  api digest : $sha" >&2
+    echo "  CI .sha256 : $published" >&2
+    echo "GitHub's digest may not have settled yet — wait a minute and re-run." >&2
+    exit 1
+  fi
+}
+
 sha_aarch64_apple="$(sha_for aarch64-apple-darwin)"
 sha_x86_64_apple="$(sha_for x86_64-apple-darwin)"
 sha_x86_64_linux="$(sha_for x86_64-unknown-linux-gnu)"
+verify_sha aarch64-apple-darwin "$sha_aarch64_apple"
+verify_sha x86_64-apple-darwin "$sha_x86_64_apple"
+verify_sha x86_64-unknown-linux-gnu "$sha_x86_64_linux"
 url_aarch64_apple="$(api_url_for aarch64-apple-darwin)"
 url_x86_64_apple="$(api_url_for x86_64-apple-darwin)"
 url_x86_64_linux="$(api_url_for x86_64-unknown-linux-gnu)"
