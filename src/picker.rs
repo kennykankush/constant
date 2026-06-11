@@ -55,10 +55,9 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
                 // A runtime-side rename outranks an AUTO trail name; a trail
                 // name the user locked (constant rename / :rename) wins.
                 Some((name, handle, named)) => {
-                    let display = if !named && runtime_title.is_some() {
-                        runtime_title.unwrap().to_string()
-                    } else {
-                        name
+                    let display = match runtime_title {
+                        Some(t) if !named => t.to_string(),
+                        _ => name,
                     };
                     (display, Some(handle), true)
                 }

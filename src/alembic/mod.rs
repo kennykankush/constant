@@ -176,11 +176,12 @@ fn claude_quick_title(path: &Path) -> Option<String> {
     const TAIL: u64 = 64 * 1024;
     const HEAD: usize = 16 * 1024;
 
-    let mut f = fs::File::open(path).ok()?;
+    let f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
 
     // Tail: the last customTitle record names the session.
     let start = len.saturating_sub(TAIL);
+    let mut f = f;
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut tail = String::new();
     let _ = f.take(TAIL).read_to_string(&mut tail);
