@@ -3,6 +3,29 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - The doorbell
+
+How an existing install learns an update exists — at every door, the way
+the runtimes themselves do it.
+
+### Added
+- **Update offer at startup.** When a newer release is known and you're on a
+  real terminal, `constant host` (and `resume`) asks `update now? [y/N]`
+  before hosting. `y` runs the right updater for how the binary was
+  installed — `brew upgrade` for brew, the curl installer for standalone
+  binaries, printed instructions for cargo — and relaunches the new
+  Constant with the same arguments. Anything else continues as-is.
+- **Update notices.** A quiet startup line (`constant v0.3.3 is available —
+  brew upgrade …`) read from a local cache, so launch never waits on the
+  network; the background version sweep refreshes it at most ~once a day.
+  Drift warnings now point at the fix when one exists (`⚠ codex 0.140
+  unvalidated · constant v0.3.3 is out — brew upgrade`) instead of only
+  warning. `constant doctor` always live-checks and reports
+  `constant : 0.3.2 (latest)` or the available upgrade (text and `--json`).
+- **Local-first honesty:** the check is one anonymous GitHub release-API
+  GET that sends nothing, at most daily (always, on explicit `doctor`);
+  `CONSTANT_NO_UPDATE_CHECK=1` disables all of it.
+
 ## [0.3.1] - Surviving codex 0.139
 
 The first live verification pass met real codec drift: codex 0.139 changed
