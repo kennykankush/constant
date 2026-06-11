@@ -568,10 +568,12 @@ fn run_export(rest: &[String]) -> Result<()> {
 fn run_trail(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut events = false;
+    let mut full = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
             "--events" => events = true,
+            "--full" => full = true,
             other => bail!("unknown flag: {other}"),
         }
     }
@@ -582,6 +584,8 @@ fn run_trail(rest: &[String]) -> Result<()> {
     };
     if events {
         trail::print_events(cwd.as_deref())
+    } else if full {
+        trail::print_full(cwd.as_deref())
     } else {
         trail::print(cwd.as_deref())
     }
@@ -1743,8 +1747,10 @@ USAGE:
   constant status [--all]
         Show current project, runtime readiness, latest sessions, and Constant trail.
 
-  constant trail [--all] [--events]
-        Show current projections by conversation. --events shows the raw switch ledger.
+  constant trail [--all] [--full] [--events]
+        One card per conversation: handle, name, chapter chain, how to resume.
+        --full adds ids, stamped titles, and native resume commands;
+        --events shows the raw switch ledger.
 
   constant rename [--of HANDLE] NEW NAME...
         Name a conversation (locks the title; native pickers re-stamped).

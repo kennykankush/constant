@@ -346,12 +346,19 @@ fn trail_dedupes_projection_refreshes_and_events_shows_raw_ledger() {
         assert!(c.status.success(), "{}", err(&c));
     }
 
-    let current = run(&dir, &["trail", "--all"]);
+    let current = run(&dir, &["trail", "--all", "--full"]);
     assert!(current.status.success(), "{}", err(&current));
     let current_out = out(&current);
     assert!(
         current_out.contains("synced 2x"),
-        "trail should collapse repeated writes to one projection: {current_out}"
+        "trail --full should collapse repeated writes to one projection: {current_out}"
+    );
+    // The default view stays compact: sync counts render as ×N.
+    let compact = run(&dir, &["trail", "--all"]);
+    assert!(
+        out(&compact).contains("\u{d7}2"),
+        "compact trail should show the refresh count: {}",
+        out(&compact)
     );
     assert!(
         current_out.contains("events: 2"),
@@ -802,7 +809,7 @@ fn trail_current_view_hides_deleted_projection_but_events_keep_it() {
     assert!(current.status.success(), "{}", err(&current));
     let current_out = out(&current);
     assert!(
-        current_out.contains("projections: none"),
+        current_out.contains("no live projections"),
         "deleted projection should not be current: {current_out}"
     );
     assert!(
