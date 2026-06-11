@@ -144,17 +144,24 @@ pub fn render_paged(
         indexed: tail_start,
     };
 
-    let head = format!(
+    let index_note = if stats.indexed > 0 {
+        format!(
+            "{} earlier turns are FILED in Constant's record (see the index at \
+             the very top of this conversation) \u{2014} they are NOT lost. Read \
+             any filed turn back exactly as it was said:\n\
+             \u{a0}\u{a0}\u{a0} constant recall {handle} ch{chapter:02} <turn or range, e.g. 12 or 12-18>\n",
+            stats.indexed
+        )
+    } else {
+        "The whole conversation above is verbatim.\n".to_string()
+    };
+    let arrival = format!(
         "[constant: taking over]\n\
          You are {to_label}, continuing the conversation \u{201c}{name}\u{201d} ({handle}), \
          chapter {chapter}, taking over from {from_label}.\n\
          {anchor_line}\
-         Earlier turns are filed verbatim in Constant's record \u{2014} they are \
-         NOT lost. To read any filed turn back exactly as it was said, run:\n\
-         \u{a0}\u{a0}\u{a0} constant recall {handle} ch{chapter:02} <turn or range, e.g. 12 or 12-18>\n\
-         The index below lists every filed turn and its address. Recent turns \
-         follow verbatim. Verify state before acting; the working tree is the \
-         source of truth.",
+         {index_note}\
+         Verify state before acting; the working tree is the source of truth.",
         anchor_line = match anchor {
             Some(a) => format!("REPO: {a}\n"),
             None => String::new(),
@@ -166,9 +173,10 @@ pub fn render_paged(
     let cut_event_ix = nth_turn_event_index(session, tail_start);
     let tail = session.events.split_off(cut_event_ix);
 
+    // Layout: [index] + [verbatim tail] + [arrival card]. The card rides the
+    // BOTTOM — claude's UI anchors a resumed session there, and the recency
+    // edge is where model attention is sharpest (recitation).
     let mut events: Vec<SessionEvent> = Vec::with_capacity(tail.len() + 2);
-    events.push(synthetic_user(&head));
-
     if stats.indexed > 0 {
         let mut toc = String::from(
             "[constant: index of filed turns \u{2014} retrieve verbatim with `constant recall`]\n",
@@ -181,8 +189,8 @@ pub fn render_paged(
         }
         events.push(synthetic_user(&toc));
     }
-
     events.extend(tail);
+    events.push(synthetic_user(&arrival));
     session.events = events;
     stats
 }
@@ -275,16 +283,18 @@ mod tests {
         assert_eq!(stats.indexed + stats.verbatim, 30);
 
         let turns = message_turns(&s);
-        // Head + index are turns now too; the LAST original turn is intact.
+        // Layout: index first, tail verbatim, arrival card LAST (the bottom
+        // is where claude anchors a resumed session AND the recency edge).
         let last = &turns.last().unwrap().2;
-        assert!(last.starts_with("turn 29"), "tail not verbatim: {last}");
-        // The head card teaches recall with the right address shape.
-        assert!(turns[0].2.contains("[constant: taking over]"));
-        assert!(turns[0].2.contains("constant recall cobalt-37 ch04"));
-        // The index lists filed turns with addresses, and only filed ones.
-        assert!(turns[1].2.contains("ch04\u{b7}1  user\u{2192} turn 0"));
+        assert!(last.starts_with("[constant: taking over]"), "no arrival card: {last}");
+        assert!(last.contains("constant recall cobalt-37 ch04"));
+        let second_last = &turns[turns.len() - 2].2;
+        assert!(second_last.starts_with("turn 29"), "tail not verbatim: {second_last}");
+        // The index opens the conversation, listing only filed turns.
+        assert!(turns[0].2.contains("index of filed turns"));
+        assert!(turns[0].2.contains("ch04\u{b7}1  user\u{2192} turn 0"));
         assert!(
-            !turns[1].2.contains(&format!("\u{b7}{}  ", stats.indexed + 1)),
+            !turns[0].2.contains(&format!("\u{b7}{}  ", stats.indexed + 1)),
             "index leaked a verbatim-tail turn"
         );
     }
@@ -295,10 +305,11 @@ mod tests {
         let stats = render_paged(&mut s, "ash-52", "hi", 1, "codex", "claude", None, TAIL_BUDGET_CHARS);
         assert_eq!(stats.indexed, 0);
         assert_eq!(stats.verbatim, 2);
-        // Head card present, no index message.
+        // Arrival card at the bottom, no index message.
         let turns = message_turns(&s);
-        assert_eq!(turns.len(), 3); // head + 2 original
-        assert!(turns[0].2.starts_with("[constant: taking over]"));
+        assert_eq!(turns.len(), 3); // 2 original + arrival
+        assert!(turns[2].2.starts_with("[constant: taking over]"));
+        assert!(turns[0].2 == "hi", "originals must stay first and verbatim");
         assert!(!turns.iter().any(|(_, _, t)| t.contains("index of filed")));
     }
 }
