@@ -922,8 +922,14 @@ pub fn run(
         });
     }
 
+    // Colored runtime letters survive inside the inverse-video overlay.
+    let (cc, cx, co) = (
+        runtime_color("claude"),
+        runtime_color("codex"),
+        runtime_color("opencode"),
+    );
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   x=codex   o=opencode   (shift=new)   t=trail   :=command   d=quit "
+        " {prefix_label} ▸  c={cc}claude\x1b[39m   x={cx}codex\x1b[39m   o={co}opencode\x1b[39m   (shift=new)   t=trail   :=command   d=quit "
     );
 
     let mut out = std::io::stdout();
@@ -1269,9 +1275,13 @@ pub fn run(
                             let title = crate::trail::title(n, from, &nm.name, &nm.handle);
 
                             let action = if request.new { "new" } else { "continue" };
+                            let (cf, ct) = (
+                                runtime_color(from.label()),
+                                runtime_color(target.label()),
+                            );
                             let _ = out.write_all(
                                 format!(
-                                    "\x1b[2m  {} · {} · ch{n:02} {} \u{2192} {} · {action} · {}\x1b[0m\r\n",
+                                    "\x1b[2m  {} · {} · ch{n:02} \x1b[0m{cf}{}\x1b[0m\x1b[2m \u{2192} \x1b[0m{ct}{}\x1b[0m\x1b[2m · {action} · {}\x1b[0m\r\n",
                                     nm.handle,
                                     nm.name,
                                     from.label(),

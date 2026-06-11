@@ -492,7 +492,15 @@ fn run_carry(rest: &[String]) -> Result<()> {
         }
         println!("{out}");
     } else {
-        println!("carried → {} session {id}  ({title})", to.label());
+        let a = trail::ansi();
+        let color = if a.tty { trail::runtime_paint(to.label()) } else { "" };
+        println!(
+            "carried \u{2192} {color}{}{} session {id}  {}({title}){}",
+            to.label(),
+            a.reset,
+            a.dim,
+            a.reset
+        );
         println!("{}", distilled.receipt.summary());
         if let Some(cwd) = cwd {
             println!("cwd: {}", term_safe(&cwd.display().to_string()));
@@ -765,24 +773,36 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
-    println!("resumable conversations (newest first):");
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+    println!("{dim}resumable conversations (newest first){reset}");
+    let handle_w = convs
+        .iter()
+        .map(|c| c.handle.chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(8);
     for c in convs {
         let lives_in = if c.projections.is_empty() {
-            "record only".to_string()
+            format!("{dim}record only{reset}")
         } else {
             c.projections
                 .iter()
-                .map(|p| p.runtime.as_str())
+                .map(|p| {
+                    let color = if a.tty { trail::runtime_paint(&p.runtime) } else { "" };
+                    format!("{color}{}{reset}", term_safe(&p.runtime))
+                })
                 .collect::<Vec<_>>()
-                .join("·")
+                .join(&format!("{dim}\u{b7}{reset}"))
         };
         println!(
-            "  {:<12} {:<40}  {}",
+            "  {bold}{:<handle_w$}{reset} {:<42} {}  {dim}{}{reset}",
             term_safe(&c.handle),
-            term_safe(&c.name),
-            lives_in
+            trail::clip(&term_safe(&c.name), 40),
+            lives_in,
+            trail::ago(c.last_ts)
         );
-        println!("      constant resume {}", term_safe(&c.handle));
+        println!("  {dim}{:<handle_w$} \u{21b3} constant resume {}{reset}", "", term_safe(&c.handle));
     }
 }
 
@@ -1223,11 +1243,16 @@ fn run_recall(rest: &[String]) -> Result<()> {
                 .map(|c| c.n)
         })
         .unwrap_or(0);
+    let a = trail::ansi();
     println!(
-        "{} ({}) \u{b7} ch{ch:02} \u{b7} turns {lo}-{hi} of {}",
-        conv.name,
-        conv.handle,
-        turns.len()
+        "{}{}{} {}({}) \u{b7} ch{ch:02} \u{b7} turns {lo}-{hi} of {}{}",
+        a.bold,
+        trail::clip(&term_safe(&conv.name), 56),
+        a.reset,
+        a.dim,
+        term_safe(&conv.handle),
+        turns.len(),
+        a.reset
     );
 
     let mut chars = 0usize;
@@ -1704,17 +1729,28 @@ fn run_doctor(rest: &[String]) -> Result<()> {
             })
         );
     } else {
+        let a = trail::ansi();
+        let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+        let amber = if a.tty { "\x1b[38;5;214m" } else { "" };
         let mark = |b: bool| if b { "ok" } else { "MISSING" };
-        println!("constant doctor");
+        println!("{bold}constant doctor{reset}");
         match (&update, &latest) {
             (Some(u), _) => println!(
-                "  constant : {current} — v{u} AVAILABLE · brew upgrade kennykankush/constant/constant"
+                "  {bold}constant{reset} : {current} {amber}\u{2014} v{u} AVAILABLE{reset} {dim}\u{b7} brew upgrade kennykankush/constant/constant{reset}"
             ),
-            (None, Some(_)) => println!("  constant : {current} (latest)"),
-            (None, None) => println!("  constant : {current} (release check skipped — offline?)"),
+            (None, Some(_)) => println!("  {bold}constant{reset} : {current} {dim}(latest){reset}"),
+            (None, None) => println!("  {bold}constant{reset} : {current} {dim}(release check skipped \u{2014} offline?){reset}"),
         }
+        let rt_line = |rt: &str| -> String {
+            if a.tty {
+                format!("{}{rt:<8}{reset}", trail::runtime_paint(rt))
+            } else {
+                format!("{rt:<8}")
+            }
+        };
         println!(
-            "  codex  : {} (cli {}, sessions {}, db {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, sessions {}, db {}) \u{2014} validated against {}.x{reset}",
+            rt_line("codex"),
             r.codex_version.as_deref().unwrap_or("not found"),
             mark(r.codex_version.is_some()),
             mark(r.codex_store),
@@ -1722,21 +1758,24 @@ fn run_doctor(rest: &[String]) -> Result<()> {
             alembic::SUPPORTED_CODEX,
         );
         println!(
-            "  claude : {} (cli {}, projects {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, projects {}) \u{2014} validated against {}.x{reset}",
+            rt_line("claude"),
             r.claude_version.as_deref().unwrap_or("not found"),
             mark(r.claude_version.is_some()),
             mark(r.claude_store),
             alembic::SUPPORTED_CLAUDE,
         );
         println!(
-            "  opencode : {} (cli {}, db {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, db {}) \u{2014} validated against {}.x{reset}",
+            rt_line("opencode"),
             r.opencode_version.as_deref().unwrap_or("not found"),
             mark(r.opencode_version.is_some()),
             mark(r.opencode_db),
             alembic::SUPPORTED_OPENCODE,
         );
         println!(
-            "  gemini : {} (cli {}, store {}) — validated against {}.x; carry source only",
+            "  {} : {} {dim}(cli {}, store {}) \u{2014} validated against {}.x; carry source only{reset}",
+            rt_line("gemini"),
             r.gemini_version.as_deref().unwrap_or("not found"),
             mark(r.gemini_version.is_some()),
             mark(r.gemini_store),
@@ -1747,102 +1786,93 @@ fn run_doctor(rest: &[String]) -> Result<()> {
 }
 
 fn print_help() {
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+    let paint = |rt: &str| -> String {
+        if a.tty {
+            format!("{}{rt}{reset}", trail::runtime_paint(rt))
+        } else {
+            rt.to_string()
+        }
+    };
+    let (codex, claude, opencode, gemini) = (
+        paint("codex"),
+        paint("claude"),
+        paint("opencode"),
+        paint("gemini"),
+    );
     println!(
-        r#"Constant — one conversation, any agent runtime.
+        "\
+{bold}constant{reset} \u{2014} one conversation, any agent runtime.
 
-USAGE:
-  constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
-        Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B).
-        A persistent status bar lives on the bottom row (runtime, thread, keys);
-        --no-bar disables it.
+{dim}LIVE{reset}
+  {bold}constant host{reset} [codex|claude|opencode] {dim}[--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
+        {dim}Host an agent CLI in a Constant PTY (default: codex, prefix: Ctrl-B).
+        A status bar lives on the bottom row; --no-bar disables it.{reset}
 
-  constant carry --to codex|claude|opencode [--from RT | --session PATH_OR_ID] [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged]
-        Sources: codex, claude, opencode (ses_… ids resolve automatically), and
-        gemini (source only — carrying INTO gemini lands after one live check).
-        Headless: carry a conversation into the target runtime's native session and
-        print the resume command (no terminal). --json for machine output;
-        --dry-run previews without writing; --debug shows the route decision;
-        --new creates a fresh target continuation instead of refreshing one.
-        (`distill` is an alias.)
+  {bold}constant resume{reset} [QUERY] {dim}[--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
+        {dim}Re-host a conversation from the trail: wakes its latest projection live.
+        No QUERY = the newest conversation here; QUERY matches a handle, name,
+        or id. If every projection is gone, reprints from the record first.{reset}
 
-        --with-tools (experimental, also on host/resume): carry tool calls and
-        results too — redacted and size-capped. Default carries conversation only.
+{dim}CARRY{reset}
+  {bold}constant carry{reset} --to codex|claude|opencode {dim}[--from RT | --session PATH_OR_ID]
+        [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged] [--tail CHARS]{reset}
+        {dim}Headless: carry a conversation into the target's native session and
+        print the receipt + resume command. Sources: codex, claude, opencode,
+        and gemini (source only). --new forks instead of refreshing;
+        --with-tools carries tool calls/results (redacted, capped).
+        (`distill` is an alias.){reset}
 
-  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
-        Re-host a conversation from the trail: wakes its latest projection live
-        (prefix switching ready). No QUERY = the newest conversation here;
-        QUERY matches the slug or conversation id. If every projection is gone,
-        reprints one from the latest record volume first.
+{dim}THE RECORD{reset}  {dim}\u{2014} every carry snapshots the FULL thread; filed is never lost{reset}
+  {bold}constant recall{reset} HANDLE {dim}[chNN] [TURN | A-B]{reset}
+        {dim}Read filed turns back, verbatim, by address (ch04\u{b7}12). Read-only.
+        --render paged lays projections out as head card + index + recent
+        turns verbatim; the index's addresses resolve here.{reset}
 
-  constant sessions [--from codex|claude] [--all] [--titles] [--json]
-        List carryable sessions (this directory, or --all). --titles adds a preview
-        (reads transcripts; slower on large stores). Discovery for carry.
+  {bold}constant snapshots{reset} {dim}[--all] [--full]{reset}
+        {dim}List the record volumes per conversation (--full shows paths).{reset}
 
-  constant export (--from codex|claude | --session PATH) [--out FILE]
-        Export a conversation as the neutral IR master (distilled + redacted JSON):
-        a portable, runtime-agnostic copy. Writes to --out FILE, else stdout.
+  {bold}constant restore{reset} SNAPSHOT {dim}[--to codex|claude] [--json]{reset}
+        {dim}Reprint a fresh native session from any volume. Never overwrites.{reset}
 
-  constant doctor [--json]
-        Preflight: which runtimes/versions are installed and whether supported.
+{dim}NAME & MOVE{reset}
+  {bold}constant rename{reset} {dim}[--of HANDLE]{reset} NEW NAME...
+        {dim}Name a conversation (locks the title; native pickers re-stamped).
+        Inside a hosted session:  prefix then  :rename NEW NAME{reset}
 
-  constant status [--all]
-        Show current project, runtime readiness, latest sessions, and Constant trail.
+  {bold}constant pack{reset} HANDLE {dim}[--out FILE]{reset}   {bold}constant unpack{reset} FILE
+        {dim}Bundle a conversation (ledger + record volumes) into one portable
+        file; unpack it on another machine, then resume by handle.{reset}
 
-  constant trail [--all] [--full] [--events]
-        One card per conversation: handle, name, chapter chain, how to resume.
-        --full adds ids, stamped titles, and native resume commands;
-        --events shows the raw switch ledger.
+{dim}LOOK AROUND{reset}
+  {bold}constant trail{reset} {dim}[--all] [--full] [--events]{reset}
+        {dim}One card per conversation: handle, name, chapter chain.{reset}
+  {bold}constant sessions{reset} {dim}[--from RT] [--all] [--titles] [--json]{reset}
+        {dim}Carryable sessions on disk, newest first, linked to their handles.{reset}
+  {bold}constant ps{reset} {dim}[--json]{reset}
+        {dim}Every live agent process right now (alias: `live`). Read-only.{reset}
+  {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all]{reset}
+        {dim}Orientation \u{b7} runtime/codec preflight + update check \u{b7} fork-graph debug.{reset}
+  {bold}constant export{reset} {dim}(--from RT | --session PATH) [--out FILE]{reset}
+        {dim}The distilled, redacted neutral IR of a thread (stdout or FILE).{reset}
 
-  constant rename [--of HANDLE] NEW NAME...
-        Name a conversation (locks the title; native pickers re-stamped).
-        Inside a hosted session: prefix then  :rename NEW NAME
-
-  constant pack HANDLE [--out FILE]
-        Bundle a conversation (ledger rows + record volumes) into one portable
-        file — move conversations between machines.
-
-  constant unpack FILE
-        Import a packed conversation; then `constant resume <handle>` reprints
-        it from the record.
-
-  constant ps [--json]
-        Every agent CLI process alive on this machine right now: runtime,
-        uptime, the conversation it holds (when the trail knows it), and cwd.
-        Read-only. (`live` is an alias.)
-
-  constant recall HANDLE [chNN] [TURN | A-B]
-        Read filed turns back from the record, verbatim. The paged view files
-        older turns under addresses like ch04·12; this resolves them.
-        Read-only. (--render paged on host/carry/resume produces the paged
-        view: head card + index of filed turns + recent turns verbatim. The
-        record always holds the FULL thread; indexed is never lost.)
-
-  constant snapshots [--all]
-        List the record volumes (per-hop IR snapshots, written at every carry).
-
-  constant restore SNAPSHOT [--to codex|claude] [--json]
-        Reprint a fresh native session from a record volume (never overwrites
-        anything). Default target: the runtime the record came from.
-
-  constant route [--all] [--session PATH_OR_ID]
-        Show the reconstructed fork graph with aliases like codex[1] and claude[1.1].
-
-PREFIX KEY:
-  Default is Ctrl-B. If you run inside tmux (which also uses Ctrl-B), pick another:
+{dim}PREFIX KEY{reset}
+  {dim}Default Ctrl-B. Inside tmux (which owns Ctrl-B), pick another:{reset}
       constant host codex --prefix C-t
       CONSTANT_PREFIX=C-g constant host codex
 
-INSIDE A HOSTED SESSION (press the prefix, then):
-  c              continue in claude
-  C              create a new claude continuation
-  x              continue in codex
-  X              create a new codex continuation
-  o              continue in opencode
-  O              create a new opencode continuation
-  :              open the command line (e.g. `switch claude`, `new claude`, `quit`)
-  d              quit Constant (the hosted CLI exits with it)
-  <prefix> again send a literal prefix key to the child
-"#
+{dim}INSIDE A HOSTED SESSION{reset} {dim}(press the prefix, release, then){reset}
+  {bold}c{reset} / {bold}C{reset}        {dim}continue in{reset} {claude} {dim}/ new continuation{reset}
+  {bold}x{reset} / {bold}X{reset}        {dim}continue in{reset} {codex} {dim}/ new continuation{reset}
+  {bold}o{reset} / {bold}O{reset}        {dim}continue in{reset} {opencode} {dim}/ new continuation{reset}
+  {bold}t{reset}            {dim}toggle the trail graph (switch from inside it; r = rename){reset}
+  {bold}:{reset}            {dim}command line \u{2014} switch/new/rename/quit, Tab completes, \u{2191}\u{2193} history{reset}
+  {bold}d{reset}            {dim}quit (the hosted CLI exits with it){reset}
+  {bold}prefix again{reset} {dim}send a literal prefix key to the child{reset}
+
+  {dim}({gemini} is a carry source \u{2014} its conversations carry IN; hosting it lands later){reset}
+"
     );
 }
 
