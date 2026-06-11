@@ -868,11 +868,13 @@ fn refresh_bar(
 /// Entry point for `constant host [runtime] [--prefix ...]` and
 /// `constant resume` (which passes the projection id to wake up — the child's
 /// identity is then declared from birth, no detection needed).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     initial: Runtime,
     resume: Option<&str>,
     with_tools: bool,
     bar: bool,
+    paged: bool,
     prefix: u8,
     prefix_label: String,
 ) -> Result<()> {
@@ -1293,6 +1295,27 @@ pub fn run(
                                         }
                                     }
                                 });
+
+                            if paged {
+                                // The desk layout: the record above holds the FULL
+                                // thread; the projection wakes the target on head
+                                // card + index + verbatim tail. Index addresses
+                                // resolve via `constant recall` into that record.
+                                let anchor = crate::alembic::render::git_anchor(
+                                    host_cwd.as_deref(),
+                                );
+                                let stats = crate::alembic::render::render_paged(
+                                    &mut distilled.session,
+                                    &nm.handle,
+                                    &nm.name,
+                                    n,
+                                    from.label(),
+                                    target.label(),
+                                    anchor.as_deref(),
+                                    crate::alembic::render::TAIL_BUDGET_CHARS,
+                                );
+                                distilled.receipt.indexed = stats.indexed;
+                            }
 
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.

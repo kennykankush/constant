@@ -1759,3 +1759,153 @@ fn export_refuses_to_overwrite_its_source() {
     assert!(!o.status.success(), "export overwrote its own source!");
     assert_eq!(before, std::fs::read(&fix).unwrap(), "source was modified");
 }
+
+/// A long IR fixture: `pairs` user/assistant exchanges, each turn padded so a
+/// paged render must file most of the conversation.
+fn ir_fixture_long(dir: &Path, id: &str, pairs: usize) -> PathBuf {
+    let path = dir.join(format!("{id}.json"));
+    let pad = "lorem ".repeat(220); // ~1.3k chars per turn
+    let mut events = String::new();
+    for i in 0..pairs {
+        if i > 0 {
+            events.push_str(",\n");
+        }
+        events.push_str(&format!(
+            r#"    {{ "kind": "message", "role": "user",
+      "blocks": [ {{ "kind": "text", "text": "question {i} {pad}" }} ] }},
+    {{ "kind": "message", "role": "assistant",
+      "blocks": [ {{ "kind": "text", "text": "answer {i} {pad}" }} ] }}"#
+        ));
+    }
+    let ir = format!(
+        r#"{{
+  "ir_version": "transession/v1",
+  "metadata": {{ "session_id": "{id}", "source_format": "codex", "cwd": "/tmp/constant-cli-proj" }},
+  "events": [
+{events}
+  ]
+}}"#
+    );
+    std::fs::write(&path, ir).unwrap();
+    path
+}
+
+/// Move 1+2 round trip: a paged carry files old turns behind addresses, the
+/// projection wakes on head card + index + verbatim tail, and `constant
+/// recall` resolves any filed address back to the exact original words.
+#[test]
+fn paged_render_files_turns_and_recall_reads_them_back() {
+    let dir = tmpdir();
+    let src = ir_fixture_long(&dir, "paged-0001", 20); // ~52k chars: must file
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "paged carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let handle = v["handle"].as_str().unwrap().to_string();
+    let indexed = v["receipt"]["indexed"].as_u64().unwrap();
+    assert!(indexed > 0, "long conversation was not filed: {v}");
+
+    // The projection: head card + index + verbatim tail, older turns ABSENT.
+    let projection = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+    assert!(projection.contains("[constant: taking over]"), "no head card");
+    assert!(projection.contains("index of filed turns"), "no index");
+    assert!(
+        projection.contains(&format!("constant recall {handle}")),
+        "head card does not teach recall"
+    );
+    assert!(projection.contains("answer 19"), "tail not verbatim");
+    let full_first_turn = format!("question 0 {}", "lorem ".repeat(220));
+    assert!(
+        !projection.contains(full_first_turn.trim_end()),
+        "filed turn leaked verbatim into the projection"
+    );
+
+    // The record still holds the FULL thread (indexed is never lost)...
+    let record = std::fs::read_to_string(v["snapshot"].as_str().unwrap()).unwrap();
+    assert!(record.contains("question 0"), "record lost a filed turn");
+
+    // ...and recall resolves a filed address to the exact words.
+    let o = run(&dir, &["recall", &handle, "1-2"]);
+    assert!(o.status.success(), "recall failed: {}", err(&o));
+    let text = out(&o);
+    assert!(text.contains("question 0"), "recall missing turn 1: {text}");
+    assert!(text.contains("answer 0"), "recall missing turn 2");
+    assert!(text.contains("\u{b7}1] user:"), "recall lost addressing: {text}");
+
+    // Single-turn recall stays scoped.
+    let o = run(&dir, &["recall", &handle, "3"]);
+    assert!(o.status.success());
+    let text = out(&o);
+    assert!(text.contains("question 1"));
+    assert!(!text.contains("answer 1\n"), "range leaked: {text}");
+}
+
+/// The paged view's desk furniture is scaffold: a RE-carry of a paged
+/// projection strips the head card and index instead of carrying them
+/// forward as fake user turns.
+#[test]
+fn paged_desk_furniture_self_cleans_on_recarry() {
+    let dir = tmpdir();
+    let src = ir_fixture_long(&dir, "paged-0002", 20);
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let projection = v["path"].as_str().unwrap().to_string();
+
+    // Re-carry the paged projection (full render this time).
+    let o = run(
+        &dir,
+        &["carry", "--session", &projection, "--to", "codex", "--json"],
+    );
+    assert!(o.status.success(), "re-carry failed: {}", err(&o));
+    let v2: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let reprojection = std::fs::read_to_string(v2["path"].as_str().unwrap()).unwrap();
+    assert!(
+        !reprojection.contains("[constant: taking over]"),
+        "head card carried forward as a conversation turn"
+    );
+    assert!(
+        !reprojection.contains("index of filed turns"),
+        "index carried forward as a conversation turn"
+    );
+    assert!(
+        v2["receipt"]["dropped_scaffold"].as_u64().unwrap() >= 2,
+        "receipt did not declare the stripped desk furniture: {v2}"
+    );
+}
+
+/// Short conversations never get filed — paged mode degrades to
+/// orientation-only, and recall still works against the record.
+#[test]
+fn paged_render_keeps_short_conversations_whole() {
+    let dir = tmpdir();
+    let src = ir_fixture(&dir);
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["receipt"]["indexed"].as_u64().unwrap(), 0);
+    let projection = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+    assert!(projection.contains("[constant: taking over]"));
+    assert!(!projection.contains("index of filed turns"));
+    assert!(projection.contains("hello from the fixture"), "turns must stay verbatim");
+}

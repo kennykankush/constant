@@ -12,6 +12,7 @@
 //! essence.
 
 pub mod formats;
+pub mod render;
 pub mod ir;
 pub(crate) mod sha256;
 
@@ -304,6 +305,9 @@ pub struct CarryReceipt {
     pub dropped_scaffold: usize,
     /// Secrets burned off by redaction.
     pub redactions: usize,
+    /// Turns filed into the paged view's index — recallable from the record,
+    /// NOT dropped (only set when a carry renders the paged view).
+    pub indexed: usize,
 }
 
 impl CarryReceipt {
@@ -332,6 +336,9 @@ impl CarryReceipt {
                 self.redactions,
                 if self.redactions == 1 { "" } else { "s" }
             ));
+        }
+        if self.indexed > 0 {
+            parts.push(format!("{} filed (recallable)", self.indexed));
         }
         parts.join(" · ")
     }
@@ -969,6 +976,7 @@ pub(crate) fn is_scaffold(text: &str) -> bool {
         "<command-message>",
         "Caveat: The messages below",
         "# AGENTS.md",
+        "[constant:",
         "# CLAUDE.md",
         "<INSTRUCTIONS>",
         "Codebase and user instructions",

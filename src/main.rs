@@ -29,6 +29,7 @@ fn main() -> Result<()> {
         Some("status") => run_status(&args[1..]),
         Some("trail") => run_trail(&args[1..]),
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
+        Some("recall") => run_recall(&args[1..]),
         Some("ps") | Some("live") => run_ps(&args[1..]),
         Some("rename") => run_rename(&args[1..]),
         Some("pack") => run_pack(&args[1..]),
@@ -76,6 +77,7 @@ fn run_host(rest: &[String]) -> Result<()> {
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
     let mut with_tools = false;
     let mut bar = true;
+    let mut paged = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -90,6 +92,14 @@ fn run_host(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                paged = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => true,
+                    "full" => false,
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
             }
             "--no-bar" => {
                 bar = false;
@@ -110,6 +120,7 @@ fn run_host(rest: &[String]) -> Result<()> {
         None,
         with_tools,
         bar,
+        paged,
         prefix_byte,
         prefix_label,
     )
@@ -217,6 +228,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let mut debug = false;
     let mut new = false;
     let mut with_tools = false;
+    let mut paged = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -224,6 +236,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                paged = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => true,
+                    "full" => false,
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
             }
             "--from" => {
                 from = Some(flag_value(rest, i, "--from")?);
@@ -323,13 +343,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
     };
 
     let receipt = distilled.receipt;
-    let receipt_json = serde_json::json!({
+    let mut receipt_json = serde_json::json!({
         "turns": receipt.turns,
         "tools": receipt.tools,
         "dropped_tools": receipt.dropped_tools,
         "dropped_reasoning": receipt.dropped_reasoning,
         "dropped_scaffold": receipt.dropped_scaffold,
         "redactions": receipt.redactions,
+        "indexed": receipt.indexed,
     });
 
     if dry_run {
@@ -386,6 +407,25 @@ fn run_carry(rest: &[String]) -> Result<()> {
             }
         }
     });
+    if paged {
+        // The desk layout: the record above holds the FULL thread (the index's
+        // addresses point into it); the projection gets head + index + tail.
+        let anchor = alembic::render::git_anchor(
+            distilled.session.metadata.cwd.as_deref().map(Path::new),
+        );
+        let stats = alembic::render::render_paged(
+            &mut distilled.session,
+            &naming.handle,
+            &naming.name,
+            n,
+            from_rt.label(),
+            to.label(),
+            anchor.as_deref(),
+            alembic::render::TAIL_BUDGET_CHARS,
+        );
+        distilled.receipt.indexed = stats.indexed;
+        receipt_json["indexed"] = serde_json::json!(stats.indexed);
+    }
     let (id, written, cwd) =
         alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
     // Record the trail under the CONVERSATION's own cwd (carried from the source
@@ -422,6 +462,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "from": from_rt.label(),
             "to": to.label(),
             "cwd": cwd.as_ref().map(|p| p.display().to_string()),
+            "path": written.display().to_string(),
             "resume": &resume,
             "trail": &title,
             "handle": &naming.handle,
@@ -445,7 +486,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
         println!("{out}");
     } else {
         println!("carried → {} session {id}  ({title})", to.label());
-        println!("{}", receipt.summary());
+        println!("{}", distilled.receipt.summary());
         if let Some(cwd) = cwd {
             println!("cwd: {}", term_safe(&cwd.display().to_string()));
         }
@@ -553,6 +594,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     let mut list = false;
     let mut with_tools = false;
     let mut bar = true;
+    let mut paged = false;
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
 
     let mut i = 0;
@@ -561,6 +603,14 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                paged = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => true,
+                    "full" => false,
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
             }
             "--no-bar" => {
                 bar = false;
@@ -700,7 +750,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         println!("{n}");
     }
     maybe_offer_update();
-    host::run(rt, Some(&id), with_tools, bar, prefix_byte, prefix_label)
+    host::run(rt, Some(&id), with_tools, bar, paged, prefix_byte, prefix_label)
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
@@ -1050,6 +1100,142 @@ fn run_ps(rest: &[String]) -> Result<()> {
         "resume any of them: constant resume <conversation>, or the native command via `constant ps --json`"
     );
     Ok(())
+}
+
+/// `constant recall HANDLE [chNN] [TURN | A-B]` — read filed turns back from
+/// the record, verbatim. The pager's other half: rendered projections file
+/// older turns under addresses like `ch04·12`; this command resolves them.
+/// Read-only — the record is never written, only opened.
+fn run_recall(rest: &[String]) -> Result<()> {
+    const MAX_TURNS: usize = 40;
+    const MAX_CHARS: usize = 20_000;
+
+    let mut query: Option<String> = None;
+    let mut chapter: Option<u32> = None;
+    let mut range: Option<(usize, usize)> = None;
+    for arg in rest {
+        let a = arg.as_str();
+        if let Some(n) = a.strip_prefix("ch").and_then(|x| x.parse::<u32>().ok()) {
+            chapter = Some(n);
+        } else if let Some((lo, hi)) = parse_turn_range(a) {
+            range = Some((lo, hi));
+        } else if a.starts_with("--") {
+            bail!("unknown flag: {a}");
+        } else if query.is_none() {
+            query = Some(a.to_string());
+        } else {
+            bail!("recall takes one conversation, e.g. `constant recall cobalt-37 ch04 12-18`");
+        }
+    }
+    let q = query.context("recall needs a conversation handle (see `constant trail --all`)")?;
+
+    // Resolve the conversation: handle exact first (never ambiguous), then
+    // name/slug contains, then conversation-id prefix.
+    let convs = trail::conversations(None);
+    let ql = q.to_lowercase();
+    let conv = convs
+        .iter()
+        .find(|c| c.handle.to_lowercase() == ql)
+        .or_else(|| {
+            let hits: Vec<_> = convs
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&ql)
+                        || c.slug.to_lowercase().contains(&ql)
+                        || c.conversation.starts_with(&q)
+                })
+                .collect();
+            match hits.len() {
+                1 => Some(hits[0]),
+                0 => None,
+                _ => {
+                    eprintln!("\"{q}\" matches several conversations — use the handle:");
+                    for c in &hits {
+                        eprintln!("  {}  {}", c.handle, c.name);
+                    }
+                    None
+                }
+            }
+        })
+        .with_context(|| format!("no conversation matches \"{q}\""))?;
+
+    // Resolve the volume: a named chapter's, else the newest on disk.
+    let volume = match chapter {
+        Some(n) => {
+            let row = trail::chapters(&conv.conversation)
+                .into_iter()
+                .find(|c| c.n == n)
+                .with_context(|| format!("{} has no chapter {n}", conv.handle))?;
+            let path = trail::snapshot_path(&conv.conversation, n, Runtime::parse(&row.from)?)
+                .context("record vault unavailable")?;
+            if !path.exists() {
+                bail!(
+                    "chapter {n}'s record volume is missing on this machine \
+                     (see `constant snapshots`)"
+                );
+            }
+            path
+        }
+        None => trail::latest_snapshot(&conv.conversation).with_context(|| {
+            format!("{} has no record volumes on this machine", conv.handle)
+        })?,
+    };
+
+    let text = std::fs::read_to_string(&volume)
+        .with_context(|| format!("could not read {}", volume.display()))?;
+    let session: alembic::ir::UniversalSession =
+        serde_json::from_str(&text).context("record volume is not a valid IR volume")?;
+    let turns = alembic::render::message_turns(&session);
+    if turns.is_empty() {
+        bail!("that volume holds no conversational turns");
+    }
+
+    let (lo, hi) = range.unwrap_or((1, turns.len()));
+    let lo = lo.max(1);
+    let hi = hi.min(turns.len());
+    if lo > hi {
+        bail!("turn range {lo}-{hi} is out of bounds (1-{})", turns.len());
+    }
+
+    let ch = chapter
+        .or_else(|| {
+            trail::chapters(&conv.conversation)
+                .last()
+                .map(|c| c.n)
+        })
+        .unwrap_or(0);
+    println!(
+        "{} ({}) \u{b7} ch{ch:02} \u{b7} turns {lo}-{hi} of {}",
+        conv.name,
+        conv.handle,
+        turns.len()
+    );
+
+    let mut chars = 0usize;
+    let mut last = lo;
+    for (shown, (n, role, text)) in turns.iter().skip(lo - 1).take(hi - lo + 1).enumerate() {
+        if shown >= MAX_TURNS || chars >= MAX_CHARS {
+            println!(
+                "\u{2026} output capped \u{b7} next: constant recall {} ch{ch:02} {}-{hi}",
+                conv.handle, last
+            );
+            break;
+        }
+        let safe = term_safe(text);
+        println!("\n[ch{ch:02}\u{b7}{n}] {role}:\n{safe}");
+        chars += safe.chars().count();
+        last = n + 1;
+    }
+    Ok(())
+}
+
+/// `"14"` → (14,14) · `"12-18"` → (12,18) · anything else → None.
+fn parse_turn_range(s: &str) -> Option<(usize, usize)> {
+    if let Ok(n) = s.parse::<usize>() {
+        return Some((n, n));
+    }
+    let (a, b) = s.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 fn run_snapshots(rest: &[String]) -> Result<()> {
@@ -1513,12 +1699,12 @@ fn print_help() {
         r#"Constant — one conversation, any agent runtime.
 
 USAGE:
-  constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
+  constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
         Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B).
         A persistent status bar lives on the bottom row (runtime, thread, keys);
         --no-bar disables it.
 
-  constant carry --to codex|claude|opencode [--from RT | --session PATH_OR_ID] [--json] [--dry-run] [--debug] [--new] [--with-tools]
+  constant carry --to codex|claude|opencode [--from RT | --session PATH_OR_ID] [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged]
         Sources: codex, claude, opencode (ses_… ids resolve automatically), and
         gemini (source only — carrying INTO gemini lands after one live check).
         Headless: carry a conversation into the target runtime's native session and
@@ -1530,7 +1716,7 @@ USAGE:
         --with-tools (experimental, also on host/resume): carry tool calls and
         results too — redacted and size-capped. Default carries conversation only.
 
-  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar]
+  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
         Re-host a conversation from the trail: wakes its latest projection live
         (prefix switching ready). No QUERY = the newest conversation here;
         QUERY matches the slug or conversation id. If every projection is gone,
@@ -1569,6 +1755,13 @@ USAGE:
         Every agent CLI process alive on this machine right now: runtime,
         uptime, the conversation it holds (when the trail knows it), and cwd.
         Read-only. (`live` is an alias.)
+
+  constant recall HANDLE [chNN] [TURN | A-B]
+        Read filed turns back from the record, verbatim. The paged view files
+        older turns under addresses like ch04·12; this resolves them.
+        Read-only. (--render paged on host/carry/resume produces the paged
+        view: head card + index of filed turns + recent turns verbatim. The
+        record always holds the FULL thread; indexed is never lost.)
 
   constant snapshots [--all]
         List the record volumes (per-hop IR snapshots, written at every carry).
