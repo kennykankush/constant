@@ -121,15 +121,41 @@ impl Drop for Screen {
     }
 }
 
+/// The picker's scope: this folder, every folder, or only conversations the
+/// Constant trail knows (handles, chapters, the record).
+#[derive(Clone, Copy, PartialEq)]
+enum Scope {
+    Cwd,
+    All,
+    Trail,
+}
+
+fn load(scope: Scope, cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
+    match scope {
+        Scope::Cwd => entries(cwd),
+        Scope::All => entries(None),
+        Scope::Trail => {
+            let mut v = entries(None);
+            v.retain(|e| e.known);
+            v
+        }
+    }
+}
+
 /// Run the picker. Returns the chosen entry, or None on cancel.
-/// `start_cwd` seeds the [cwd] filter; Tab widens to everywhere.
+/// `start_cwd` seeds the [folder] scope; Tab cycles folder → everywhere →
+/// constant trail.
 pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!("the resume picker needs an interactive terminal");
     }
 
-    let mut scoped = start_cwd.is_some();
-    let mut all_entries = entries(if scoped { start_cwd.as_deref() } else { None });
+    let mut scope = if start_cwd.is_some() {
+        Scope::Cwd
+    } else {
+        Scope::All
+    };
+    let mut all_entries = load(scope, start_cwd.as_deref());
     let mut query = String::new();
     let mut selected: usize = 0;
     let mut offset: usize = 0;
@@ -141,7 +167,7 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
             selected = visible.len().saturating_sub(1);
         }
 
-        draw(&visible, &query, selected, &mut offset, scoped, start_cwd.as_deref())?;
+        draw(&visible, &query, selected, &mut offset, scope, start_cwd.as_deref())?;
 
         match event::read()? {
             Event::Key(k) => {
@@ -164,9 +190,18 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                         }
                     }
                     (KeyCode::Tab, _) => {
-                        scoped = !scoped;
-                        all_entries =
-                            entries(if scoped { start_cwd.as_deref() } else { None });
+                        scope = match scope {
+                            Scope::Cwd => Scope::All,
+                            Scope::All => Scope::Trail,
+                            Scope::Trail => {
+                                if start_cwd.is_some() {
+                                    Scope::Cwd
+                                } else {
+                                    Scope::All
+                                }
+                            }
+                        };
+                        all_entries = load(scope, start_cwd.as_deref());
                         selected = 0;
                         offset = 0;
                     }
@@ -195,7 +230,7 @@ fn draw(
     query: &str,
     selected: usize,
     offset: &mut usize,
-    scoped: bool,
+    scope: Scope,
     cwd: Option<&std::path::Path>,
 ) -> Result<()> {
     let (cols, rows) = size().unwrap_or((80, 24));
@@ -222,15 +257,15 @@ fn draw(
     s.push_str(&format!(
         "  {BOLD}constant{RESET} \u{2014} resume a session\r\n\r\n"
     ));
-    let scope_label = if scoped {
-        format!(
+    let scope_label = match scope {
+        Scope::Cwd => format!(
             "[{}]",
             cwd.and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "cwd".to_string())
-        )
-    } else {
-        "[everywhere]".to_string()
+                .unwrap_or_else(|| "folder".to_string())
+        ),
+        Scope::All => "[everywhere]".to_string(),
+        Scope::Trail => "[constant trail]".to_string(),
     };
     let q_shown = if query.is_empty() {
         format!("{DIM}type to search{RESET}")
@@ -253,7 +288,7 @@ fn draw(
     {
         let color = trail::runtime_paint(e.runtime.label());
         let age = trail::ago(e.mtime_secs);
-        let name_budget = if scoped {
+        let name_budget = if scope == Scope::Cwd {
             width.saturating_sub(34)
         } else {
             width.saturating_sub(58)
@@ -270,7 +305,7 @@ fn draw(
         }
         // Everywhere-scope shows each session's home, shortened.
         let home = std::env::var("HOME").unwrap_or_default();
-        let place = if scoped {
+        let place = if scope == Scope::Cwd {
             String::new()
         } else {
             e.cwd
