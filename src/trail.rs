@@ -1118,6 +1118,12 @@ pub fn import_rows(
 /// (as a projection or as a recorded source) — used by `constant ps` to name
 /// live processes.
 pub fn label_for_session(id: &str) -> Option<String> {
+    naming_parts_for_session(id).map(|(name, handle)| format!("{name} \u{b7} {handle}"))
+}
+
+/// (name, handle) for a session the trail knows — the name is the thing a
+/// person reads; the handle is Constant metadata that decorates it.
+pub fn naming_parts_for_session(id: &str) -> Option<(String, String)> {
     let entries = load_entries(None);
     let conv = entries.iter().find_map(|e| {
         (e.id == id || e.source_id.as_deref() == Some(id)).then(|| e.conversation.clone())
@@ -1128,7 +1134,7 @@ pub fn label_for_session(id: &str) -> Option<String> {
         .map(|e| e.slug.clone())
         .unwrap_or_else(|| conv.clone());
     let naming = naming_from_entries(&entries, &conv, &slug, None);
-    Some(format!("{} \u{b7} {}", naming.handle, naming.name))
+    Some((naming.name, naming.handle))
 }
 
 /// The newest record volume for a conversation that still exists on disk —
@@ -1196,9 +1202,9 @@ pub fn print_snapshots(cwd_filter: Option<&Path>, full: bool) -> anyhow::Result<
 
         println!();
         println!(
-            "  {bold}{}{reset} {}  {dim}({cwd}){reset}",
-            crate::term_safe(&naming.handle),
-            clip(&crate::term_safe(&naming.name), 56)
+            "  {bold}{}{reset}  {dim}{} \u{b7} {cwd}{reset}",
+            clip(&crate::term_safe(&naming.name), 56),
+            crate::term_safe(&naming.handle)
         );
         for e in rows.iter() {
             let snap = e.snapshot.as_deref().unwrap_or("");
@@ -1454,13 +1460,6 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
         ),
     }
 
-    let handle_w = views
-        .iter()
-        .map(|v| v.handle.chars().count())
-        .max()
-        .unwrap_or(8)
-        .max(8);
-
     for conv in &views {
         let handle = crate::term_safe(&conv.handle);
         let name = clip(&crate::term_safe(&conv.name), 56);
@@ -1468,11 +1467,11 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
         let when = ago(conv.last_ts);
 
         println!();
-        print!("  {bold}{handle:<handle_w$}{reset} {name}");
+        print!("  {bold}{name}{reset}");
         if latest_n > 0 {
-            print!("  {dim}\u{b7} ch{latest_n:02} \u{b7} {when}{reset}");
+            print!("  {dim}\u{b7} ch{latest_n:02} \u{b7} {when} \u{b7} {handle}{reset}");
         } else {
-            print!("  {dim}\u{b7} {when}{reset}");
+            print!("  {dim}\u{b7} {when} \u{b7} {handle}{reset}");
         }
         if want_cwd.is_none()
             && let Some(c) = &conv.cwd
@@ -1481,7 +1480,7 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
         }
         println!();
 
-        let pad = " ".repeat(handle_w + 3);
+        let pad = "    ".to_string();
         if conv.projections.is_empty() {
             println!("{pad}{dim}no live projections \u{2014} resume reprints from the record{reset}");
         } else {
@@ -1584,13 +1583,6 @@ pub fn print_status(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
     let (dim, bold, reset) = (a.dim, a.bold, a.reset);
 
     println!("trail:");
-    let handle_w = views
-        .iter()
-        .take(3)
-        .map(|v| v.handle.chars().count())
-        .max()
-        .unwrap_or(8)
-        .max(8);
     for conv in views.iter().take(3) {
         let chain = conv
             .projections
@@ -1611,9 +1603,9 @@ pub fn print_status(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(&format!(" {dim}\u{2192}{reset} "));
         println!(
-            "  {bold}{:<handle_w$}{reset} {:<42} {}",
-            crate::term_safe(&conv.handle),
+            "  {bold}{:<42}{reset} {dim}{:<12}{reset} {}",
             clip(&crate::term_safe(&conv.name), 40),
+            crate::term_safe(&conv.handle),
             if chain.is_empty() {
                 format!("{dim}no live projections{reset}")
             } else {

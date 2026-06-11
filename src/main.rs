@@ -821,9 +821,9 @@ fn print_resume_list(convs: &[trail::ConversationView]) {
                 .join(&format!("{dim}\u{b7}{reset}"))
         };
         println!(
-            "  {bold}{:<handle_w$}{reset} {:<42} {}  {dim}{}{reset}",
-            term_safe(&c.handle),
+            "  {bold}{:<42}{reset} {dim}{:<handle_w$}{reset} {}  {dim}{}{reset}",
             trail::clip(&term_safe(&c.name), 40),
+            term_safe(&c.handle),
             lives_in,
             trail::ago(c.last_ts)
         );
@@ -1126,8 +1126,8 @@ fn run_ps(rest: &[String]) -> Result<()> {
         let raw_label = a
             .session_id
             .as_deref()
-            .and_then(trail::label_for_session)
-            .map(|l| term_safe(&trail::clip(&l, 44)));
+            .and_then(trail::naming_parts_for_session)
+            .map(|(n, h)| term_safe(&trail::clip(&format!("{n} \u{b7} {h}"), 44)));
         let conversation = match &raw_label {
             Some(l) => format!("{bold}{:<44}{reset}", l),
             None => format!("{dim}{:<44}{reset}", "\u{2014}"),
@@ -1582,8 +1582,14 @@ fn run_status(rest: &[String]) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| trail::ago(d.as_secs()))
                 .unwrap_or_default();
-            let known = trail::label_for_session(&s.id)
-                .map(|l| format!("  {bold}{}{reset}", term_safe(&trail::clip(&l, 48))))
+            let known = trail::naming_parts_for_session(&s.id)
+                .map(|(n, h)| {
+                    format!(
+                        "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
+                        term_safe(&trail::clip(&n, 44)),
+                        term_safe(&h)
+                    )
+                })
                 .unwrap_or_default();
             println!(
                 "  {color}{:<8}{reset} {dim}{}{reset}  {dim}{age}{reset}{known}",
@@ -1708,8 +1714,14 @@ fn run_sessions(rest: &[String]) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| trail::ago(d.as_secs()))
                 .unwrap_or_default();
-            let label = trail::label_for_session(&s.id)
-                .map(|l| format!("  {bold}{}{reset}", term_safe(&trail::clip(&l, 48))))
+            let label = trail::naming_parts_for_session(&s.id)
+                .map(|(n, h)| {
+                    format!(
+                        "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
+                        term_safe(&trail::clip(&n, 44)),
+                        term_safe(&h)
+                    )
+                })
                 .unwrap_or_default();
             let title = s
                 .title

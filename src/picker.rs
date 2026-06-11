@@ -24,9 +24,11 @@ use crate::trail;
 pub struct PickEntry {
     pub runtime: Runtime,
     pub id: String,
-    /// What a person knows it by: `handle · name` when the trail knows the
-    /// session, else the runtime's own registry title, else a dim id.
+    /// What a person knows it by: the conversation name (trail name when
+    /// known, else the runtime's own registry title, else the id).
     pub display: String,
+    /// Constant's handle when the trail knows this session — pure decoration.
+    pub handle: Option<String>,
     /// True when `display` came from the trail (rendered bold).
     pub known: bool,
     pub cwd: Option<String>,
@@ -48,17 +50,18 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let (display, known) = match trail::label_for_session(&s.id) {
-                Some(l) => (l, true),
+            let (display, handle, known) = match trail::naming_parts_for_session(&s.id) {
+                Some((name, handle)) => (name, Some(handle), true),
                 None => match s.title.as_deref().filter(|t| !t.is_empty()) {
-                    Some(t) => (t.to_string(), false),
-                    None => (s.id.clone(), false),
+                    Some(t) => (t.to_string(), None, false),
+                    None => (s.id.clone(), None, false),
                 },
             };
             out.push(PickEntry {
                 runtime: rt,
                 id: s.id,
                 display,
+                handle,
                 known,
                 cwd: s.cwd,
                 mtime_secs,
@@ -79,6 +82,11 @@ pub fn filter<'a>(entries: &'a [PickEntry], query: &str) -> Vec<&'a PickEntry> {
                 || e.display.to_lowercase().contains(&q)
                 || e.id.to_lowercase().contains(&q)
                 || e.runtime.label().contains(&q)
+                || e
+                    .handle
+                    .as_deref()
+                    .map(|h| h.to_lowercase().contains(&q))
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -242,11 +250,15 @@ fn draw(
             width.saturating_sub(58)
         };
         let name = trail::clip(&crate::term_safe(&e.display), name_budget.max(16));
-        let name = if e.known {
+        let mut name = if e.known {
             format!("{BOLD}{name}{RESET}")
         } else {
             name
         };
+        // The title is the protagonist; the handle decorates it, dim.
+        if let Some(h) = &e.handle {
+            name.push_str(&format!(" {DIM}\u{b7} {}{RESET}", crate::term_safe(h)));
+        }
         // Everywhere-scope shows each session's home, shortened.
         let home = std::env::var("HOME").unwrap_or_default();
         let place = if scoped {
@@ -297,6 +309,7 @@ mod tests {
             runtime: rt,
             id: id.into(),
             display: display.into(),
+            handle: None,
             known: false,
             cwd: None,
             mtime_secs: ts,
