@@ -1577,6 +1577,7 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut json = false;
     let mut titles = false;
+    let mut query: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1594,6 +1595,13 @@ fn run_sessions(rest: &[String]) -> Result<()> {
             }
             "--titles" => {
                 titles = true;
+                i += 1;
+            }
+            q if !q.starts_with('-') => {
+                if query.is_some() {
+                    bail!("sessions takes one search query, e.g. `constant sessions market`");
+                }
+                query = Some(q.to_lowercase());
                 i += 1;
             }
             other => bail!("unknown flag: {other}"),
@@ -1619,6 +1627,23 @@ fn run_sessions(rest: &[String]) -> Result<()> {
         sessions.extend(alembic::list_sessions(rt, cwd.as_deref(), titles));
     }
     sessions.sort_by_key(|b| std::cmp::Reverse(b.mtime));
+    if let Some(q) = &query {
+        sessions.retain(|s| {
+            s.id.to_lowercase().contains(q)
+                || s.title
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(q))
+                    .unwrap_or(false)
+                || trail::label_for_session(&s.id)
+                    .map(|l| l.to_lowercase().contains(q))
+                    .unwrap_or(false)
+        });
+        if sessions.is_empty() {
+            println!("no sessions match \u{201c}{}\u{201d}", term_safe(q));
+            println!("(codex titles come from its registry; claude/gemini need --titles to search transcripts)");
+            return Ok(());
+        }
+    }
 
     if json {
         let arr: Vec<_> = sessions
@@ -1848,8 +1873,9 @@ fn print_help() {
 {dim}LOOK AROUND{reset}
   {bold}constant trail{reset} {dim}[--all] [--full] [--events]{reset}
         {dim}One card per conversation: handle, name, chapter chain.{reset}
-  {bold}constant sessions{reset} {dim}[--from RT] [--all] [--titles] [--json]{reset}
-        {dim}Carryable sessions on disk, newest first, linked to their handles.{reset}
+  {bold}constant sessions{reset} {dim}[QUERY] [--from RT] [--all] [--titles] [--json]{reset}
+        {dim}Carryable sessions on disk, newest first, linked to their handles.
+        QUERY filters by name/id (codex names come from its own registry).{reset}
   {bold}constant ps{reset} {dim}[--json]{reset}
         {dim}Every live agent process right now (alias: `live`). Read-only.{reset}
   {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all]{reset}

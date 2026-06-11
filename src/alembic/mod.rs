@@ -167,6 +167,37 @@ fn codex_thread_from_logs_in(
     None
 }
 
+/// Every codex thread's display title from its registry (read-only, one
+/// query) — the names the user actually knows, including in-codex renames.
+fn codex_registry_titles() -> std::collections::HashMap<String, String> {
+    use rusqlite::{Connection, OpenFlags};
+    let mut map = std::collections::HashMap::new();
+    let Ok(root) = formats::default_output_root(SessionFormat::Codex) else {
+        return map;
+    };
+    let db = root.join("state_5.sqlite");
+    if !db.exists() {
+        return map;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return map;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id, COALESCE(title, '') FROM threads") else {
+        return map;
+    };
+    if let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (id, title) in rows.flatten() {
+            map.insert(id, title);
+        }
+    }
+    map
+}
+
 /// Newest codex thread for a directory straight from codex's own registry
 /// (read-only), respecting the spawn-time fence and requiring at least one
 /// real user turn. Returns the thread's rollout file.
@@ -1373,6 +1404,11 @@ pub fn list_sessions(
     if fmt == SessionFormat::OpenCode {
         return list_opencode_sessions(cwd);
     }
+    let codex_titles = if fmt == SessionFormat::Codex {
+        codex_registry_titles()
+    } else {
+        std::collections::HashMap::new()
+    };
     let Ok(root) = formats::default_output_root(fmt) else {
         return Vec::new();
     };
@@ -1449,7 +1485,7 @@ pub fn list_sessions(
             // Reading the file body (has_conversation + title) is opt-in: the
             // default listing stays metadata-only so it doesn't scan every
             // transcript on a large store.
-            let (has_conversation, title) = if with_titles {
+            let (has_conversation, mut title) = if with_titles {
                 let has = has_conversation(&path, fmt);
                 (
                     Some(has),
@@ -1458,6 +1494,14 @@ pub fn list_sessions(
             } else {
                 (None, None)
             };
+            // Codex names its threads in its own registry (incl. user renames)
+            // — that's the name a person knows the conversation BY, and it's
+            // one free lookup. Prefer it over the derived first-message title.
+            if let Some(t) = codex_titles.get(&id)
+                && !t.is_empty()
+            {
+                title = Some(t.clone());
+            }
             out.push(SessionSummary {
                 runtime: runtime.label(),
                 id,
