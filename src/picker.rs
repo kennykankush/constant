@@ -50,9 +50,19 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let runtime_title = s.title.as_deref().filter(|t| !t.is_empty());
             let (display, handle, known) = match trail::naming_parts_for_session(&s.id) {
-                Some((name, handle)) => (name, Some(handle), true),
-                None => match s.title.as_deref().filter(|t| !t.is_empty()) {
+                // A runtime-side rename outranks an AUTO trail name; a trail
+                // name the user locked (constant rename / :rename) wins.
+                Some((name, handle, named)) => {
+                    let display = if !named && runtime_title.is_some() {
+                        runtime_title.unwrap().to_string()
+                    } else {
+                        name
+                    };
+                    (display, Some(handle), true)
+                }
+                None => match runtime_title {
                     Some(t) => (t.to_string(), None, false),
                     None => (s.id.clone(), None, false),
                 },

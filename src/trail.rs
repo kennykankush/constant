@@ -1118,12 +1118,14 @@ pub fn import_rows(
 /// (as a projection or as a recorded source) — used by `constant ps` to name
 /// live processes.
 pub fn label_for_session(id: &str) -> Option<String> {
-    naming_parts_for_session(id).map(|(name, handle)| format!("{name} \u{b7} {handle}"))
+    naming_parts_for_session(id).map(|(name, handle, _)| format!("{name} \u{b7} {handle}"))
 }
 
-/// (name, handle) for a session the trail knows — the name is the thing a
-/// person reads; the handle is Constant metadata that decorates it.
-pub fn naming_parts_for_session(id: &str) -> Option<(String, String)> {
+/// (name, handle, named) for a session the trail knows — the name is the
+/// thing a person reads; the handle is Constant metadata that decorates it;
+/// `named` is true only when a user explicitly locked the name (so callers
+/// can let a runtime-side rename outrank an auto-derived trail name).
+pub fn naming_parts_for_session(id: &str) -> Option<(String, String, bool)> {
     let entries = load_entries(None);
     let conv = entries.iter().find_map(|e| {
         (e.id == id || e.source_id.as_deref() == Some(id)).then(|| e.conversation.clone())
@@ -1134,7 +1136,7 @@ pub fn naming_parts_for_session(id: &str) -> Option<(String, String)> {
         .map(|e| e.slug.clone())
         .unwrap_or_else(|| conv.clone());
     let naming = naming_from_entries(&entries, &conv, &slug, None);
-    Some((naming.name, naming.handle))
+    Some((naming.name, naming.handle, naming.named))
 }
 
 /// The newest record volume for a conversation that still exists on disk —

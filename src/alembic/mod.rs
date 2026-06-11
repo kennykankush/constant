@@ -167,6 +167,81 @@ fn codex_thread_from_logs_in(
     None
 }
 
+/// A claude session's display name from bounded reads: the LAST customTitle
+/// record wins (a /rename, or Constant's own re-stamp — search the tail),
+/// else the first real user message (search the head), clipped. Reads at most
+/// ~80KB per file regardless of transcript size.
+fn claude_quick_title(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    const HEAD: usize = 16 * 1024;
+
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+
+    // Tail: the last customTitle record names the session.
+    let start = len.saturating_sub(TAIL);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    let _ = f.take(TAIL).read_to_string(&mut tail);
+    if let Some(ix) = tail.rfind("\"customTitle\":\"") {
+        let rest = &tail[ix + "\"customTitle\":\"".len()..];
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => {
+                    // Keep escaped quotes/backslashes readable; drop the rest.
+                    if let Some(n) = chars.next()
+                        && (n == '"' || n == '\\')
+                    {
+                        out.push(n);
+                    }
+                }
+                _ => out.push(c),
+            }
+            if out.chars().count() >= 80 {
+                break;
+            }
+        }
+        // Constant's own stamps carry trail metadata — show just the name part.
+        if let Some((name, _)) = out.split_once(" \u{b7} ch") {
+            out = name.to_string();
+        }
+        if !out.trim().is_empty() {
+            return Some(out.trim().to_string());
+        }
+    }
+
+    // Head: first real user message as an auto-title.
+    let mut f = fs::File::open(path).ok()?;
+    let mut head = String::new();
+    let _ = f.take(HEAD as u64).read_to_string(&mut head);
+    for line in head.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(text) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let t = text.trim();
+        if t.is_empty() || is_scaffold(t) {
+            continue;
+        }
+        let clipped: String = t.chars().take(72).collect();
+        return Some(clipped);
+    }
+    None
+}
+
 /// Every codex thread's display title from its registry (read-only, one
 /// query) — the names the user actually knows, including in-codex renames.
 fn codex_registry_titles() -> std::collections::HashMap<String, String> {
@@ -1501,6 +1576,13 @@ pub fn list_sessions(
                 && !t.is_empty()
             {
                 title = Some(t.clone());
+            }
+            // Claude keeps names in the session file itself: /rename appends a
+            // customTitle record (tail), and the first user message makes a
+            // serviceable auto-title (head). Bounded reads — never the whole
+            // transcript — so the default listing stays fast on big stores.
+            if fmt == SessionFormat::Claude && title.is_none() {
+                title = claude_quick_title(&path);
             }
             out.push(SessionSummary {
                 runtime: runtime.label(),

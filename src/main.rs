@@ -1127,7 +1127,7 @@ fn run_ps(rest: &[String]) -> Result<()> {
             .session_id
             .as_deref()
             .and_then(trail::naming_parts_for_session)
-            .map(|(n, h)| term_safe(&trail::clip(&format!("{n} \u{b7} {h}"), 44)));
+            .map(|(n, h, _)| term_safe(&trail::clip(&format!("{n} \u{b7} {h}"), 44)));
         let conversation = match &raw_label {
             Some(l) => format!("{bold}{:<44}{reset}", l),
             None => format!("{dim}{:<44}{reset}", "\u{2014}"),
@@ -1583,7 +1583,7 @@ fn run_status(rest: &[String]) -> Result<()> {
                 .map(|d| trail::ago(d.as_secs()))
                 .unwrap_or_default();
             let known = trail::naming_parts_for_session(&s.id)
-                .map(|(n, h)| {
+                .map(|(n, h, _)| {
                     format!(
                         "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
                         term_safe(&trail::clip(&n, 44)),
@@ -1715,7 +1715,7 @@ fn run_sessions(rest: &[String]) -> Result<()> {
                 .map(|d| trail::ago(d.as_secs()))
                 .unwrap_or_default();
             let label = trail::naming_parts_for_session(&s.id)
-                .map(|(n, h)| {
+                .map(|(n, h, _)| {
                     format!(
                         "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
                         term_safe(&trail::clip(&n, 44)),
