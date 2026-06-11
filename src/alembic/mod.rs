@@ -216,7 +216,7 @@ fn claude_quick_title(path: &Path) -> Option<String> {
     }
 
     // Head: first real user message as an auto-title.
-    let mut f = fs::File::open(path).ok()?;
+    let f = fs::File::open(path).ok()?;
     let mut head = String::new();
     let _ = f.take(HEAD as u64).read_to_string(&mut head);
     for line in head.lines() {
