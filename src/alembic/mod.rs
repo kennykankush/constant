@@ -1537,6 +1537,113 @@ pub fn version_validated(version: &str, supported: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// The newest released Constant version (e.g. "0.3.1"), live from GitHub's
+/// release API via the system `curl` (one standard GET, nothing sent).
+/// Quietly None when offline, curl is missing, opted out
+/// (CONSTANT_NO_UPDATE_CHECK), or anything else goes wrong. On success the
+/// result is cached (~/.constant/update-check.json) so `host` can show an
+/// update line INSTANTLY at startup without any network call.
+pub fn latest_release_version() -> Option<String> {
+    if std::env::var_os("CONSTANT_NO_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    let out = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "3",
+            "https://api.github.com/repos/kennykankush/constant/releases/latest",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let tag = v.get("tag_name")?.as_str()?;
+    let version = tag.trim_start_matches('v').trim();
+    if version.is_empty() {
+        return None;
+    }
+    write_update_cache(version);
+    Some(version.to_string())
+}
+
+fn update_cache_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".constant").join("update-check.json"))
+}
+
+fn write_update_cache(version: &str) {
+    let Some(path) = update_cache_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = serde_json::json!({ "checked_at": now, "latest": version }).to_string();
+    let _ = fs::write(&path, body);
+}
+
+/// Cache-only read of the last release check (instant, offline-safe, no TTL —
+/// for the host's startup line). None when never checked or opted out.
+pub fn cached_release_version() -> Option<String> {
+    if std::env::var_os("CONSTANT_NO_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    let text = fs::read_to_string(update_cache_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("latest")?.as_str().map(str::to_string)
+}
+
+/// The release check the host's background sweep uses: the cache when it's
+/// fresh (under ~20h old), a live refresh otherwise — so a machine that hosts
+/// constantly still asks GitHub at most about once a day.
+pub fn latest_release_refreshed() -> Option<String> {
+    if std::env::var_os("CONSTANT_NO_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    if let Ok(text) = fs::read_to_string(update_cache_path()?)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+        && let (Some(at), Some(latest)) = (
+            v.get("checked_at").and_then(serde_json::Value::as_u64),
+            v.get("latest").and_then(serde_json::Value::as_str),
+        )
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(at) < 20 * 60 * 60 {
+            return Some(latest.to_string());
+        }
+    }
+    latest_release_version()
+}
+
+/// Is `latest` strictly newer than `current`? Numeric dot-segment compare;
+/// a malformed segment counts as 0 (never panics on weird tags).
+pub fn version_newer(latest: &str, current: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| p.trim().parse().unwrap_or(0))
+            .collect()
+    };
+    let (l, c) = (parse(latest), parse(current));
+    for i in 0..l.len().max(c.len()) {
+        let a = l.get(i).copied().unwrap_or(0);
+        let b = c.get(i).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
 /// Installed-version preflight for one runtime: (version, validated).
 /// Runs the CLI's `--version` (subprocess) — call off the hot path.
 pub fn version_status(rt: Runtime) -> Option<(String, bool)> {
@@ -2269,6 +2376,18 @@ Exporting session: ses_x1"#;
         // Naive starts_with would wrongly accept these:
         assert!(!version_validated("0.1370.0", "0.137"));
         assert!(!version_validated("2.10.0", "2.1"));
+    }
+
+    #[test]
+    fn version_newer_compares_numerically() {
+        assert!(version_newer("0.3.1", "0.3.0"));
+        assert!(version_newer("0.10.0", "0.9.9"));
+        assert!(version_newer("1.0.0", "0.99.99"));
+        assert!(!version_newer("0.3.1", "0.3.1"));
+        assert!(!version_newer("0.3.0", "0.3.1"));
+        // Length differences and junk segments never panic.
+        assert!(version_newer("0.3.0.1", "0.3"));
+        assert!(!version_newer("x.y", "0.0.1"));
     }
 
     #[test]

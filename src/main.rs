@@ -1328,10 +1328,24 @@ fn run_doctor(rest: &[String]) -> Result<()> {
         }
     }
     let r = alembic::doctor();
+    // The one diagnostic that checks for a newer Constant (a single GitHub
+    // API GET; quietly skipped offline). Drift fixes ship as releases — this
+    // is how an existing install learns one exists.
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = alembic::latest_release_version();
+    let update = latest
+        .as_deref()
+        .filter(|l| alembic::version_newer(l, current))
+        .map(str::to_string);
     if json {
         println!(
             "{}",
             serde_json::json!({
+                "constant": {
+                    "version": current,
+                    "latest": latest,
+                    "update_available": update.is_some(),
+                },
                 "codex": {
                     "version": r.codex_version,
                     "supported": alembic::SUPPORTED_CODEX,
@@ -1359,6 +1373,13 @@ fn run_doctor(rest: &[String]) -> Result<()> {
     } else {
         let mark = |b: bool| if b { "ok" } else { "MISSING" };
         println!("constant doctor");
+        match (&update, &latest) {
+            (Some(u), _) => println!(
+                "  constant : {current} — v{u} AVAILABLE · brew upgrade kennykankush/constant/constant"
+            ),
+            (None, Some(_)) => println!("  constant : {current} (latest)"),
+            (None, None) => println!("  constant : {current} (release check skipped — offline?)"),
+        }
         println!(
             "  codex  : {} (cli {}, sessions {}, db {}) — validated against {}.x",
             r.codex_version.as_deref().unwrap_or("not found"),

@@ -209,8 +209,10 @@ enum Ev {
     Pty(Vec<u8>),
     PtyClosed,
     Resize,
-    /// Background installed-version preflight: (runtime, version, validated).
-    Versions(Vec<(Runtime, String, bool)>),
+    /// Background installed-version preflight: (runtime, version, validated),
+    /// plus a newer Constant release when one exists (checked ONLY when some
+    /// runtime is unvalidated — drift detected — never in the happy path).
+    Versions(Vec<(Runtime, String, bool)>, Option<String>),
 }
 
 struct Session {
@@ -1007,6 +1009,19 @@ pub fn run(
         }
     };
     banner(&mut out, session.runtime, &prefix_label);
+    // The claude-code-style "update is ready" line at startup: read from the
+    // LAST check's cache — instant, offline-safe, never blocks the launch.
+    // (The background sweep below refreshes the cache, at most ~once a day.)
+    if let Some(latest) = crate::alembic::cached_release_version()
+        && crate::alembic::version_newer(&latest, env!("CARGO_PKG_VERSION"))
+    {
+        dim(
+            &mut out,
+            &format!(
+                "constant v{latest} is available — brew upgrade kennykankush/constant/constant"
+            ),
+        );
+    }
 
     let mut mode = M_NORMAL;
     let mut cmd_buf = String::new();
@@ -1034,7 +1049,11 @@ pub fn run(
             .into_iter()
             .filter_map(|rt| crate::alembic::version_status(rt).map(|(ver, ok)| (rt, ver, ok)))
             .collect();
-            let _ = tx.send(Ev::Versions(v));
+            // Refresh the release cache (live at most ~once a day, else the
+            // cached answer) so the startup line and drift notices stay true.
+            let update = crate::alembic::latest_release_refreshed()
+                .filter(|l| crate::alembic::version_newer(l, env!("CARGO_PKG_VERSION")));
+            let _ = tx.send(Ev::Versions(v, update));
         });
     }
 
@@ -1118,7 +1137,7 @@ pub fn run(
                 }
             }
 
-            Ev::Versions(list) => {
+            Ev::Versions(list, update) => {
                 for (rt, ver, ok) in list {
                     versions.insert(rt, (ver, ok));
                 }
@@ -1126,11 +1145,25 @@ pub fn run(
                     .get(&session.runtime)
                     .map(|(v, ok)| (v.clone(), *ok))
                 {
+                    let fix = match &update {
+                        Some(u) => {
+                            format!(" \u{b7} constant v{u} is out \u{2014} brew upgrade")
+                        }
+                        None => " \u{b7} carries may misbehave".to_string(),
+                    };
                     bar_notice = Some((
                         format!(
-                            " \u{26a0} {} {ver} unvalidated (codec validated against {}.x) \u{b7} carries may misbehave ",
+                            " \u{26a0} {} {ver} unvalidated (codec validated against {}.x){fix} ",
                             session.runtime.label(),
                             supported_line(session.runtime),
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                    bar_dirty = bar;
+                } else if let Some(u) = &update {
+                    bar_notice = Some((
+                        format!(
+                            " \u{2191} constant v{u} is available \u{b7} brew upgrade kennykankush/constant/constant "
                         ),
                         std::time::Instant::now(),
                     ));
