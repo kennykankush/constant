@@ -3,6 +3,11 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.3]
+
+Maintenance release with no functional changes — cut to verify the update
+doorbell end to end on a live install.
+
 ## [0.3.2] - The doorbell
 
 How an existing install learns an update exists — at every door, the way
