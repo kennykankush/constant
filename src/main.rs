@@ -7,6 +7,7 @@
 mod alembic;
 mod host;
 mod live;
+mod picker;
 mod runtime;
 mod trail;
 
@@ -667,6 +668,30 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     } else {
         std::env::current_dir().ok()
     };
+    // No query, interactive terminal → the picker: every session in scope,
+    // type-to-search, Enter wakes it hosted. (Non-TTY and explicit queries
+    // keep the scriptable paths below.)
+    if query.is_none()
+        && !list
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        let Some(choice) = picker::pick(cwd.clone())? else {
+            return Ok(());
+        };
+        let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
+        maybe_offer_update();
+        return host::run(
+            choice.runtime,
+            Some(&choice.id),
+            with_tools,
+            bar,
+            paged,
+            prefix_byte,
+            prefix_label,
+        );
+    }
+
     let convs = trail::conversations(cwd.as_deref());
     if convs.is_empty() {
         let scope = if all {
@@ -1836,9 +1861,10 @@ fn print_help() {
         A status bar lives on the bottom row; --no-bar disables it.{reset}
 
   {bold}constant resume{reset} [QUERY] {dim}[--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
-        {dim}Re-host a conversation from the trail: wakes its latest projection live.
-        No QUERY = the newest conversation here; QUERY matches a handle, name,
-        or id. If every projection is gone, reprints from the record first.{reset}
+        {dim}No QUERY (in a terminal): an interactive picker over every session
+        in scope \u{2014} type to search, \u{2191}\u{2193} browse, Tab widens to everywhere,
+        Enter wakes it hosted. With QUERY: matches a handle, name, or id from
+        the trail. If every projection is gone, reprints from the record.{reset}
 
 {dim}CARRY{reset}
   {bold}constant carry{reset} --to codex|claude|opencode {dim}[--from RT | --session PATH_OR_ID]
