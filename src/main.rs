@@ -229,6 +229,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let mut new = false;
     let mut with_tools = false;
     let mut paged = false;
+    let mut tail_budget = alembic::render::TAIL_BUDGET_CHARS;
 
     let mut i = 0;
     while i < rest.len() {
@@ -243,6 +244,12 @@ fn run_carry(rest: &[String]) -> Result<()> {
                     "full" => false,
                     other => bail!("unknown render mode: {other} (full|paged)"),
                 };
+                i += 2;
+            }
+            "--tail" => {
+                tail_budget = flag_value(rest, i, "--tail")?
+                    .parse()
+                    .context("--tail takes a character budget, e.g. --tail 8000")?;
                 i += 2;
             }
             "--from" => {
@@ -421,7 +428,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             from_rt.label(),
             to.label(),
             anchor.as_deref(),
-            alembic::render::TAIL_BUDGET_CHARS,
+            tail_budget,
         );
         distilled.receipt.indexed = stats.indexed;
         receipt_json["indexed"] = serde_json::json!(stats.indexed);
