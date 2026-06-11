@@ -1149,7 +1149,7 @@ pub fn latest_snapshot(conv_id: &str) -> Option<PathBuf> {
 /// ledger knows about, grouped by conversation. A volume the ledger doesn't
 /// reference is effectively lost in the archive, so this lists from the
 /// ledger and marks files that have since gone missing.
-pub fn print_snapshots(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
+pub fn print_snapshots(cwd_filter: Option<&Path>, full: bool) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
     let entries: Vec<TrailEntry> = load_entries(cwd_filter)
@@ -1179,30 +1179,42 @@ pub fn print_snapshots(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
             .push(entry);
     }
 
+    let a = ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+    let all_entries = load_entries(None);
+
     for conv in order {
         let rows = groups.get_mut(&conv).unwrap();
         rows.sort_by_key(|e| (e.ts, e.n));
-        let display = crate::term_safe(
-            rows.iter()
-                .find(|e| e.slug != "?")
-                .map(|e| e.slug.as_str())
-                .unwrap_or(conv.as_str()),
-        );
+        let slug = rows
+            .iter()
+            .find(|e| e.slug != "?")
+            .map(|e| e.slug.clone())
+            .unwrap_or_else(|| conv.clone());
+        let naming = naming_from_entries(&all_entries, &conv, &slug, None);
         let cwd = crate::term_safe(rows.first().and_then(|e| e.cwd.as_deref()).unwrap_or(""));
-        println!("\nconversation: {display}   ({cwd})");
+
+        println!();
+        println!(
+            "  {bold}{}{reset} {}  {dim}({cwd}){reset}",
+            crate::term_safe(&naming.handle),
+            clip(&crate::term_safe(&naming.name), 56)
+        );
         for e in rows.iter() {
             let snap = e.snapshot.as_deref().unwrap_or("");
-            let status = if Path::new(snap).exists() {
-                "ok     "
-            } else {
-                "missing"
-            };
-            println!(
-                "  ch{:02}  from {:<6}  {status}  {}",
+            let exists = Path::new(snap).exists();
+            let status = if exists { "ok" } else { "missing" };
+            let color = if a.tty { runtime_paint(&e.from) } else { "" };
+            print!(
+                "    ch{:02} \u{2190} {color}{}{reset}   {status:<7} {dim}{}{reset}",
                 e.n,
                 crate::term_safe(&e.from),
-                crate::term_safe(snap)
+                ago(e.ts)
             );
+            if full {
+                print!("  {dim}{}{reset}", crate::term_safe(snap));
+            }
+            println!();
         }
         if let Some(last) = rows.iter().rev().find(|e| {
             e.snapshot
@@ -1211,10 +1223,13 @@ pub fn print_snapshots(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
                 .unwrap_or(false)
         }) {
             println!(
-                "  restore latest: constant restore {}",
+                "    {dim}\u{21b3} constant restore {}{reset}",
                 crate::term_safe(last.snapshot.as_deref().unwrap_or(""))
             );
         }
+    }
+    if !full {
+        println!("\n{dim}volume paths: constant snapshots --full{reset}");
     }
     Ok(())
 }
@@ -1243,11 +1258,13 @@ pub fn print_routes(
         return Ok(());
     }
 
+    let a = ansi();
+    let (dim, reset) = (a.dim, a.reset);
     for conv in views {
         let cwd = crate::term_safe(conv.cwd.as_deref().unwrap_or(""));
         let display = crate::term_safe(&conv.slug);
         let root = crate::term_safe(&conv.conversation);
-        println!("\nconversation: {display}   ({cwd})");
+        println!("\nconversation: {display}   {dim}({cwd}){reset}");
         println!(
             "  root: {}  {} {}",
             crate::term_safe(&conv.root_alias),
@@ -1279,10 +1296,10 @@ pub fn print_routes(
                 crate::term_safe(&node.mode)
             );
             if !node.title.is_empty() {
-                println!("       title: {}", crate::term_safe(&node.title));
+                println!("       {dim}title: {}{reset}", clip(&crate::term_safe(&node.title), 64));
             }
             if !node.path.is_empty() {
-                println!("       path: {}", crate::term_safe(&node.path));
+                println!("       {dim}path: {}{reset}", crate::term_safe(&node.path));
             }
             println!(
                 "       resume: {}",
@@ -1346,8 +1363,28 @@ pub fn print_carry_debug(
 /// ledger. This is the user-facing view: one target runtime projection per
 /// conversation, with a refresh count when the same projection was updated more
 /// than once.
+/// ANSI styling for views, gated on stdout being a terminal (piped output
+/// stays plain for scripts and tests).
+pub(crate) struct Ansi {
+    pub dim: &'static str,
+    pub bold: &'static str,
+    pub reset: &'static str,
+    pub tty: bool,
+}
+
+pub(crate) fn ansi() -> Ansi {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    Ansi {
+        dim: if tty { "\x1b[2m" } else { "" },
+        bold: if tty { "\x1b[1m" } else { "" },
+        reset: if tty { "\x1b[0m" } else { "" },
+        tty,
+    }
+}
+
 /// Relative age for the compact trail view ("3d ago", "2h ago", "just now").
-fn ago(ts: u64) -> String {
+pub(crate) fn ago(ts: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1363,7 +1400,7 @@ fn ago(ts: u64) -> String {
 }
 
 /// Clip a name to `max` display chars with an ellipsis.
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -1371,7 +1408,7 @@ fn clip(s: &str, max: usize) -> String {
     format!("{cut}\u{2026}")
 }
 
-fn runtime_paint(runtime: &str) -> &'static str {
+pub(crate) fn runtime_paint(runtime: &str) -> &'static str {
     match runtime {
         "claude" => "\x1b[38;5;208m",
         "codex" => "\x1b[38;5;39m",
@@ -1386,7 +1423,6 @@ fn runtime_paint(runtime: &str) -> &'static str {
 /// and the one command that matters. Ids, native resume commands, and stamped
 /// titles live under `--full`; the raw ledger under `--events`.
 pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
-    use std::io::IsTerminal;
     let mut views = conversations(cwd_filter);
     let want_cwd = cwd_filter.map(|p| p.display().to_string());
     if views.is_empty() {
@@ -1401,10 +1437,8 @@ pub fn print(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
     }
     views.sort_by_key(|v| std::cmp::Reverse(v.last_ts));
 
-    let tty = std::io::stdout().is_terminal();
-    let dim = if tty { "\x1b[2m" } else { "" };
-    let bold = if tty { "\x1b[1m" } else { "" };
-    let reset = if tty { "\x1b[0m" } else { "" };
+    let a = ansi();
+    let (tty, dim, bold, reset) = (a.tty, a.dim, a.bold, a.reset);
 
     match &want_cwd {
         Some(c) => println!(
@@ -1540,31 +1574,58 @@ pub fn print_full(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
 }
 
 pub fn print_status(cwd_filter: Option<&Path>) -> anyhow::Result<()> {
-    let views = conversations(cwd_filter);
+    let mut views = conversations(cwd_filter);
     if views.is_empty() {
         println!("trail: none");
         return Ok(());
     }
+    views.sort_by_key(|v| std::cmp::Reverse(v.last_ts));
+    let a = ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
 
     println!("trail:");
+    let handle_w = views
+        .iter()
+        .take(3)
+        .map(|v| v.handle.chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(8);
     for conv in views.iter().take(3) {
-        let root = crate::term_safe(&conv.conversation);
-        println!("  conversation {root}");
-        for p in &conv.projections {
-            println!(
-                "    {:<6} {}  {}",
-                crate::term_safe(&p.runtime),
-                crate::term_safe(&p.id),
-                if p.refreshes > 1 {
-                    format!("synced {}x", p.refreshes)
+        let chain = conv
+            .projections
+            .iter()
+            .map(|p| {
+                let color = if a.tty { runtime_paint(&p.runtime) } else { "" };
+                let times = if p.refreshes > 1 {
+                    format!(" \u{d7}{}", p.refreshes)
                 } else {
-                    "synced 1x".to_string()
-                }
-            );
-        }
+                    String::new()
+                };
+                format!(
+                    "{color}{}{reset} {dim}ch{:02}{times}{reset}",
+                    crate::term_safe(&p.runtime),
+                    p.last_n
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(&format!(" {dim}\u{2192}{reset} "));
+        println!(
+            "  {bold}{:<handle_w$}{reset} {:<42} {}",
+            crate::term_safe(&conv.handle),
+            clip(&crate::term_safe(&conv.name), 40),
+            if chain.is_empty() {
+                format!("{dim}no live projections{reset}")
+            } else {
+                chain
+            }
+        );
     }
     if views.len() > 3 {
-        println!("  ... {} more (`constant trail --all`)", views.len() - 3);
+        println!(
+            "  {dim}\u{2026} {} more (`constant trail`){reset}",
+            views.len() - 3
+        );
     }
     Ok(())
 }

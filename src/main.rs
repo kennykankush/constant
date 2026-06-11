@@ -1066,26 +1066,35 @@ fn run_ps(rest: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    println!("live agent sessions ({}):", agents.len());
+    let a_style = trail::ansi();
+    let (dim, bold, reset) = (a_style.dim, a_style.bold, a_style.reset);
+    println!("{dim}{} live agent session{}{reset}", agents.len(), if agents.len() == 1 { "" } else { "s" });
+    println!();
     let home = std::env::var("HOME").unwrap_or_default();
     for a in &agents {
-        let conversation = a
+        let color = if a_style.tty {
+            trail::runtime_paint(a.runtime.label())
+        } else {
+            ""
+        };
+        // Pad BEFORE styling: escape codes inside a width spec break columns.
+        let raw_label = a
             .session_id
             .as_deref()
             .and_then(trail::label_for_session)
-            .unwrap_or_else(|| "-".to_string());
+            .map(|l| term_safe(&trail::clip(&l, 44)));
+        let conversation = match &raw_label {
+            Some(l) => format!("{bold}{:<44}{reset}", l),
+            None => format!("{dim}{:<44}{reset}", "\u{2014}"),
+        };
         let session = a
             .session_id
             .as_deref()
             .map(|id| {
-                if id.chars().count() > 14 {
-                    let head: String = id.chars().take(12).collect();
-                    format!("{head}\u{2026}")
-                } else {
-                    id.to_string()
-                }
+                let head: String = id.chars().take(8).collect();
+                format!("{head}\u{2026}")
             })
-            .unwrap_or_else(|| "(session unknown)".to_string());
+            .unwrap_or_else(|| "fresh".to_string());
         let cwd = a
             .cwd
             .as_deref()
@@ -1098,10 +1107,9 @@ fn run_ps(rest: &[String]) -> Result<()> {
             })
             .unwrap_or_default();
         println!(
-            "  {:<9} {:>12}  {:<30} {:<16} {}",
+            "  {color}{:<9}{reset} {dim}{:>12}{reset}  {dim}{:<10}{reset} {conversation} {dim}{}{reset}",
             a.runtime.label(),
             term_safe(&a.up),
-            term_safe(&conversation),
             term_safe(&session),
             term_safe(&cwd),
         );
@@ -1251,9 +1259,11 @@ fn parse_turn_range(s: &str) -> Option<(usize, usize)> {
 
 fn run_snapshots(rest: &[String]) -> Result<()> {
     let mut all = false;
+    let mut full = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
+            "--full" => full = true,
             other => bail!("unknown flag: {other}"),
         }
     }
@@ -1262,7 +1272,7 @@ fn run_snapshots(rest: &[String]) -> Result<()> {
     } else {
         std::env::current_dir().ok()
     };
-    trail::print_snapshots(cwd.as_deref())
+    trail::print_snapshots(cwd.as_deref(), full)
 }
 
 /// A restore's outcome: the freshly minted projection and where it came from.
@@ -1503,6 +1513,8 @@ fn run_status(rest: &[String]) -> Result<()> {
     println!();
     trail::print_status(cwd.as_deref())?;
 
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
     println!("\nlatest sessions:");
     for rt in [
         Runtime::Codex,
@@ -1513,10 +1525,23 @@ fn run_status(rest: &[String]) -> Result<()> {
         // Keep `status` cheap and privacy-minimal: no transcript reads here.
         // Use `constant sessions --titles` when the prompt-derived title is wanted.
         let sessions = alembic::list_sessions(rt, cwd.as_deref(), false);
+        let color = if a.tty { trail::runtime_paint(rt.label()) } else { "" };
         if let Some(s) = sessions.first() {
-            println!("  {:<6} {}", s.runtime, term_safe(&s.id));
+            let age = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| trail::ago(d.as_secs()))
+                .unwrap_or_default();
+            let known = trail::label_for_session(&s.id)
+                .map(|l| format!("  {bold}{}{reset}", term_safe(&trail::clip(&l, 48))))
+                .unwrap_or_default();
+            println!(
+                "  {color}{:<8}{reset} {dim}{}{reset}  {dim}{age}{reset}{known}",
+                s.runtime,
+                term_safe(&s.id)
+            );
         } else {
-            println!("  {:<6} none", rt.label());
+            println!("  {color}{:<8}{reset} {dim}none{reset}", rt.label());
         }
     }
     Ok(())
@@ -1594,17 +1619,33 @@ fn run_sessions(rest: &[String]) -> Result<()> {
         };
         println!("no sessions found{scope}");
     } else {
+        let a = trail::ansi();
+        let (dim, bold, reset) = (a.dim, a.bold, a.reset);
         for s in &sessions {
             // `·` marks a session known to be empty (only determinable with --titles).
             let mark = match s.has_conversation {
-                Some(false) => "·",
+                Some(false) => "\u{b7}",
                 _ => " ",
             };
+            let color = if a.tty { trail::runtime_paint(s.runtime) } else { "" };
+            let age = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| trail::ago(d.as_secs()))
+                .unwrap_or_default();
+            let label = trail::label_for_session(&s.id)
+                .map(|l| format!("  {bold}{}{reset}", term_safe(&trail::clip(&l, 48))))
+                .unwrap_or_default();
+            let title = s
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("  {}", term_safe(&trail::clip(t, 56))))
+                .unwrap_or_default();
             println!(
-                "{mark} {:6}  {}  {}",
+                "{mark} {color}{:<8}{reset} {} {dim}{age:>8}{reset}{label}{title}",
                 s.runtime,
-                term_safe(&s.id),
-                term_safe(s.title.as_deref().unwrap_or(""))
+                term_safe(&s.id)
             );
         }
     }

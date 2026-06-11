@@ -467,9 +467,10 @@ fn clear_bottom(out: &mut impl Write) {
 }
 
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
+    let color = runtime_color(runtime.label());
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  t=trail  :=command  d=quit\x1b[0m\r\n",
+        "\x1b[2m  constant \u{b7} hosting \x1b[0m{color}{}\x1b[0m\x1b[2m \u{b7} {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  t=trail  :=command  d=quit\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();

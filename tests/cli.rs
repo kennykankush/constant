@@ -1667,7 +1667,7 @@ fn carry_writes_a_record_volume_and_restore_reprints_it() {
     assert!(ls_out.contains("ch01"), "listing missing the volume: {ls_out}");
     assert!(ls_out.contains("ok"), "volume not marked ok: {ls_out}");
     assert!(
-        ls_out.contains("restore latest:"),
+        ls_out.contains("constant restore"),
         "listing missing restore hint: {ls_out}"
     );
 
