@@ -35,6 +35,10 @@ const M_COMMAND: u8 = 2;
 /// toggled from prefix mode. Child output is dropped while open — the child
 /// repaints on exit via a resize wiggle.
 const M_VIEW: u8 = 3;
+/// The switch-time render prompt: `[v]erbatim · [c]ompact` in the bottom row.
+/// Entered only when the host was launched without an explicit --render AND
+/// the source thread is long enough that the answer changes anything.
+const M_RENDER: u8 = 4;
 
 // Largest escape sequence we'll buffer before giving up and flushing it as-is,
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
@@ -226,6 +230,10 @@ struct Session {
 struct SwitchRequest {
     target: Runtime,
     new: bool,
+    /// Lay the target's desk paged (index + verbatim tail + arrival card)
+    /// instead of the full verbatim pile — per-switch, decided at the prompt
+    /// or inherited from the launch flag.
+    paged: bool,
 }
 
 enum SpawnMode<'a> {
@@ -322,6 +330,7 @@ fn terminate(child: &mut Box<dyn Child + Send + Sync>) {
 fn request_switch(
     target: Runtime,
     new: bool,
+    paged: bool,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) {
@@ -334,7 +343,38 @@ fn request_switch(
     // Termination is deferred to the carry gate at the end of the input
     // tick: a CONTINUE switch with nothing to carry is cancelled there
     // instead of tearing the child down for an empty target.
-    *switching_to = Some(SwitchRequest { target, new });
+    *switching_to = Some(SwitchRequest { target, new, paged });
+}
+
+/// Should the `[v]erbatim · [c]ompact` prompt appear for this switch? Only
+/// when the choice changes anything: below the tail budget the paged desk
+/// keeps the whole thread verbatim anyway, so short conversations switch
+/// without a question. Unknown source: no prompt (the carry gate may cancel
+/// the switch regardless).
+const RENDER_PROMPT_MIN_BYTES: u64 = 48 * 1024;
+
+fn source_worth_prompting(
+    runtime: Runtime,
+    declared: Option<&str>,
+    owned: &std::collections::HashMap<Runtime, (String, std::path::PathBuf)>,
+    host_cwd: Option<&std::path::Path>,
+    spawned_at: std::time::SystemTime,
+) -> bool {
+    let path = declared
+        .and_then(|id| crate::alembic::session_by_id(runtime, id))
+        .map(|(p, _)| p)
+        .or_else(|| {
+            owned
+                .get(&runtime)
+                .map(|(_, p)| p.clone())
+                .filter(|p| p.exists())
+        })
+        .or_else(|| {
+            crate::alembic::active_session(runtime, host_cwd, Some(spawned_at)).map(|(p, _)| p)
+        });
+    path.and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() >= RENDER_PROMPT_MIN_BYTES)
+        .unwrap_or(false)
 }
 
 /// One dim parenthetical status line.
@@ -429,6 +469,7 @@ enum Action {
 
 fn execute_command(
     line: &str,
+    paged: bool,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) -> Action {
@@ -436,13 +477,13 @@ fn execute_command(
     match parts.as_slice() {
         ["switch", rt] | ["s", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, false, session, switching_to);
+                request_switch(target, false, paged, session, switching_to);
             }
             Action::None
         }
         ["new", rt] | ["n", rt] | ["fork", rt] | ["switch", "--new", rt] | ["s", "--new", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, true, session, switching_to);
+                request_switch(target, true, paged, session, switching_to);
             }
             Action::None
         }
@@ -875,10 +916,13 @@ pub fn run(
     resume: Option<&str>,
     with_tools: bool,
     bar: bool,
-    paged: bool,
+    render: Option<bool>,
     prefix: u8,
     prefix_label: String,
 ) -> Result<()> {
+    // None = no --render flag at launch: long-thread switches ask
+    // [v]erbatim · [c]ompact; Some(_) = explicit, never second-guessed.
+    let default_paged = render.unwrap_or(false);
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("`constant host` must run in an interactive terminal (a TTY)");
     }
@@ -1043,6 +1087,10 @@ pub fn run(
     let mut typed_tail: Vec<u8> = Vec::new();
     let mut resumed_away = false;
     let mut pending_out: Vec<u8> = Vec::new();
+    // The render prompt's pending switch + its overlay line (redrawn if a
+    // chatty child floods the bottom row while the question is up).
+    let mut pending_switch: Option<(Runtime, bool)> = None;
+    let mut render_prompt = String::new();
     // Installed-version preflight, off the hot path (each `--version` is a
     // subprocess). An unvalidated runtime gets a warning in the bar the moment
     // the sweep lands — doctor's quiet knowledge, surfaced where it matters.
@@ -1126,7 +1174,7 @@ pub fn run(
                     // on exit via the resize wiggle; buffering would duplicate.
                     continue;
                 }
-                if mode == M_COMMAND {
+                if mode == M_COMMAND || mode == M_RENDER {
                     // Bounded: a chatty child while the user sits in the command
                     // line must not grow memory forever. Past the cap, flush
                     // through and redraw the prompt (a flicker beats a leak).
@@ -1136,7 +1184,11 @@ pub fn run(
                         pending_out.clear();
                         let _ = out.write_all(&bytes);
                         let _ = out.flush();
-                        bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                        if mode == M_RENDER {
+                            bottom_overlay(&mut out, &render_prompt);
+                        } else {
+                            bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                        }
                     } else {
                         pending_out.extend_from_slice(&bytes);
                     }
@@ -1307,7 +1359,7 @@ pub fn run(
                                     }
                                 });
 
-                            if paged {
+                            if request.paged {
                                 // The desk layout: the record above holds the FULL
                                 // thread; the projection wakes the target on head
                                 // card + index + verbatim tail. Index addresses
@@ -1614,43 +1666,14 @@ pub fn run(
                             if matches!(tok, Token::Prefix) {
                                 passthrough.push(prefix); // literal prefix to child
                             } else {
+                                let mut want: Option<(Runtime, bool)> = None;
                                 match command_key(&tok) {
-                                    Some(b'c') => request_switch(
-                                        Runtime::Claude,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'C') => request_switch(
-                                        Runtime::Claude,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'x') => request_switch(
-                                        Runtime::Codex,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'X') => request_switch(
-                                        Runtime::Codex,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'o') => request_switch(
-                                        Runtime::OpenCode,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'O') => request_switch(
-                                        Runtime::OpenCode,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
+                                    Some(b'c') => want = Some((Runtime::Claude, false)),
+                                    Some(b'C') => want = Some((Runtime::Claude, true)),
+                                    Some(b'x') => want = Some((Runtime::Codex, false)),
+                                    Some(b'X') => want = Some((Runtime::Codex, true)),
+                                    Some(b'o') => want = Some((Runtime::OpenCode, false)),
+                                    Some(b'O') => want = Some((Runtime::OpenCode, true)),
                                     Some(b'g') | Some(b'G') => dim(
                                         &mut out,
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
@@ -1688,6 +1711,76 @@ pub fn run(
                                         bottom_overlay(&mut out, " constant ▸ ");
                                     }
                                     _ => {} // unknown: ignore
+                                }
+                                if let Some((rt, fork)) = want {
+                                    let blocked = rt == session.runtime
+                                        || switching_to.is_some()
+                                        || !crate::alembic::supports_target(rt);
+                                    if !blocked
+                                        && render.is_none()
+                                        && source_worth_prompting(
+                                            session.runtime,
+                                            child_session.as_deref(),
+                                            &owned,
+                                            host_cwd.as_deref(),
+                                            child_spawned_at,
+                                        )
+                                    {
+                                        // Long thread, no launch flag: ask how
+                                        // the next desk should be laid out.
+                                        mode = M_RENDER;
+                                        pending_switch = Some((rt, fork));
+                                        let action = if fork { "new" } else { "continue" };
+                                        render_prompt = format!(
+                                            " constant \u{25b8} {action} in {} \u{b7} [v]erbatim \u{b7} [c]ompact (older turns filed, recallable) \u{b7} esc ",
+                                            rt.label()
+                                        );
+                                        bottom_overlay(&mut out, &render_prompt);
+                                    } else {
+                                        request_switch(
+                                            rt,
+                                            fork,
+                                            default_paged,
+                                            &mut session,
+                                            &mut switching_to,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        M_RENDER => {
+                            // One decisive key; unknown keys keep the prompt up,
+                            // esc (either encoding) cancels with the child untouched.
+                            let key = command_key(&tok);
+                            let mut decided: Option<bool> = None;
+                            let mut cancel = matches!(tok, Token::Prefix);
+                            match key {
+                                Some(b'v') | Some(b'V') | Some(0x0d) | Some(0x0a) => {
+                                    decided = Some(false)
+                                }
+                                Some(b'c') | Some(b'C') => decided = Some(true),
+                                Some(0x1b) | Some(b'q') | Some(0x03) => cancel = true,
+                                _ => {}
+                            }
+                            if decided.is_some() || cancel {
+                                clear_bottom(&mut out);
+                                mode = M_NORMAL;
+                                bar_dirty = bar;
+                                if !pending_out.is_empty() {
+                                    let _ = out.write_all(&pending_out);
+                                    let _ = out.flush();
+                                    pending_out.clear();
+                                }
+                                match (decided, pending_switch.take()) {
+                                    (Some(paged), Some((rt, fork))) => request_switch(
+                                        rt,
+                                        fork,
+                                        paged,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    _ => pending_switch = None,
                                 }
                             }
                         }
@@ -1804,6 +1897,7 @@ pub fn run(
                                     hist_ix = None;
                                     match execute_command(
                                         cmd_buf.trim(),
+                                        default_paged,
                                         &mut session,
                                         &mut switching_to,
                                     ) {
@@ -1899,7 +1993,7 @@ pub fn run(
                             if let Some((rt, fork)) = switch_to {
                                 leave_view(&mut out, &mut view_alt, &mut view_buf);
                                 mode = M_NORMAL;
-                                request_switch(rt, fork, &mut session, &mut switching_to);
+                                request_switch(rt, fork, default_paged, &mut session, &mut switching_to);
                             }
                             if close {
                                 mode = M_NORMAL;

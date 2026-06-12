@@ -80,7 +80,8 @@ fn run_host(rest: &[String]) -> Result<()> {
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
     let mut with_tools = false;
     let mut bar = true;
-    let mut paged = false;
+    // None = no flag: long-thread switches ask [v]erbatim · [c]ompact.
+    let mut render: Option<bool> = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -97,9 +98,9 @@ fn run_host(rest: &[String]) -> Result<()> {
                 i += 1;
             }
             "--render" => {
-                paged = match flag_value(rest, i, "--render")?.as_str() {
-                    "paged" => true,
-                    "full" => false,
+                render = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => Some(true),
+                    "full" => Some(false),
                     other => bail!("unknown render mode: {other} (full|paged)"),
                 };
                 i += 2;
@@ -123,7 +124,7 @@ fn run_host(rest: &[String]) -> Result<()> {
         None,
         with_tools,
         bar,
-        paged,
+        render,
         prefix_byte,
         prefix_label,
     )
@@ -768,7 +769,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     let mut list = false;
     let mut with_tools = false;
     let mut bar = true;
-    let mut paged = false;
+    let mut render: Option<bool> = None;
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
 
     let mut i = 0;
@@ -779,9 +780,9 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
                 i += 1;
             }
             "--render" => {
-                paged = match flag_value(rest, i, "--render")?.as_str() {
-                    "paged" => true,
-                    "full" => false,
+                render = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => Some(true),
+                    "full" => Some(false),
                     other => bail!("unknown render mode: {other} (full|paged)"),
                 };
                 i += 2;
@@ -840,7 +841,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
             Some(&choice.id),
             with_tools,
             bar,
-            paged,
+            render,
             prefix_byte,
             prefix_label,
         );
@@ -948,7 +949,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         println!("{n}");
     }
     maybe_offer_update();
-    host::run(rt, Some(&id), with_tools, bar, paged, prefix_byte, prefix_label)
+    host::run(rt, Some(&id), with_tools, bar, render, prefix_byte, prefix_label)
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
@@ -2038,9 +2039,11 @@ fn print_help() {
 {bold}constant{reset} \u{2014} one conversation, any agent runtime.
 
 {dim}LIVE{reset}
-  {bold}constant host{reset} [codex|claude|opencode] {dim}[--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
+  {bold}constant host{reset} [codex|claude|opencode] {dim}[--prefix C-t] [--with-tools] [--no-bar] [--render full|paged]{reset}
         {dim}Host an agent CLI in a Constant PTY (default: codex, prefix: Ctrl-B).
-        A status bar lives on the bottom row; --no-bar disables it.{reset}
+        A status bar lives on the bottom row; --no-bar disables it.
+        No --render flag: switching a LONG thread asks [v]erbatim \u{b7} [c]ompact
+        (compact files older turns in the record \u{2014} recallable, never lost).{reset}
 
   {bold}constant resume{reset} [QUERY] {dim}[--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
         {dim}No QUERY (in a terminal): an interactive picker over every session
@@ -2104,6 +2107,7 @@ fn print_help() {
   {bold}c{reset} / {bold}C{reset}        {dim}continue in{reset} {claude} {dim}/ new continuation{reset}
   {bold}x{reset} / {bold}X{reset}        {dim}continue in{reset} {codex} {dim}/ new continuation{reset}
   {bold}o{reset} / {bold}O{reset}        {dim}continue in{reset} {opencode} {dim}/ new continuation{reset}
+               {dim}(a long thread asks first: [v]erbatim \u{b7} [c]ompact \u{b7} esc){reset}
   {bold}t{reset}            {dim}toggle the trail graph (switch from inside it; r = rename){reset}
   {bold}:{reset}            {dim}command line \u{2014} switch/new/rename/quit, Tab completes, \u{2191}\u{2193} history{reset}
   {bold}d{reset}            {dim}quit (the hosted CLI exits with it){reset}
