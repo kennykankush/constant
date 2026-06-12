@@ -1902,9 +1902,10 @@ fn print_help() {
 
   {bold}constant resume{reset} [QUERY] {dim}[--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
         {dim}No QUERY (in a terminal): an interactive picker over every session
-        in scope \u{2014} type to search, \u{2191}\u{2193} browse, Tab widens to everywhere,
-        Enter wakes it hosted. With QUERY: matches a handle, name, or id from
-        the trail. If every projection is gone, reprints from the record.{reset}
+        in scope \u{2014} type to search, \u{2191}\u{2193} browse, Tab toggles folder/everywhere,
+        Ctrl-T narrows to constant conversations, Enter wakes it hosted.
+        With QUERY: matches a handle, name, or id from the trail. If every
+        projection is gone, reprints from the record.{reset}
 
 {dim}CARRY{reset}
   {bold}constant carry{reset} --to codex|claude|opencode {dim}[--from RT | --session PATH_OR_ID]

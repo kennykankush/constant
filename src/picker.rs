@@ -100,39 +100,48 @@ pub fn filter<'a>(entries: &'a [PickEntry], query: &str) -> Vec<&'a PickEntry> {
         .collect()
 }
 
-/// The picker's scope: this folder, every folder, or only conversations the
-/// Constant trail knows (handles, chapters, the record).
+/// WHERE the picker looks: this folder or every folder. Orthogonal to the
+/// trail lens — place and lens are two axes, not one cycle.
 #[derive(Clone, Copy, PartialEq)]
-enum Scope {
+enum Place {
     Cwd,
     All,
-    Trail,
+}
+
+/// The picker's scope: a place (Tab toggles) plus the constant lens (Ctrl-T)
+/// that narrows whichever place you're in to conversations the trail knows.
+#[derive(Clone, Copy, PartialEq)]
+struct Scope {
+    place: Place,
+    constant_only: bool,
 }
 
 fn load(scope: Scope, cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
-    match scope {
-        Scope::Cwd => entries(cwd),
-        Scope::All => entries(None),
-        Scope::Trail => {
-            let mut v = entries(None);
-            v.retain(|e| e.known);
-            v
-        }
+    let mut v = match scope.place {
+        Place::Cwd => entries(cwd),
+        Place::All => entries(None),
+    };
+    if scope.constant_only {
+        v.retain(|e| e.known);
     }
+    v
 }
 
 /// Run the picker. Returns the chosen entry, or None on cancel.
-/// `start_cwd` seeds the [folder] scope; Tab cycles folder → everywhere →
-/// constant trail.
+/// `start_cwd` seeds the [folder] place; Tab toggles folder ↔ everywhere,
+/// Ctrl-T lays the constant lens over either.
 pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
     if !crate::tui::interactive() {
         anyhow::bail!("the resume picker needs an interactive terminal");
     }
 
-    let mut scope = if start_cwd.is_some() {
-        Scope::Cwd
-    } else {
-        Scope::All
+    let mut scope = Scope {
+        place: if start_cwd.is_some() {
+            Place::Cwd
+        } else {
+            Place::All
+        },
+        constant_only: false,
     };
     let mut all_entries = load(scope, start_cwd.as_deref());
     let mut query = String::new();
@@ -169,17 +178,17 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                         }
                     }
                     (KeyCode::Tab, _) => {
-                        scope = match scope {
-                            Scope::Cwd => Scope::All,
-                            Scope::All => Scope::Trail,
-                            Scope::Trail => {
-                                if start_cwd.is_some() {
-                                    Scope::Cwd
-                                } else {
-                                    Scope::All
-                                }
-                            }
+                        scope.place = match scope.place {
+                            Place::Cwd => Place::All,
+                            Place::All if start_cwd.is_some() => Place::Cwd,
+                            Place::All => Place::All,
                         };
+                        all_entries = load(scope, start_cwd.as_deref());
+                        selected = 0;
+                        offset = 0;
+                    }
+                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                        scope.constant_only = !scope.constant_only;
                         all_entries = load(scope, start_cwd.as_deref());
                         selected = 0;
                         offset = 0;
@@ -235,15 +244,18 @@ fn draw(
     s.push_str(&format!(
         "  {BOLD}constant{RESET} \u{2014} resume a session\r\n\r\n"
     ));
-    let scope_label = match scope {
-        Scope::Cwd => format!(
-            "[{}]",
-            cwd.and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "folder".to_string())
-        ),
-        Scope::All => "[everywhere]".to_string(),
-        Scope::Trail => "[constant trail]".to_string(),
+    // The scope reads as place + lens: `[everywhere · constant]`.
+    let place_label = match scope.place {
+        Place::Cwd => cwd
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string()),
+        Place::All => "everywhere".to_string(),
+    };
+    let scope_label = if scope.constant_only {
+        format!("[{place_label} \u{b7} {BOLD}constant{RESET}{DIM}]")
+    } else {
+        format!("[{place_label}]")
     };
     let q_shown = if query.is_empty() {
         format!("{DIM}type to search{RESET}")
@@ -251,7 +263,7 @@ fn draw(
         format!("{BOLD}{}{RESET}", crate::term_safe(query))
     };
     s.push_str(&format!(
-        "  \u{25b8} {q_shown}    {DIM}scope:{RESET} {scope_label} {DIM}(tab toggles){RESET}\r\n\r\n"
+        "  \u{25b8} {q_shown}    {DIM}scope: {scope_label}{RESET}\r\n\r\n"
     ));
 
     // Rows.
@@ -266,7 +278,7 @@ fn draw(
     {
         let color = trail::runtime_paint(e.runtime.label());
         let age = trail::ago(e.mtime_secs);
-        let name_budget = if scope == Scope::Cwd {
+        let name_budget = if scope.place == Place::Cwd {
             width.saturating_sub(34)
         } else {
             width.saturating_sub(58)
@@ -283,7 +295,7 @@ fn draw(
         }
         // Everywhere-scope shows each session's home, shortened.
         let home = std::env::var("HOME").unwrap_or_default();
-        let place = if scope == Scope::Cwd {
+        let place = if scope.place == Place::Cwd {
             String::new()
         } else {
             e.cwd
@@ -311,7 +323,7 @@ fn draw(
 
     // Footer.
     s.push_str(&format!(
-        "\r\n  {DIM}{} of {} \u{b7} enter resume \u{b7} \u{2191}\u{2193} browse \u{b7} tab scope \u{b7} esc exit{RESET}\r\n",
+        "\r\n  {DIM}{} of {} \u{b7} enter resume \u{b7} \u{2191}\u{2193} browse \u{b7} tab folder/everywhere \u{b7} ^t constant only \u{b7} esc exit{RESET}\r\n",
         if visible.is_empty() { 0 } else { selected + 1 },
         visible.len(),
     ));
