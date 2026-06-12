@@ -226,7 +226,7 @@ struct Session {
     child: Box<dyn Child + Send + Sync>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SwitchRequest {
     target: Runtime,
     new: bool,
@@ -234,7 +234,13 @@ struct SwitchRequest {
     /// instead of the full verbatim pile — per-switch, decided at the prompt
     /// or inherited from the launch flag.
     paged: bool,
+    /// Land in THIS projection (id, path) instead of the ledger-resolved
+    /// stable pair — the graph cursor's Enter. Validated before use.
+    landing: Option<Landing>,
 }
+
+/// A specific projection to land in: (session id, file path).
+type Landing = (String, std::path::PathBuf);
 
 enum SpawnMode<'a> {
     /// A fresh launch. For runtimes that support it, the session id is MINTED
@@ -331,6 +337,7 @@ fn request_switch(
     target: Runtime,
     new: bool,
     paged: bool,
+    landing: Option<Landing>,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) {
@@ -343,7 +350,12 @@ fn request_switch(
     // Termination is deferred to the carry gate at the end of the input
     // tick: a CONTINUE switch with nothing to carry is cancelled there
     // instead of tearing the child down for an empty target.
-    *switching_to = Some(SwitchRequest { target, new, paged });
+    *switching_to = Some(SwitchRequest {
+        target,
+        new,
+        paged,
+        landing,
+    });
 }
 
 /// Should the `[v]erbatim · [c]ompact` prompt appear for this switch? Only
@@ -477,13 +489,13 @@ fn execute_command(
     match parts.as_slice() {
         ["switch", rt] | ["s", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, false, paged, session, switching_to);
+                request_switch(target, false, paged, None, session, switching_to);
             }
             Action::None
         }
         ["new", rt] | ["n", rt] | ["fork", rt] | ["switch", "--new", rt] | ["s", "--new", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, true, paged, session, switching_to);
+                request_switch(target, true, paged, None, session, switching_to);
             }
             Action::None
         }
@@ -619,14 +631,26 @@ fn runtime_color(runtime: &str) -> &'static str {
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
+/// How many chapter rows the graph can draw at this terminal height — shared
+/// by the renderer and the cursor clamp (one formula, or they drift).
+fn graph_shown(total: usize, rows: u16) -> usize {
+    // Budget: header(4) + head(1) + footer(2) + notice slack.
+    let budget = rows.saturating_sub(8) as usize;
+    total.min(budget.max(1))
+}
+
 /// Render the trail graph — newest chapter on top, GitLab-style rails, one
-/// dot per chapter colored by the narrator that produced it. Pure: testable.
+/// dot per chapter colored by the narrator that produced it, the cursor (`sel`,
+/// 0 = newest drawn row) marking where Enter lands. Pure: testable.
+#[allow(clippy::too_many_arguments)]
 fn render_graph(
     naming: Option<&crate::trail::Naming>,
     chapters: &[crate::trail::ChapterRow],
     hosting: &str,
     rows: u16,
     now: u64,
+    sel: usize,
+    notice: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
@@ -654,12 +678,11 @@ fn render_graph(
         hosting,
     ));
 
-    // Budget: header(4) + head(1) + footer(2).
-    let budget = rows.saturating_sub(8) as usize;
-    let shown = chapters.len().min(budget.max(1));
+    let shown = graph_shown(chapters.len(), rows);
     let hidden = chapters.len() - shown;
+    let sel = sel.min(shown.saturating_sub(1));
 
-    for ch in chapters.iter().rev().take(shown) {
+    for (i, ch) in chapters.iter().rev().take(shown).enumerate() {
         let color = runtime_color(&ch.from);
         let rail = format!("  {DIM}\u{2502}{RESET}\r\n");
         out.push_str(&rail);
@@ -673,8 +696,14 @@ fn render_graph(
         } else {
             String::new()
         };
+        // The cursor: where Enter lands. Drawn rows are newest-first.
+        let cursor = if i == sel && !chapters.is_empty() {
+            "\x1b[7m\u{276f}\x1b[0m "
+        } else {
+            "  "
+        };
         out.push_str(&format!(
-            "  {glyph}  ch{:02}  {color}{:<8}{RESET} {DIM}\u{2192}{RESET} {:<8}  {DIM}{}{RESET}{record}\r\n",
+            "{cursor}{glyph}  ch{:02}  {color}{:<8}{RESET} {DIM}\u{2192}{RESET} {:<8}  {DIM}{}{RESET}{record}\r\n",
             ch.n,
             crate::term_safe(&ch.from),
             crate::term_safe(&ch.to),
@@ -685,8 +714,11 @@ fn render_graph(
         out.push_str(&format!("  {DIM}\u{2502}  \u{2026} {hidden} earlier chapters{RESET}\r\n"));
     }
 
+    if let Some(n) = notice {
+        out.push_str(&format!("\r\n  {n}\r\n"));
+    }
     out.push_str(&format!(
-        "\r\n  {DIM}c/x/o switch (shift=new) \u{b7} r rename \u{b7} t/q close{RESET}\r\n"
+        "\r\n  {DIM}\u{2191}\u{2193} pick \u{b7} enter land in it \u{b7} c/x/o switch (shift=new) \u{b7} r rename \u{b7} t/q close{RESET}\r\n"
     ));
     out
 }
@@ -1091,6 +1123,11 @@ pub fn run(
     // chatty child floods the bottom row while the question is up).
     let mut pending_switch: Option<(Runtime, bool)> = None;
     let mut render_prompt = String::new();
+    // The graph's cursor: the chapters on display (newest first when drawn),
+    // which row is selected, and a one-shot notice under the rails.
+    let mut view_chapters: Vec<crate::trail::ChapterRow> = Vec::new();
+    let mut view_sel: usize = 0;
+    let mut view_notice: Option<String> = None;
     // Installed-version preflight, off the hot path (each `--version` is a
     // subprocess). An unvalidated runtime gets a warning in the bar the moment
     // the sweep lands — doctor's quiet knowledge, surfaced where it matters.
@@ -1382,10 +1419,18 @@ pub fn run(
 
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.
+                            // A graph-cursor landing overrides the stable pair —
+                            // validated: on disk, and never the source itself.
                             let reuse_owned = if request.new {
                                 None
                             } else {
-                                owned.get(&target).cloned()
+                                request
+                                    .landing
+                                    .clone()
+                                    .filter(|(_, p)| {
+                                        p.exists() && !crate::alembic::same_file(&src_path, p)
+                                    })
+                                    .or_else(|| owned.get(&target).cloned())
                             };
                             let reuse = reuse_owned
                                 .as_ref()
@@ -1686,20 +1731,24 @@ pub fn run(
                                             let _ = out.write_all(b"\x1b[?1049h");
                                         }
                                         let (_, r) = size().unwrap_or((cols, rows));
-                                        let chapters = root_id
+                                        view_chapters = root_id
                                             .as_deref()
                                             .map(crate::trail::chapters)
                                             .unwrap_or_default();
+                                        view_sel = 0;
+                                        view_notice = None;
                                         let now = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_secs())
                                             .unwrap_or(0);
                                         let view = render_graph(
                                             naming.as_ref(),
-                                            &chapters,
+                                            &view_chapters,
                                             session.runtime.label(),
                                             r,
                                             now,
+                                            view_sel,
+                                            view_notice.as_deref(),
                                         );
                                         let _ = out.write_all(view.as_bytes());
                                         let _ = out.flush();
@@ -1741,6 +1790,7 @@ pub fn run(
                                             rt,
                                             fork,
                                             default_paged,
+                                            None,
                                             &mut session,
                                             &mut switching_to,
                                         );
@@ -1777,6 +1827,7 @@ pub fn run(
                                         rt,
                                         fork,
                                         paged,
+                                        None,
                                         &mut session,
                                         &mut switching_to,
                                     ),
@@ -1948,35 +1999,102 @@ pub fn run(
 
                         M_VIEW => {
                             // The cockpit: act from inside the graph. Letter
-                            // keys arrive as bytes or kitty presses — normalize.
+                            // keys arrive as bytes or kitty presses — normalize;
+                            // arrow sequences move the node cursor.
+                            let mut arrow: Option<i8> = None;
                             let key: Option<u8> = match &tok {
                                 Token::Byte(b) => Some(*b),
-                                Token::Seq(seq) => match parse_kitty_u(seq) {
-                                    Some((cp, mods, ev)) if ev != 3 && mods <= 2 => {
-                                        u8::try_from(cp).ok()
+                                Token::Seq(seq) => match seq.as_slice() {
+                                    b"\x1b[A" | b"\x1bOA" => {
+                                        arrow = Some(-1);
+                                        None
                                     }
-                                    Some(_) => None,
-                                    // any unrecognized escape (incl. bare Esc) closes
-                                    None => Some(b'q'),
+                                    b"\x1b[B" | b"\x1bOB" => {
+                                        arrow = Some(1);
+                                        None
+                                    }
+                                    _ => match parse_kitty_u(seq) {
+                                        Some((cp, mods, ev)) if ev != 3 && mods <= 2 => {
+                                            u8::try_from(cp).ok()
+                                        }
+                                        Some(_) => None,
+                                        // any unrecognized escape (incl. bare Esc) closes
+                                        None => Some(b'q'),
+                                    },
                                 },
                                 Token::Prefix => None,
                             };
                             let mut close = false;
+                            let mut redraw = false;
+                            let (_, view_rows) = size().unwrap_or((cols, rows));
+                            let shown = graph_shown(view_chapters.len(), view_rows);
+                            if let Some(step) = arrow {
+                                view_sel = if step < 0 {
+                                    view_sel.saturating_sub(1)
+                                } else {
+                                    (view_sel + 1).min(shown.saturating_sub(1))
+                                };
+                                view_notice = None;
+                                redraw = true;
+                            }
                             // Switch straight from the graph: leave the view
                             // first (restoring the child's screen), then the
                             // switch flow owns the screen from there.
-                            let switch_to: Option<(Runtime, bool)> = match key {
-                                Some(b'c') => Some((Runtime::Claude, false)),
-                                Some(b'C') => Some((Runtime::Claude, true)),
-                                Some(b'x') => Some((Runtime::Codex, false)),
-                                Some(b'X') => Some((Runtime::Codex, true)),
-                                Some(b'o') => Some((Runtime::OpenCode, false)),
-                                Some(b'O') => Some((Runtime::OpenCode, true)),
-                                _ => None,
-                            };
+                            let mut switch_to: Option<(Runtime, bool, Option<Landing>)> =
+                                match key {
+                                    Some(b'c') => Some((Runtime::Claude, false, None)),
+                                    Some(b'C') => Some((Runtime::Claude, true, None)),
+                                    Some(b'x') => Some((Runtime::Codex, false, None)),
+                                    Some(b'X') => Some((Runtime::Codex, true, None)),
+                                    Some(b'o') => Some((Runtime::OpenCode, false, None)),
+                                    Some(b'O') => Some((Runtime::OpenCode, true, None)),
+                                    _ => None,
+                                };
                             match key {
-                                Some(b't') | Some(b'q') | Some(0x0d) | Some(0x0a)
-                                | Some(b' ') | Some(0x03) | Some(27) => close = true,
+                                // Enter: land in the selected node's projection.
+                                Some(0x0d) | Some(0x0a) if !view_chapters.is_empty() => {
+                                    let row = view_chapters.iter().rev().nth(view_sel);
+                                    match row {
+                                        Some(ch) => match Runtime::parse(&ch.to) {
+                                            Ok(rt) if rt == session.runtime => {
+                                                view_notice = Some(format!(
+                                                    "ch{:02} is {} — already the runtime you're in",
+                                                    ch.n, ch.to
+                                                ));
+                                                redraw = true;
+                                            }
+                                            Ok(rt) => {
+                                                if !ch.path.is_empty()
+                                                    && std::path::Path::new(&ch.path).exists()
+                                                {
+                                                    switch_to = Some((
+                                                        rt,
+                                                        false,
+                                                        Some((
+                                                            ch.id.clone(),
+                                                            std::path::PathBuf::from(&ch.path),
+                                                        )),
+                                                    ));
+                                                } else {
+                                                    view_notice = Some(format!(
+                                                        "ch{:02}'s projection is gone — restore it from the record (constant snapshots)",
+                                                        ch.n
+                                                    ));
+                                                    redraw = true;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                view_notice =
+                                                    Some(format!("can't host {}", ch.to));
+                                                redraw = true;
+                                            }
+                                        },
+                                        None => close = true,
+                                    }
+                                }
+                                Some(b't') | Some(b'q') | Some(b' ') | Some(0x03)
+                                | Some(27) => close = true,
+                                Some(0x0d) | Some(0x0a) => close = true,
                                 // Rename without leaving: command line over the
                                 // graph, prefilled with the current name.
                                 Some(b'r') => {
@@ -1990,10 +2108,27 @@ pub fn run(
                                 }
                                 _ => {}
                             }
-                            if let Some((rt, fork)) = switch_to {
+                            if redraw && !close && switch_to.is_none() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let view = render_graph(
+                                    naming.as_ref(),
+                                    &view_chapters,
+                                    session.runtime.label(),
+                                    view_rows,
+                                    now,
+                                    view_sel,
+                                    view_notice.as_deref(),
+                                );
+                                let _ = out.write_all(view.as_bytes());
+                                let _ = out.flush();
+                            }
+                            if let Some((rt, fork, landing)) = switch_to {
                                 leave_view(&mut out, &mut view_alt, &mut view_buf);
                                 mode = M_NORMAL;
-                                request_switch(rt, fork, default_paged, &mut session, &mut switching_to);
+                                request_switch(rt, fork, default_paged, landing, &mut session, &mut switching_to);
                             }
                             if close {
                                 mode = M_NORMAL;
@@ -2155,9 +2290,11 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: if n == 3 { "new-fork" } else { "refresh-existing" }.to_string(),
                 recorded: n > 1,
+                id: format!("proj-{n}"),
+                path: format!("/tmp/proj-{n}.jsonl"),
             })
             .collect();
-        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000);
+        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000, 0, None);
         assert!(view.contains("cobalt-37"), "{view}");
         assert!(view.contains("auth redirect bug"));
         assert!(view.contains("ch05"), "head chapter missing: {view}");
@@ -2166,12 +2303,25 @@ mod tests {
         assert!(view.contains("rec \u{2713}"), "record marker missing");
 
         // Tiny terminal: old chapters truncate with an honest count.
-        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000);
+        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000, 0, None);
         assert!(small.contains("earlier chapters"), "{small}");
 
         // No thread yet: says so instead of pretending.
-        let empty = render_graph(None, &[], "codex", 40, 2_000_000);
+        let empty = render_graph(None, &[], "codex", 40, 2_000_000, 0, None);
         assert!(empty.contains("no thread yet"));
+
+        // The cursor rides the selected row (newest-first), and a notice shows.
+        let with_sel = render_graph(
+            Some(&nm),
+            &chapters,
+            "codex",
+            40,
+            2_000_000,
+            1,
+            Some("ch02's projection is gone"),
+        );
+        assert!(with_sel.contains("\u{276f}"), "no cursor: {with_sel}");
+        assert!(with_sel.contains("projection is gone"));
     }
 
     #[test]

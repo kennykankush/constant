@@ -960,6 +960,10 @@ pub struct ChapterRow {
     pub mode: String,
     /// The hop's record volume still exists on disk.
     pub recorded: bool,
+    /// The hop's target projection — the graph cursor's landing pad.
+    pub id: String,
+    /// Target projection path; may no longer exist (checked before landing).
+    pub path: String,
 }
 
 /// The chapters of a conversation, oldest first (rename events excluded).
@@ -978,6 +982,8 @@ pub fn chapters(conv_id: &str) -> Vec<ChapterRow> {
                 .as_deref()
                 .map(|p| Path::new(p).exists())
                 .unwrap_or(false),
+            id: e.id.clone(),
+            path: e.path.clone(),
         })
         .collect();
     rows.sort_by_key(|r| (r.ts, r.n));
