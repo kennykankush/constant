@@ -246,11 +246,15 @@ pub(crate) fn claude_quick_title(path: &Path) -> Option<String> {
 /// Every codex thread's display title from its registry (read-only, one
 /// query) — the names the user actually knows, including in-codex renames.
 fn codex_registry_titles() -> std::collections::HashMap<String, String> {
+    match formats::default_output_root(SessionFormat::Codex) {
+        Ok(root) => codex_registry_titles_in(&root),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+fn codex_registry_titles_in(root: &Path) -> std::collections::HashMap<String, String> {
     use rusqlite::{Connection, OpenFlags};
     let mut map = std::collections::HashMap::new();
-    let Ok(root) = formats::default_output_root(SessionFormat::Codex) else {
-        return map;
-    };
     let db = root.join("state_5.sqlite");
     if !db.exists() {
         return map;
@@ -268,7 +272,12 @@ fn codex_registry_titles() -> std::collections::HashMap<String, String> {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     }) {
         for (id, title) in rows.flatten() {
-            map.insert(id, title);
+            // Codex's own backfill can adopt a paged projection's first
+            // message — our desk furniture — as the thread title. Scaffold
+            // NEVER displays, no matter which store it leaked into.
+            if !title.is_empty() && !is_scaffold(&title) {
+                map.insert(id, title);
+            }
         }
     }
     map
@@ -2652,6 +2661,45 @@ Exporting session: ses_x1"#;
     /// The codex registry oracle: newest cwd-matching thread inside the spawn
     /// fence wins; threads without a user turn, archived threads, and threads
     /// last touched before the fence are invisible.
+    #[test]
+    fn registry_titles_never_surface_desk_furniture() {
+        // Codex's backfill can adopt a paged projection's first user message
+        // (the index scaffold) as the thread's registry title — seen live on
+        // 0.139 after a native resume of a paged projection. The display
+        // reader must drop it, whatever wrote it.
+        let dir = std::env::temp_dir().join(format!(
+            "constant-titles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)")
+            .unwrap();
+        for (id, title) in [
+            ("real", "WED 2"),
+            (
+                "paged",
+                "[constant: index of filed turns \u{2014} retrieve verbatim with `constant recall`]",
+            ),
+            ("blank", ""),
+        ] {
+            conn.execute("INSERT INTO threads VALUES (?1, ?2)", rusqlite::params![id, title])
+                .unwrap();
+        }
+        drop(conn);
+        let titles = codex_registry_titles_in(&dir);
+        assert_eq!(titles.get("real").map(String::as_str), Some("WED 2"));
+        assert!(
+            !titles.contains_key("paged"),
+            "desk furniture leaked as a display title"
+        );
+        assert!(!titles.contains_key("blank"));
+    }
+
     #[test]
     fn codex_registry_oracle_respects_fence_cwd_and_user_turns() {
         let dir = std::env::temp_dir().join(format!("constant-oracle-{}", std::process::id()));

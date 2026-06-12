@@ -358,6 +358,30 @@ fn request_switch(
     });
 }
 
+/// The thread identity of an already-known child: a projection the harness
+/// resumed (declared id), or — at view time — whatever conversation the
+/// child is sitting in per the live oracles. None when the ledger doesn't
+/// know it (a fresh thread earns its identity at the first switch, as ever).
+fn adopt_thread(
+    source: Option<(std::path::PathBuf, String)>,
+) -> Option<(String, u32, crate::trail::Naming)> {
+    let (path, id) = source?;
+    let (conv_id, max_n, _) = crate::trail::resume(&path, &id);
+    if max_n == 0 {
+        return None;
+    }
+    let (name, handle, named) = crate::trail::naming_parts_for_session(&id)?;
+    Some((
+        conv_id,
+        max_n,
+        crate::trail::Naming {
+            handle,
+            name,
+            named,
+        },
+    ))
+}
+
 /// Should the `[v]erbatim · [c]ompact` prompt appear for this switch? Only
 /// when the choice changes anything: below the tail budget the paged desk
 /// keeps the whole thread verbatim anyway, so short conversations switch
@@ -1093,6 +1117,16 @@ pub fn run(
             s
         }
     };
+    // A resumed projection's conversation is known from BIRTH: seed the
+    // thread identity now so the graph and the bar speak immediately,
+    // instead of pleading "no thread yet" until the first switch.
+    if let Some((conv, n, nm)) = adopt_thread(child_session.as_deref().and_then(|id| {
+        crate::alembic::session_by_id(initial, id).map(|(p, _)| (p, id.to_string()))
+    })) {
+        root_id = Some(conv);
+        trail_n = n;
+        naming = Some(nm);
+    }
     banner(&mut out, session.runtime, &prefix_label);
     // The claude-code-style "update is ready" line at startup: read from the
     // LAST check's cache — instant, offline-safe, never blocks the launch.
@@ -1724,6 +1758,34 @@ pub fn run(
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b't') => {
+                                        // Late adoption: the host may not have
+                                        // learned the thread yet (e.g. the user
+                                        // /resume'd INSIDE the child) — ask the
+                                        // oracles before declaring "no thread".
+                                        if root_id.is_none() {
+                                            let src = child_session
+                                                .as_deref()
+                                                .and_then(|id| {
+                                                    crate::alembic::session_by_id(
+                                                        session.runtime,
+                                                        id,
+                                                    )
+                                                    .map(|(p, _)| (p, id.to_string()))
+                                                })
+                                                .or_else(|| {
+                                                    crate::alembic::active_session(
+                                                        session.runtime,
+                                                        host_cwd.as_deref(),
+                                                        Some(child_spawned_at),
+                                                    )
+                                                });
+                                            if let Some((conv, n, nm)) = adopt_thread(src) {
+                                                root_id = Some(conv);
+                                                trail_n = n;
+                                                naming = Some(nm);
+                                                bar_dirty = bar;
+                                            }
+                                        }
                                         mode = M_VIEW;
                                         view_alt = !child_alt_active;
                                         if view_alt {
