@@ -1730,6 +1730,8 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     } else {
         let a = trail::ansi();
         let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+        // One ledger read for every row's naming, not one per row.
+        let naming = trail::naming_index();
         for s in &sessions {
             // `·` marks a session known to be empty (only determinable with --titles).
             let mark = match s.has_conversation {
@@ -1742,12 +1744,13 @@ fn run_sessions(rest: &[String]) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| trail::ago(d.as_secs()))
                 .unwrap_or_default();
-            let label = trail::naming_parts_for_session(&s.id)
+            let label = naming
+                .get(&s.id)
                 .map(|(n, h, _)| {
                     format!(
                         "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
-                        term_safe(&trail::clip(&n, 44)),
-                        term_safe(&h)
+                        term_safe(&trail::clip(n, 44)),
+                        term_safe(h)
                     )
                 })
                 .unwrap_or_default();

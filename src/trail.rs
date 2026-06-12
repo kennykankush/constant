@@ -1127,6 +1127,13 @@ pub fn label_for_session(id: &str) -> Option<String> {
 /// can let a runtime-side rename outrank an auto-derived trail name).
 pub fn naming_parts_for_session(id: &str) -> Option<(String, String, bool)> {
     let entries = load_entries(None);
+    naming_parts_from_entries(&entries, id)
+}
+
+fn naming_parts_from_entries(
+    entries: &[TrailEntry],
+    id: &str,
+) -> Option<(String, String, bool)> {
     let conv = entries.iter().find_map(|e| {
         (e.id == id || e.source_id.as_deref() == Some(id)).then(|| e.conversation.clone())
     })?;
@@ -1135,8 +1142,27 @@ pub fn naming_parts_for_session(id: &str) -> Option<(String, String, bool)> {
         .find(|e| e.conversation == conv && e.slug != "?")
         .map(|e| e.slug.clone())
         .unwrap_or_else(|| conv.clone());
-    let naming = naming_from_entries(&entries, &conv, &slug, None);
+    let naming = naming_from_entries(entries, &conv, &slug, None);
     Some((naming.name, naming.handle, naming.named))
+}
+
+/// Every session id the trail knows → (name, handle, named), from ONE ledger
+/// read. Per-row [`naming_parts_for_session`] re-reads the ledger each call —
+/// fine for a handful of lookups, quadratic for a picker listing thousands of
+/// sessions. Build this once per listing instead.
+pub fn naming_index() -> std::collections::HashMap<String, (String, String, bool)> {
+    let entries = load_entries(None);
+    let mut out = std::collections::HashMap::new();
+    for e in &entries {
+        for id in [Some(e.id.as_str()), e.source_id.as_deref()].into_iter().flatten() {
+            if id != "?" && !out.contains_key(id)
+                && let Some(parts) = naming_parts_from_entries(&entries, id)
+            {
+                out.insert(id.to_string(), parts);
+            }
+        }
+    }
+    out
 }
 
 /// The newest record volume for a conversation that still exists on disk —

@@ -171,7 +171,7 @@ fn codex_thread_from_logs_in(
 /// record wins (a /rename, or Constant's own re-stamp — search the tail),
 /// else the first real user message (search the head), clipped. Reads at most
 /// ~80KB per file regardless of transcript size.
-fn claude_quick_title(path: &Path) -> Option<String> {
+pub(crate) fn claude_quick_title(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 64 * 1024;
     const HEAD: usize = 16 * 1024;
@@ -1418,7 +1418,7 @@ fn same_dir(recorded: &str, here: &Path) -> bool {
 }
 
 /// Read a Codex rollout's recorded cwd from its first-line session_meta.
-fn codex_session_cwd(path: &Path) -> Option<String> {
+pub(crate) fn codex_session_cwd(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let file = fs::File::open(path).ok()?;
     let mut first = String::new();
@@ -1475,6 +1475,25 @@ pub fn list_sessions(
     runtime: Runtime,
     cwd: Option<&Path>,
     with_titles: bool,
+) -> Vec<SessionSummary> {
+    list_sessions_inner(runtime, cwd, with_titles, true)
+}
+
+/// The picker's fast first paint: same listing, but the per-file reads are
+/// skipped — no claude title tailing, and no codex head reads when there's no
+/// cwd filter to serve. Cheap batched sources stay (the codex registry is one
+/// query for every title). The caller streams the skipped enrichment in
+/// afterwards ([`claude_quick_title`], [`codex_session_cwd`] per row,
+/// off-thread).
+pub fn list_sessions_lazy(runtime: Runtime, cwd: Option<&Path>) -> Vec<SessionSummary> {
+    list_sessions_inner(runtime, cwd, false, false)
+}
+
+fn list_sessions_inner(
+    runtime: Runtime,
+    cwd: Option<&Path>,
+    with_titles: bool,
+    enrich: bool,
 ) -> Vec<SessionSummary> {
     let fmt = session_format(runtime);
     if fmt == SessionFormat::OpenCode {
@@ -1533,8 +1552,10 @@ pub fn list_sessions(
             let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
+            // The codex head read is only unavoidable when a cwd filter needs
+            // it; the lazy listing defers it otherwise (display-only data).
             let rec_cwd = match fmt {
-                SessionFormat::Codex => codex_session_cwd(&path),
+                SessionFormat::Codex if enrich || cwd.is_some() => codex_session_cwd(&path),
                 _ => None,
             };
             let cwd_ok = match (fmt, cwd) {
@@ -1582,7 +1603,7 @@ pub fn list_sessions(
             // customTitle record (tail), and the first user message makes a
             // serviceable auto-title (head). Bounded reads — never the whole
             // transcript — so the default listing stays fast on big stores.
-            if fmt == SessionFormat::Claude && title.is_none() {
+            if enrich && fmt == SessionFormat::Claude && title.is_none() {
                 title = claude_quick_title(&path);
             }
             out.push(SessionSummary {

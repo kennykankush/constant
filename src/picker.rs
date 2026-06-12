@@ -4,12 +4,20 @@
 //! conversation handles Constant knows, names pulled from each runtime's own
 //! registry where one exists.
 //!
+//! Opens INSTANTLY, then fills in: the first paint lists from cheap sources
+//! only (directory walks, the codex registry's one query, one trail-ledger
+//! read), while the per-file reads — claude title tailing, codex cwd heads —
+//! stream in from a background thread, newest first. A scope flip bumps the
+//! generation and stale enrichment is dropped on the floor.
+//!
 //! Draws on the ALTERNATE screen (the terminal restores the shell on exit),
 //! raw mode for keys, no extra dependencies — the same primitives the host
 //! already lives on.
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -19,24 +27,49 @@ use crate::runtime::Runtime;
 use crate::trail;
 use crate::tui::Screen;
 
-/// One pickable row.
+/// One pickable row. Naming sources are kept raw and the display name is
+/// computed on read, so streamed enrichment (a claude title arriving late)
+/// re-ranks the precedence without re-deriving anything else.
 #[derive(Clone)]
 pub struct PickEntry {
     pub runtime: Runtime,
     pub id: String,
-    /// What a person knows it by: the conversation name (trail name when
-    /// known, else the runtime's own registry title, else the id).
-    pub display: String,
-    /// Constant's handle when the trail knows this session — pure decoration.
-    pub handle: Option<String>,
-    /// True when `display` came from the trail (rendered bold).
-    pub known: bool,
+    pub path: PathBuf,
+    /// The runtime's own name for it (codex registry at load; claude's
+    /// customTitle/first-message streams in from the enrichment thread).
+    pub runtime_title: Option<String>,
+    /// (name, handle, named) when the constant trail knows this session.
+    pub trail: Option<(String, String, bool)>,
     pub cwd: Option<String>,
     pub mtime_secs: u64,
 }
 
-/// Gather pickable sessions, newest first.
+impl PickEntry {
+    /// What a person knows it by: a user-locked trail name wins, then the
+    /// runtime's own title, then the auto trail name, then the id.
+    pub fn display(&self) -> String {
+        match (&self.trail, &self.runtime_title) {
+            (Some((name, _, true)), _) => name.clone(),
+            (_, Some(t)) => t.clone(),
+            (Some((name, _, false)), None) => name.clone(),
+            (None, None) => self.id.clone(),
+        }
+    }
+
+    pub fn handle(&self) -> Option<&str> {
+        self.trail.as_ref().map(|(_, h, _)| h.as_str())
+    }
+
+    /// True when the constant trail knows this session (rendered bold).
+    pub fn known(&self) -> bool {
+        self.trail.is_some()
+    }
+}
+
+/// Gather pickable sessions, newest first — the FAST pass (no per-file
+/// reads; see the module docs for what streams in afterwards).
 pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
+    let naming = trail::naming_index();
     let mut out = Vec::new();
     for rt in [
         Runtime::Codex,
@@ -44,34 +77,18 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
         Runtime::OpenCode,
         Runtime::Gemini,
     ] {
-        for s in alembic::list_sessions(rt, cwd, false) {
+        for s in alembic::list_sessions_lazy(rt, cwd) {
             let mtime_secs = s
                 .mtime
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let runtime_title = s.title.as_deref().filter(|t| !t.is_empty());
-            let (display, handle, known) = match trail::naming_parts_for_session(&s.id) {
-                // A runtime-side rename outranks an AUTO trail name; a trail
-                // name the user locked (constant rename / :rename) wins.
-                Some((name, handle, named)) => {
-                    let display = match runtime_title {
-                        Some(t) if !named => t.to_string(),
-                        _ => name,
-                    };
-                    (display, Some(handle), true)
-                }
-                None => match runtime_title {
-                    Some(t) => (t.to_string(), None, false),
-                    None => (s.id.clone(), None, false),
-                },
-            };
             out.push(PickEntry {
                 runtime: rt,
+                trail: naming.get(&s.id).cloned(),
+                runtime_title: s.title.filter(|t| !t.is_empty()),
                 id: s.id,
-                display,
-                handle,
-                known,
+                path: s.path,
                 cwd: s.cwd,
                 mtime_secs,
             });
@@ -81,19 +98,18 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
     out
 }
 
-/// Case-insensitive filter over display, id, and runtime label.
+/// Case-insensitive filter over display name, id, runtime label, and handle.
 pub fn filter<'a>(entries: &'a [PickEntry], query: &str) -> Vec<&'a PickEntry> {
     let q = query.to_lowercase();
     entries
         .iter()
         .filter(|e| {
             q.is_empty()
-                || e.display.to_lowercase().contains(&q)
+                || e.display().to_lowercase().contains(&q)
                 || e.id.to_lowercase().contains(&q)
                 || e.runtime.label().contains(&q)
                 || e
-                    .handle
-                    .as_deref()
+                    .handle()
                     .map(|h| h.to_lowercase().contains(&q))
                     .unwrap_or(false)
         })
@@ -116,15 +132,70 @@ struct Scope {
     constant_only: bool,
 }
 
+/// Rows one screen of the list holds — the unit PgUp/PgDn flip by, and the
+/// same number draw() windows to (one definition, or paging and drawing drift).
+fn page_size() -> usize {
+    crate::tui::dimensions().1.saturating_sub(6).max(3)
+}
+
 fn load(scope: Scope, cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
+    let t = std::time::Instant::now();
     let mut v = match scope.place {
         Place::Cwd => entries(cwd),
         Place::All => entries(None),
     };
     if scope.constant_only {
-        v.retain(|e| e.known);
+        v.retain(|e| e.known());
+    }
+    if std::env::var_os("CONSTANT_DEBUG_TIMING").is_some() {
+        eprintln!("[timing] load: {}ms, {} rows\r", t.elapsed().as_millis(), v.len());
     }
     v
+}
+
+/// One streamed enrichment result, tagged with its load generation.
+enum Enrich {
+    Row {
+        ix: usize,
+        title: Option<String>,
+        cwd: Option<String>,
+    },
+    Done,
+}
+
+/// Spawn the enrichment sweep for one load generation: the per-file reads
+/// the fast pass skipped, newest first. Returns true when there is anything
+/// to sweep (so the caller knows whether to show the scanning indicator).
+fn spawn_enrichment(generation: u64, rows: &[PickEntry], tx: mpsc::Sender<(u64, Enrich)>) -> bool {
+    let work: Vec<(usize, PathBuf, bool, bool)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, e)| {
+            let need_title = e.runtime == Runtime::Claude && e.runtime_title.is_none();
+            let need_cwd = e.runtime == Runtime::Codex && e.cwd.is_none();
+            (need_title || need_cwd).then(|| (ix, e.path.clone(), need_title, need_cwd))
+        })
+        .collect();
+    if work.is_empty() {
+        return false;
+    }
+    std::thread::spawn(move || {
+        for (ix, path, need_title, need_cwd) in work {
+            let title = need_title
+                .then(|| alembic::claude_quick_title(&path))
+                .flatten();
+            let cwd = need_cwd
+                .then(|| alembic::codex_session_cwd(&path))
+                .flatten();
+            if (title.is_some() || cwd.is_some())
+                && tx.send((generation, Enrich::Row { ix, title, cwd })).is_err()
+            {
+                return; // picker is gone
+            }
+        }
+        let _ = tx.send((generation, Enrich::Done));
+    });
+    true
 }
 
 /// Run the picker. Returns the chosen entry, or None on cancel.
@@ -143,53 +214,108 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
         },
         constant_only: false,
     };
+    let (tx, rx) = mpsc::channel::<(u64, Enrich)>();
+    let mut generation: u64 = 0;
     let mut all_entries = load(scope, start_cwd.as_deref());
+    let mut scanning = spawn_enrichment(generation, &all_entries, tx.clone());
     let mut query = String::new();
     let mut selected: usize = 0;
     let mut offset: usize = 0;
+    let mut dirty = true;
 
     let _screen = Screen::enter()?;
     loop {
-        let visible = filter(&all_entries, &query);
-        if selected >= visible.len() {
-            selected = visible.len().saturating_sub(1);
+        // Apply whatever the sweep has sent since the last tick.
+        while let Ok((generation_of, enrich)) = rx.try_recv() {
+            if generation_of != generation {
+                continue; // a stale sweep from before a scope flip
+            }
+            match enrich {
+                Enrich::Row { ix, title, cwd } => {
+                    if let Some(e) = all_entries.get_mut(ix) {
+                        if e.runtime_title.is_none() {
+                            e.runtime_title = title;
+                        }
+                        if e.cwd.is_none() {
+                            e.cwd = cwd;
+                        }
+                        dirty = true;
+                    }
+                }
+                Enrich::Done => {
+                    scanning = false;
+                    dirty = true;
+                }
+            }
         }
 
-        draw(&visible, &query, selected, &mut offset, scope, start_cwd.as_deref())?;
+        if dirty {
+            let visible = filter(&all_entries, &query);
+            if selected >= visible.len() {
+                selected = visible.len().saturating_sub(1);
+            }
+            draw(
+                &visible,
+                &query,
+                selected,
+                &mut offset,
+                scope,
+                scanning,
+                start_cwd.as_deref(),
+            )?;
+            dirty = false;
+        }
 
+        // Tick: keys when they come, enrichment drained in between.
+        if !event::poll(Duration::from_millis(60))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(k) => {
                 // Only key PRESSES (kitty-capable terminals also report releases).
                 if k.kind == event::KeyEventKind::Release {
                     continue;
                 }
+                dirty = true;
+                let visible_len = filter(&all_entries, &query).len();
                 match (k.code, k.modifiers) {
                     (KeyCode::Esc, _) => return Ok(None),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
                     (KeyCode::Enter, _) => {
+                        let visible = filter(&all_entries, &query);
                         if let Some(e) = visible.get(selected) {
                             return Ok(Some((*e).clone()));
                         }
                     }
                     (KeyCode::Up, _) => selected = selected.saturating_sub(1),
                     (KeyCode::Down, _) => {
-                        if selected + 1 < visible.len() {
+                        if selected + 1 < visible_len {
                             selected += 1;
                         }
                     }
+                    (KeyCode::PageUp, _) => selected = selected.saturating_sub(page_size()),
+                    (KeyCode::PageDown, _) => {
+                        selected = (selected + page_size()).min(visible_len.saturating_sub(1));
+                    }
+                    (KeyCode::Home, _) => selected = 0,
+                    (KeyCode::End, _) => selected = visible_len.saturating_sub(1),
                     (KeyCode::Tab, _) => {
                         scope.place = match scope.place {
                             Place::Cwd => Place::All,
                             Place::All if start_cwd.is_some() => Place::Cwd,
                             Place::All => Place::All,
                         };
+                        generation += 1;
                         all_entries = load(scope, start_cwd.as_deref());
+                        scanning = spawn_enrichment(generation, &all_entries, tx.clone());
                         selected = 0;
                         offset = 0;
                     }
                     (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
                         scope.constant_only = !scope.constant_only;
+                        generation += 1;
                         all_entries = load(scope, start_cwd.as_deref());
+                        scanning = spawn_enrichment(generation, &all_entries, tx.clone());
                         selected = 0;
                         offset = 0;
                     }
@@ -207,22 +333,24 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                     _ => {}
                 }
             }
-            Event::Resize(_, _) => {}
+            Event::Resize(_, _) => dirty = true,
             _ => {}
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     visible: &[&PickEntry],
     query: &str,
     selected: usize,
     offset: &mut usize,
     scope: Scope,
+    scanning: bool,
     cwd: Option<&std::path::Path>,
 ) -> Result<()> {
-    let (width, rows) = crate::tui::dimensions();
-    let list_rows = rows.saturating_sub(6).max(3);
+    let (width, _) = crate::tui::dimensions();
+    let list_rows = page_size();
 
     // Keep the selection inside the window.
     if selected < *offset {
@@ -257,13 +385,18 @@ fn draw(
     } else {
         format!("[{place_label}]")
     };
+    let scan_note = if scanning {
+        " \u{b7} scanning names\u{2026}"
+    } else {
+        ""
+    };
     let q_shown = if query.is_empty() {
         format!("{DIM}type to search{RESET}")
     } else {
         format!("{BOLD}{}{RESET}", crate::term_safe(query))
     };
     s.push_str(&format!(
-        "  \u{25b8} {q_shown}    {DIM}scope: {scope_label}{RESET}\r\n\r\n"
+        "  \u{25b8} {q_shown}    {DIM}scope: {scope_label}{scan_note}{RESET}\r\n\r\n"
     ));
 
     // Rows.
@@ -283,14 +416,14 @@ fn draw(
         } else {
             width.saturating_sub(58)
         };
-        let name = trail::clip(&crate::term_safe(&e.display), name_budget.max(16));
-        let mut name = if e.known {
+        let name = trail::clip(&crate::term_safe(&e.display()), name_budget.max(16));
+        let mut name = if e.known() {
             format!("{BOLD}{name}{RESET}")
         } else {
             name
         };
         // The title is the protagonist; the handle decorates it, dim.
-        if let Some(h) = &e.handle {
+        if let Some(h) = e.handle() {
             name.push_str(&format!(" {DIM}\u{b7} {}{RESET}", crate::term_safe(h)));
         }
         // Everywhere-scope shows each session's home, shortened.
@@ -321,9 +454,12 @@ fn draw(
         }
     }
 
-    // Footer.
+    // Footer: position + page, then the keys. The page is the fixed window
+    // the SELECTION sits in (stable while the scroll offset slides).
+    let pages = visible.len().div_ceil(list_rows).max(1);
+    let page = (selected / list_rows) + 1;
     s.push_str(&format!(
-        "\r\n  {DIM}{} of {} \u{b7} enter resume \u{b7} \u{2191}\u{2193} browse \u{b7} tab folder/everywhere \u{b7} ^t constant only \u{b7} esc exit{RESET}\r\n",
+        "\r\n  {DIM}{} of {} \u{b7} page {page}/{pages} \u{b7} enter resume \u{b7} \u{2191}\u{2193} pgup/pgdn \u{b7} tab folder/everywhere \u{b7} ^t constant \u{b7} esc{RESET}\r\n",
         if visible.is_empty() { 0 } else { selected + 1 },
         visible.len(),
     ));
@@ -338,13 +474,13 @@ fn draw(
 mod tests {
     use super::*;
 
-    fn e(rt: Runtime, id: &str, display: &str, ts: u64) -> PickEntry {
+    fn e(rt: Runtime, id: &str, title: &str, ts: u64) -> PickEntry {
         PickEntry {
             runtime: rt,
             id: id.into(),
-            display: display.into(),
-            handle: None,
-            known: false,
+            path: PathBuf::new(),
+            runtime_title: Some(title.into()),
+            trail: None,
             cwd: None,
             mtime_secs: ts,
         }
@@ -362,5 +498,23 @@ mod tests {
         assert_eq!(filter(&list, "claude").len(), 1);
         assert_eq!(filter(&list, "").len(), 2);
         assert_eq!(filter(&list, "zzz").len(), 0);
+    }
+
+    #[test]
+    fn display_precedence_locked_beats_runtime_beats_auto_beats_id() {
+        let mut entry = e(Runtime::Codex, "019e993b", "registry title", 1);
+        // Runtime title over an auto trail name…
+        entry.trail = Some(("auto name".into(), "cobalt-37".into(), false));
+        assert_eq!(entry.display(), "registry title");
+        // …but a user-locked trail name wins over everything.
+        entry.trail = Some(("my name".into(), "cobalt-37".into(), true));
+        assert_eq!(entry.display(), "my name");
+        // No runtime title: the auto trail name serves.
+        entry.runtime_title = None;
+        entry.trail = Some(("auto name".into(), "cobalt-37".into(), false));
+        assert_eq!(entry.display(), "auto name");
+        // Nothing known: the id is the last resort.
+        entry.trail = None;
+        assert_eq!(entry.display(), "019e993b");
     }
 }
