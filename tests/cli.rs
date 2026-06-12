@@ -378,6 +378,40 @@ fn trail_dedupes_projection_refreshes_and_events_shows_raw_ledger() {
     );
 }
 
+/// In a terminal `constant trail` opens the interactive explorer; everywhere
+/// else (pipes, scripts, --plain) it MUST stay the printable card view. The
+/// other trail tests already pipe bare `trail`, so this pins the explicit
+/// opt-out: --plain is accepted and prints the same cards.
+#[test]
+fn trail_plain_and_sessions_plain_keep_the_printouts() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+        ],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let plain = run(&dir, &["trail", "--all", "--plain"]);
+    assert!(plain.status.success(), "{}", err(&plain));
+    let plain_out = out(&plain);
+    assert!(
+        plain_out.contains("constant resume"),
+        "trail --plain should print the card view: {plain_out}"
+    );
+    // Identical to the piped default — --plain is the same view, just forced.
+    assert_eq!(plain_out, out(&run(&dir, &["trail", "--all"])));
+
+    let sessions = run(&dir, &["sessions", "--all", "--plain"]);
+    assert!(sessions.status.success(), "{}", err(&sessions));
+}
+
 #[test]
 fn route_prints_aliases_and_refreshes() {
     let dir = tmpdir();

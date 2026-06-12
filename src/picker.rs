@@ -8,16 +8,16 @@
 //! raw mode for keys, no extra dependencies — the same primitives the host
 //! already lives on.
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
 use crate::alembic;
 use crate::runtime::Runtime;
 use crate::trail;
+use crate::tui::Screen;
 
 /// One pickable row.
 #[derive(Clone)]
@@ -100,27 +100,6 @@ pub fn filter<'a>(entries: &'a [PickEntry], query: &str) -> Vec<&'a PickEntry> {
         .collect()
 }
 
-/// RAII raw-mode + alt-screen guard: the shell comes back no matter how we
-/// leave (including on error paths).
-struct Screen;
-impl Screen {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?1049h\x1b[?25l");
-        let _ = out.flush();
-        Ok(Screen)
-    }
-}
-impl Drop for Screen {
-    fn drop(&mut self) {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?1049l\x1b[?25h");
-        let _ = out.flush();
-        let _ = disable_raw_mode();
-    }
-}
-
 /// The picker's scope: this folder, every folder, or only conversations the
 /// Constant trail knows (handles, chapters, the record).
 #[derive(Clone, Copy, PartialEq)]
@@ -146,7 +125,7 @@ fn load(scope: Scope, cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
 /// `start_cwd` seeds the [folder] scope; Tab cycles folder → everywhere →
 /// constant trail.
 pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !crate::tui::interactive() {
         anyhow::bail!("the resume picker needs an interactive terminal");
     }
 
@@ -233,9 +212,8 @@ fn draw(
     scope: Scope,
     cwd: Option<&std::path::Path>,
 ) -> Result<()> {
-    let (cols, rows) = size().unwrap_or((80, 24));
-    let width = cols as usize;
-    let list_rows = (rows as usize).saturating_sub(6).max(3);
+    let (width, rows) = crate::tui::dimensions();
+    let list_rows = rows.saturating_sub(6).max(3);
 
     // Keep the selection inside the window.
     if selected < *offset {

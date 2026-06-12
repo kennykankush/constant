@@ -5,11 +5,13 @@
 //! the conversation.
 
 mod alembic;
+mod explorer;
 mod host;
 mod live;
 mod picker;
 mod runtime;
 mod trail;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 use runtime::Runtime;
@@ -578,11 +580,13 @@ fn run_trail(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut events = false;
     let mut full = false;
+    let mut plain = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
             "--events" => events = true,
             "--full" => full = true,
+            "--plain" => plain = true,
             other => bail!("unknown flag: {other}"),
         }
     }
@@ -592,12 +596,23 @@ fn run_trail(rest: &[String]) -> Result<()> {
         std::env::current_dir().ok()
     };
     if events {
-        trail::print_events(cwd.as_deref())
-    } else if full {
-        trail::print_full(cwd.as_deref())
-    } else {
-        trail::print(cwd.as_deref())
+        return trail::print_events(cwd.as_deref());
     }
+    if full {
+        return trail::print_full(cwd.as_deref());
+    }
+    // In a terminal the trail is a place, not a printout: the explorer zooms
+    // conversations → chapters → filed turns. Piped output (and --plain)
+    // keeps the card view for scripts and quick glances.
+    if !plain && tui::interactive() {
+        return match explorer::explore(cwd)? {
+            // Handles are globally unambiguous, and the explorer's everywhere
+            // scope can pick a conversation from any folder — resume unscoped.
+            Some(handle) => run_resume_cmd(&[handle, "--all".to_string()]),
+            None => Ok(()),
+        };
+    }
+    trail::print(cwd.as_deref())
 }
 
 /// `constant resume [QUERY]` — re-host a conversation from the trail: pick its
@@ -1608,6 +1623,7 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut json = false;
     let mut titles = false;
+    let mut plain = false;
     let mut query: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
@@ -1628,6 +1644,10 @@ fn run_sessions(rest: &[String]) -> Result<()> {
                 titles = true;
                 i += 1;
             }
+            "--plain" => {
+                plain = true;
+                i += 1;
+            }
             q if !q.starts_with('-') => {
                 if query.is_some() {
                     bail!("sessions takes one search query, e.g. `constant sessions market`");
@@ -1637,6 +1657,14 @@ fn run_sessions(rest: &[String]) -> Result<()> {
             }
             other => bail!("unknown flag: {other}"),
         }
+    }
+
+    // Bare `constant sessions` in a terminal opens the same picker as
+    // `constant resume`: the sessions ARE its rows, Enter wakes one hosted.
+    // Any query/flag (or a pipe) keeps the scriptable printout below.
+    if !plain && !json && !titles && from.is_none() && query.is_none() && tui::interactive() {
+        let fwd: Vec<String> = if all { vec!["--all".to_string()] } else { Vec::new() };
+        return run_resume_cmd(&fwd);
     }
 
     let cwd = if all {
@@ -1909,11 +1937,14 @@ fn print_help() {
         file; unpack it on another machine, then resume by handle.{reset}
 
 {dim}LOOK AROUND{reset}
-  {bold}constant trail{reset} {dim}[--all] [--full] [--events]{reset}
-        {dim}One card per conversation: handle, name, chapter chain.{reset}
-  {bold}constant sessions{reset} {dim}[QUERY] [--from RT] [--all] [--titles] [--json]{reset}
+  {bold}constant trail{reset} {dim}[--all] [--plain] [--full] [--events]{reset}
+        {dim}In a terminal: the explorer \u{2014} type to search, Enter zooms into a
+        conversation \u{2192} its chapters \u{2192} the filed turns, verbatim; Esc backs
+        out, r resumes hosted. --plain prints the cards instead.{reset}
+  {bold}constant sessions{reset} {dim}[QUERY] [--from RT] [--all] [--titles] [--plain] [--json]{reset}
         {dim}Carryable sessions on disk, newest first, linked to their handles.
-        QUERY filters by name/id (codex names come from its own registry).{reset}
+        Bare in a terminal: the resume picker. QUERY filters the printout
+        by name/id (codex names come from its own registry).{reset}
   {bold}constant ps{reset} {dim}[--json]{reset}
         {dim}Every live agent process right now (alias: `live`). Read-only.{reset}
   {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all]{reset}

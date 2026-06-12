@@ -67,8 +67,9 @@ fn joined_text(message: &MessageEvent) -> String {
         .join("\n")
 }
 
-/// First line of a turn, clipped for the index.
-fn preview(text: &str, max: usize) -> String {
+/// First line of a turn, clipped for the index (also the trail explorer's
+/// turn-index rows — one previewer, so the two views never drift).
+pub(crate) fn preview(text: &str, max: usize) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let mut out: String = line.chars().take(max).collect();
     if line.chars().count() > max {
