@@ -222,6 +222,145 @@ fn install_channel(exe: &str) -> InstallChannel {
     }
 }
 
+/// Resolve a `--session` argument the way a person types it. In order:
+/// a path or native session id (exact, scriptable — unchanged), then a
+/// conversation HANDLE from the trail (globally unambiguous by construction;
+/// falls back to the conversation's latest record volume when no projection
+/// lives), then a NAME. Names can be duplicated — claude and codex both
+/// allow several sessions to share a title — so several matches open a
+/// picker in a terminal, or list the candidates and bail in a script.
+fn resolve_session_arg(q: &str) -> Result<PathBuf> {
+    // 1. Path or native id — the exact, scriptable spelling. An AMBIGUOUS id
+    // (one id in two runtimes' stores) is a refusal, not a miss: it must
+    // propagate, never fall through to fuzzier matching.
+    match alembic::resolve_session(Path::new(q)) {
+        Ok(p) => return Ok(p),
+        Err(e) if e.to_string().contains("more than one") => return Err(e),
+        Err(_) => {}
+    }
+
+    // 2. Trail handle: cobalt-37 names exactly one conversation, ever.
+    let convs = trail::conversations(None);
+    if let Some(c) = convs.iter().find(|c| c.handle.eq_ignore_ascii_case(q)) {
+        if let Some(p) = c.projections.iter().max_by_key(|p| p.last_n)
+            && let Ok(rt) = Runtime::parse(&p.runtime)
+            && let Some((path, _)) = alembic::session_by_id(rt, &p.id)
+        {
+            return Ok(path);
+        }
+        // Every projection gone: the record volume is itself a valid carry
+        // source (carry reads IR), so a packed/expired conversation still
+        // carries by handle.
+        if let Some(snap) = trail::latest_snapshot(&c.conversation) {
+            return Ok(snap);
+        }
+        bail!(
+            "{} has no live projection and no record volume on this machine",
+            term_safe(q)
+        );
+    }
+
+    // 3. A name. Scan this folder first, widen to everywhere only when the
+    // folder has no match (the near thing is almost always the meant thing).
+    let here = std::env::current_dir().ok();
+    let mut candidates = name_candidates(q, here.as_deref());
+    if candidates.is_empty() {
+        candidates = name_candidates(q, None);
+    }
+    match candidates.len() {
+        0 => bail!(
+            "could not resolve {} as a path, session id, handle, or name \
+             (see `constant sessions`)",
+            term_safe(q)
+        ),
+        1 => Ok(candidates.remove(0).path),
+        _ => {
+            // Several files, ONE conversation: projections of the same
+            // conversation share its name by design (the codex copy, the
+            // claude copy). The user means the conversation — its newest
+            // projection wins. Real ambiguity is DIFFERENT conversations
+            // (or unknown sessions) wearing one name.
+            let handles: std::collections::HashSet<&str> =
+                candidates.iter().filter_map(|c| c.handle()).collect();
+            if handles.len() == 1 && candidates.iter().all(|c| c.handle().is_some()) {
+                return Ok(candidates.remove(0).path); // newest-first order
+            }
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                let heading = format!("several sessions are named \u{201c}{}\u{201d}", term_safe(q));
+                match picker::pick_among(&heading, candidates)? {
+                    Some(choice) => Ok(choice.path),
+                    None => bail!("cancelled"),
+                }
+            } else {
+                let a = trail::ansi();
+                eprintln!("several sessions match \u{201c}{}\u{201d}:", term_safe(q));
+                for c in &candidates {
+                    let age = trail::ago(c.mtime_secs);
+                    eprintln!(
+                        "  {age:>8}  {:<9} {}  {}{}{}",
+                        c.runtime.label(),
+                        term_safe(&c.display()),
+                        a.dim,
+                        term_safe(&c.id),
+                        a.reset
+                    );
+                }
+                bail!("pick one by id: constant carry --session <id> ...");
+            }
+        }
+    }
+}
+
+/// Sessions whose display name matches `q` (case-insensitive; exact-name
+/// matches outrank contains-matches), newest first, names fully resolved
+/// (this is a one-shot lookup — the per-file title reads are worth it).
+fn name_candidates(q: &str, cwd: Option<&Path>) -> Vec<picker::PickEntry> {
+    let ql = q.to_lowercase();
+    let naming = trail::naming_index();
+    let mut exact = Vec::new();
+    let mut partial = Vec::new();
+    for rt in [
+        Runtime::Codex,
+        Runtime::Claude,
+        Runtime::OpenCode,
+        Runtime::Gemini,
+    ] {
+        for s in alembic::list_sessions(rt, cwd, false) {
+            let mtime_secs = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let entry = picker::PickEntry {
+                runtime: rt,
+                trail: naming.get(&s.id).cloned(),
+                runtime_title: s.title.filter(|t| !t.is_empty()),
+                id: s.id,
+                path: s.path,
+                cwd: s.cwd,
+                mtime_secs,
+            };
+            // Only REAL names participate — when display() falls back to the
+            // raw id, "name matching" would just be a looser, more dangerous
+            // version of the id resolution step 1 already does exactly.
+            let name = entry.display();
+            if name == entry.id {
+                continue;
+            }
+            let name = name.to_lowercase();
+            if name == ql {
+                exact.push(entry);
+            } else if name.contains(&ql) {
+                partial.push(entry);
+            }
+        }
+    }
+    let mut out = if exact.is_empty() { partial } else { exact };
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime_secs));
+    out
+}
+
 fn run_carry(rest: &[String]) -> Result<()> {
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
@@ -298,8 +437,8 @@ fn run_carry(rest: &[String]) -> Result<()> {
     // Resolve the source: its path, native id, and which runtime it belongs to.
     let (src_path, src_id, from_rt) = match &session {
         Some(p) => {
-            // Resolve a path OR session id to the real file, then identify it.
-            let resolved = alembic::resolve_session(p)?;
+            // Resolve a path, session id, handle, or name to the real file.
+            let resolved = resolve_session_arg(&p.display().to_string())?;
             let (rt, id) = alembic::identify(&resolved)
                 .with_context(|| format!("could not identify session {}", resolved.display()))?;
             (resolved, id, rt)

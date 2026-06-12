@@ -198,6 +198,115 @@ fn spawn_enrichment(generation: u64, rows: &[PickEntry], tx: mpsc::Sender<(u64, 
     true
 }
 
+/// The screen's wording — the same picker serves more than one verb
+/// (resume's full picker, carry's duplicate disambiguation).
+struct Chrome<'a> {
+    title: &'a str,
+    verb: &'a str,
+    /// Overrides the computed place label when set (e.g. "matches").
+    scope_label: Option<&'a str>,
+}
+
+/// Pick among a FIXED candidate list — the disambiguation screen for
+/// duplicate names (claude and codex both allow several sessions to share
+/// one title). Same look and keys as the resume picker, no scopes, no
+/// background sweep: the candidates already carry their names.
+pub fn pick_among(title: &str, candidates: Vec<PickEntry>) -> Result<Option<PickEntry>> {
+    if !crate::tui::interactive() {
+        anyhow::bail!("picking among duplicates needs an interactive terminal");
+    }
+    let chrome = Chrome {
+        title,
+        verb: "choose",
+        scope_label: Some("matches"),
+    };
+    let scope = Scope {
+        place: Place::All,
+        constant_only: false,
+    };
+    let mut query = String::new();
+    let mut selected: usize = 0;
+    let mut page: usize = 0;
+    let mut dirty = true;
+
+    let _screen = Screen::enter()?;
+    loop {
+        if dirty {
+            let visible = filter(&candidates, &query);
+            let ps = page_size();
+            let pages = visible.len().div_ceil(ps).max(1);
+            page = page.min(pages - 1);
+            let start = page * ps;
+            let end = (start + ps).min(visible.len());
+            if selected < start || selected >= end {
+                selected = start;
+            }
+            draw(&visible, &query, selected, page, scope, false, None, &chrome)?;
+            dirty = false;
+        }
+        if !event::poll(Duration::from_millis(60))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else {
+            dirty = true;
+            continue;
+        };
+        if k.kind == event::KeyEventKind::Release {
+            continue;
+        }
+        dirty = true;
+        let visible_len = filter(&candidates, &query).len();
+        let ps = page_size();
+        let page_start = page * ps;
+        let page_end = (page_start + ps).min(visible_len);
+        match (k.code, k.modifiers) {
+            (KeyCode::Esc, _) => return Ok(None),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
+            (KeyCode::Enter, _) => {
+                let visible = filter(&candidates, &query);
+                if let Some(e) = visible.get(selected) {
+                    return Ok(Some((*e).clone()));
+                }
+            }
+            (KeyCode::Up, _) => {
+                if selected > page_start {
+                    selected -= 1;
+                }
+            }
+            (KeyCode::Down, _) => {
+                if selected + 1 < page_end {
+                    selected += 1;
+                }
+            }
+            (KeyCode::PageUp, _) => {
+                if page > 0 {
+                    page -= 1;
+                    selected = page * ps;
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                if page_end < visible_len {
+                    page += 1;
+                    selected = page * ps;
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                query.pop();
+                selected = 0;
+                page = 0;
+            }
+            (KeyCode::Char(c), m)
+                if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+            {
+                query.push(c);
+                selected = 0;
+                page = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Run the picker. Returns the chosen entry, or None on cancel.
 /// `start_cwd` seeds the [folder] place; Tab toggles folder ↔ everywhere,
 /// Ctrl-T lays the constant lens over either.
@@ -269,6 +378,11 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                 scope,
                 scanning,
                 start_cwd.as_deref(),
+                &Chrome {
+                    title: "resume a session",
+                    verb: "resume",
+                    scope_label: None,
+                },
             )?;
             dirty = false;
         }
@@ -379,6 +493,7 @@ fn draw(
     scope: Scope,
     scanning: bool,
     cwd: Option<&std::path::Path>,
+    chrome: &Chrome,
 ) -> Result<()> {
     let (width, _) = crate::tui::dimensions();
     let list_rows = page_size();
@@ -394,7 +509,8 @@ fn draw(
 
     // Header.
     s.push_str(&format!(
-        "  {BOLD}constant{RESET} \u{2014} resume a session\r\n\r\n"
+        "  {BOLD}constant{RESET} \u{2014} {}\r\n\r\n",
+        chrome.title
     ));
     // The scope reads as place + lens: `[everywhere · constant]`.
     let place_label = match scope.place {
@@ -404,10 +520,12 @@ fn draw(
             .unwrap_or_else(|| "folder".to_string()),
         Place::All => "everywhere".to_string(),
     };
-    let scope_label = if scope.constant_only {
-        format!("[{place_label} \u{b7} {BOLD}constant{RESET}{DIM}]")
-    } else {
-        format!("[{place_label}]")
+    let scope_label = match chrome.scope_label {
+        Some(label) => format!("[{label}]"),
+        None if scope.constant_only => {
+            format!("[{place_label} \u{b7} {BOLD}constant{RESET}{DIM}]")
+        }
+        None => format!("[{place_label}]"),
     };
     let scan_note = if scanning {
         " \u{b7} scanning names\u{2026}"
@@ -481,10 +599,11 @@ fn draw(
     // Footer: position + page, then the keys.
     let pages = visible.len().div_ceil(list_rows).max(1);
     s.push_str(&format!(
-        "\r\n  {DIM}{} of {} \u{b7} page {}/{pages} \u{b7} enter resume \u{b7} \u{2191}\u{2193} within \u{b7} pgup/pgdn turn \u{b7} tab scope \u{b7} ^t constant \u{b7} esc{RESET}\r\n",
+        "\r\n  {DIM}{} of {} \u{b7} page {}/{pages} \u{b7} enter {} \u{b7} \u{2191}\u{2193} within \u{b7} pgup/pgdn turn \u{b7} tab scope \u{b7} ^t constant \u{b7} esc{RESET}\r\n",
         if visible.is_empty() { 0 } else { selected + 1 },
         visible.len(),
         page + 1,
+        chrome.verb,
     ));
 
     let mut out = std::io::stdout();

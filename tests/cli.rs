@@ -146,6 +146,79 @@ fn carry_requires_a_source() {
     assert!(err(&o).contains("requires"), "{}", err(&o));
 }
 
+/// `--session` resolves the spellings a person actually types: the trail
+/// HANDLE (globally unique) and the conversation NAME — and duplicate names
+/// are refused with the candidates listed (claude/codex allow duplicates).
+#[test]
+fn carry_session_resolves_handles_and_names() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+
+    // The handle the trail minted for this conversation.
+    let trail_out = out(&run(&dir, &["trail", "--all", "--plain"]));
+    let handle = trail_out
+        .split_whitespace()
+        .find(|w| {
+            w.contains('-')
+                && w.split_once('-')
+                    .map(|(c, t)| c.chars().all(|ch| ch.is_ascii_lowercase())
+                        && !c.is_empty()
+                        && t.chars().all(|ch| ch.is_ascii_digit())
+                        && !t.is_empty())
+                    .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("no handle in trail output: {trail_out}"))
+        .to_string();
+
+    // Carry BY HANDLE: resolves to the conversation's latest projection.
+    let o = run(&dir, &["carry", "--to", "codex", "--session", &handle, "--json"]);
+    assert!(o.status.success(), "carry by handle failed: {}", err(&o));
+
+    // Carry BY NAME: the projection's display name (the stamped trail name,
+    // "from-the-fixture") — a unique contains-match resolves without a TTY.
+    let o = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", "from-the-fixture", "--json"],
+    );
+    assert!(o.status.success(), "carry by name failed: {}", err(&o));
+}
+
+#[test]
+fn carry_session_refuses_duplicate_names_without_a_terminal() {
+    let dir = tmpdir();
+    let a = ir_fixture_named(&dir, "a.json", "dup-aaaa", "duplicate name here");
+    let b = ir_fixture_named(&dir, "b.json", "dup-bbbb", "duplicate name here");
+    for f in [&a, &b] {
+        let o = run(
+            &dir,
+            &["carry", "--to", "claude", "--session", f.to_str().unwrap()],
+        );
+        assert!(o.status.success(), "{}", err(&o));
+    }
+
+    // Two claude projections now share the name. Piped (no TTY): list + bail.
+    let o = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", "duplicate-name-here"],
+    );
+    assert!(!o.status.success(), "duplicate names must not auto-pick");
+    assert!(
+        err(&o).contains("several sessions match"),
+        "wrong error: {}",
+        err(&o)
+    );
+    assert!(
+        err(&o).contains("pick one by id"),
+        "should teach the way out: {}",
+        err(&o)
+    );
+}
+
 #[test]
 fn carry_from_and_session_are_mutually_exclusive() {
     let dir = tmpdir();
