@@ -220,7 +220,7 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
     let mut scanning = spawn_enrichment(generation, &all_entries, tx.clone());
     let mut query = String::new();
     let mut selected: usize = 0;
-    let mut offset: usize = 0;
+    let mut page: usize = 0;
     let mut dirty = true;
 
     let _screen = Screen::enter()?;
@@ -251,14 +251,21 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
 
         if dirty {
             let visible = filter(&all_entries, &query);
-            if selected >= visible.len() {
-                selected = visible.len().saturating_sub(1);
+            // Pages are fixed windows; the selection lives inside the
+            // current one (a shrunken filter pulls both back into range).
+            let ps = page_size();
+            let pages = visible.len().div_ceil(ps).max(1);
+            page = page.min(pages - 1);
+            let start = page * ps;
+            let end = (start + ps).min(visible.len());
+            if selected < start || selected >= end {
+                selected = start;
             }
             draw(
                 &visible,
                 &query,
                 selected,
-                &mut offset,
+                page,
                 scope,
                 scanning,
                 start_cwd.as_deref(),
@@ -278,6 +285,9 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                 }
                 dirty = true;
                 let visible_len = filter(&all_entries, &query).len();
+                let ps = page_size();
+                let page_start = page * ps;
+                let page_end = (page_start + ps).min(visible_len);
                 match (k.code, k.modifiers) {
                     (KeyCode::Esc, _) => return Ok(None),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
@@ -287,18 +297,37 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                             return Ok(Some((*e).clone()));
                         }
                     }
-                    (KeyCode::Up, _) => selected = selected.saturating_sub(1),
+                    // Arrows stay INSIDE the page; only the page keys turn it.
+                    (KeyCode::Up, _) => {
+                        if selected > page_start {
+                            selected -= 1;
+                        }
+                    }
                     (KeyCode::Down, _) => {
-                        if selected + 1 < visible_len {
+                        if selected + 1 < page_end {
                             selected += 1;
                         }
                     }
-                    (KeyCode::PageUp, _) => selected = selected.saturating_sub(page_size()),
-                    (KeyCode::PageDown, _) => {
-                        selected = (selected + page_size()).min(visible_len.saturating_sub(1));
+                    (KeyCode::PageUp, _) => {
+                        if page > 0 {
+                            page -= 1;
+                            selected = page * ps;
+                        }
                     }
-                    (KeyCode::Home, _) => selected = 0,
-                    (KeyCode::End, _) => selected = visible_len.saturating_sub(1),
+                    (KeyCode::PageDown, _) => {
+                        if page_end < visible_len {
+                            page += 1;
+                            selected = page * ps;
+                        }
+                    }
+                    (KeyCode::Home, _) => {
+                        page = 0;
+                        selected = 0;
+                    }
+                    (KeyCode::End, _) => {
+                        selected = visible_len.saturating_sub(1);
+                        page = selected / ps;
+                    }
                     (KeyCode::Tab, _) => {
                         scope.place = match scope.place {
                             Place::Cwd => Place::All,
@@ -309,7 +338,7 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                         all_entries = load(scope, start_cwd.as_deref());
                         scanning = spawn_enrichment(generation, &all_entries, tx.clone());
                         selected = 0;
-                        offset = 0;
+                        page = 0;
                     }
                     (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
                         scope.constant_only = !scope.constant_only;
@@ -317,11 +346,12 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                         all_entries = load(scope, start_cwd.as_deref());
                         scanning = spawn_enrichment(generation, &all_entries, tx.clone());
                         selected = 0;
-                        offset = 0;
+                        page = 0;
                     }
                     (KeyCode::Backspace, _) => {
                         query.pop();
                         selected = 0;
+                        page = 0;
                     }
                     (KeyCode::Char(c), m)
                         if !m.contains(KeyModifiers::CONTROL)
@@ -329,6 +359,7 @@ pub fn pick(start_cwd: Option<PathBuf>) -> Result<Option<PickEntry>> {
                     {
                         query.push(c);
                         selected = 0;
+                        page = 0;
                     }
                     _ => {}
                 }
@@ -344,21 +375,14 @@ fn draw(
     visible: &[&PickEntry],
     query: &str,
     selected: usize,
-    offset: &mut usize,
+    page: usize,
     scope: Scope,
     scanning: bool,
     cwd: Option<&std::path::Path>,
 ) -> Result<()> {
     let (width, _) = crate::tui::dimensions();
     let list_rows = page_size();
-
-    // Keep the selection inside the window.
-    if selected < *offset {
-        *offset = selected;
-    }
-    if selected >= *offset + list_rows {
-        *offset = selected + 1 - list_rows;
-    }
+    let page_start = page * list_rows;
 
     const DIM: &str = "\x1b[2m";
     const BOLD: &str = "\x1b[1m";
@@ -406,7 +430,7 @@ fn draw(
     for (i, e) in visible
         .iter()
         .enumerate()
-        .skip(*offset)
+        .skip(page_start)
         .take(list_rows)
     {
         let color = trail::runtime_paint(e.runtime.label());
@@ -454,14 +478,13 @@ fn draw(
         }
     }
 
-    // Footer: position + page, then the keys. The page is the fixed window
-    // the SELECTION sits in (stable while the scroll offset slides).
+    // Footer: position + page, then the keys.
     let pages = visible.len().div_ceil(list_rows).max(1);
-    let page = (selected / list_rows) + 1;
     s.push_str(&format!(
-        "\r\n  {DIM}{} of {} \u{b7} page {page}/{pages} \u{b7} enter resume \u{b7} \u{2191}\u{2193} pgup/pgdn \u{b7} tab folder/everywhere \u{b7} ^t constant \u{b7} esc{RESET}\r\n",
+        "\r\n  {DIM}{} of {} \u{b7} page {}/{pages} \u{b7} enter resume \u{b7} \u{2191}\u{2193} within \u{b7} pgup/pgdn turn \u{b7} tab scope \u{b7} ^t constant \u{b7} esc{RESET}\r\n",
         if visible.is_empty() { 0 } else { selected + 1 },
         visible.len(),
+        page + 1,
     ));
 
     let mut out = std::io::stdout();
