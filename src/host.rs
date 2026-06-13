@@ -237,6 +237,11 @@ struct SwitchRequest {
     /// Land in THIS projection (id, path) instead of the ledger-resolved
     /// stable pair — the graph cursor's Enter. Validated before use.
     landing: Option<Landing>,
+    /// Resume the landing's native file AS IT IS — go back to that chapter,
+    /// never distill the live thread into it. The graph cursor's Enter. When
+    /// false, `landing` (if any) is a carry target, the prior overwrite-on-land
+    /// behaviour. Forking from a chapter is c/x/o, which leave this false.
+    resume_in_place: bool,
 }
 
 /// A specific projection to land in: (session id, file path).
@@ -338,13 +343,17 @@ fn request_switch(
     new: bool,
     paged: bool,
     landing: Option<Landing>,
+    resume_in_place: bool,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) {
-    if session.runtime == target
-        || switching_to.is_some()
-        || !crate::alembic::supports_target(target)
-    {
+    if switching_to.is_some() || !crate::alembic::supports_target(target) {
+        return;
+    }
+    // A carry to the runtime you're already in is a no-op; a resume-in-place
+    // may target the same runtime (go back to an OLDER chapter of the same
+    // kind), so it's allowed through.
+    if !resume_in_place && session.runtime == target {
         return;
     }
     // Termination is deferred to the carry gate at the end of the input
@@ -355,6 +364,7 @@ fn request_switch(
         new,
         paged,
         landing,
+        resume_in_place,
     });
 }
 
@@ -513,13 +523,13 @@ fn execute_command(
     match parts.as_slice() {
         ["switch", rt] | ["s", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, false, paged, None, session, switching_to);
+                request_switch(target, false, paged, None, false, session, switching_to);
             }
             Action::None
         }
         ["new", rt] | ["n", rt] | ["fork", rt] | ["switch", "--new", rt] | ["s", "--new", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, true, paged, None, session, switching_to);
+                request_switch(target, true, paged, None, false, session, switching_to);
             }
             Action::None
         }
@@ -675,6 +685,8 @@ fn render_graph(
     now: u64,
     sel: usize,
     notice: Option<&str>,
+    here_id: Option<&str>,
+    here_origin: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
@@ -694,13 +706,27 @@ fn render_graph(
         }
     }
 
-    // Head: where you are right now (the chapter being written).
-    let head_color = runtime_color(hosting);
-    out.push_str(&format!(
-        "  {head_color}\u{25c9}{RESET}  \x1b[1mch{:02}\x1b[0m  {head_color}{}{RESET}  {DIM}\u{2190} you are here{RESET}\r\n",
-        chapters.len() + 1,
-        hosting,
-    ));
+    // Head: where you are right now. Only a SEPARATE node when you're not
+    // already inside a recorded chapter — otherwise the live position is marked
+    // on that chapter's own row below (no phantom "next chapter"). The origin —
+    // the thread the chapters were carried out of — is named as such, not given
+    // a chapter number it never earned.
+    let here_in_chapter = here_id.is_some_and(|h| chapters.iter().any(|c| c.id == h));
+    if !here_in_chapter {
+        let head_color = runtime_color(hosting);
+        let (tag, hint): (String, &str) = if here_origin {
+            (
+                "origin".to_string(),
+                "\u{2190} you are here \u{b7} the thread the chapters were carried from",
+            )
+        } else {
+            (format!("ch{:02}", chapters.len() + 1), "\u{2190} you are here")
+        };
+        out.push_str(&format!(
+            "  {head_color}\u{25c9}{RESET}  \x1b[1m{tag}\x1b[0m  {head_color}{}{RESET}  {DIM}{hint}{RESET}\r\n",
+            hosting,
+        ));
+    }
 
     let shown = graph_shown(chapters.len(), rows);
     let hidden = chapters.len() - shown;
@@ -715,11 +741,16 @@ fn render_graph(
             "restore" => format!("{DIM}\u{2570}\u{2500}{RESET}\u{25cb}"),
             _ => format!("{color}\u{25cf}{RESET}"),
         };
-        let record = if ch.recorded {
+        let mut record = if ch.recorded {
             format!("  {DIM}rec \u{2713}{RESET}")
         } else {
             String::new()
         };
+        // When you resumed straight into a recorded chapter, mark it here
+        // rather than inventing a phantom head above.
+        if here_id == Some(ch.id.as_str()) {
+            record.push_str(&format!("  {DIM}\u{2190} you are here{RESET}"));
+        }
         // The cursor: where Enter lands. Drawn rows are newest-first.
         let cursor = if i == sel && !chapters.is_empty() {
             "\x1b[7m\u{276f}\x1b[0m "
@@ -1160,6 +1191,10 @@ pub fn run(
     // The graph's cursor: the chapters on display (newest first when drawn),
     // which row is selected, and a one-shot notice under the rails.
     let mut view_chapters: Vec<crate::trail::ChapterRow> = Vec::new();
+    // The live session is the conversation's origin (the thread its chapters
+    // were carried from) — computed when the graph opens, so the head reads
+    // "origin" not a phantom chapter number.
+    let mut view_here_origin = false;
     let mut view_sel: usize = 0;
     let mut view_notice: Option<String> = None;
     // Installed-version preflight, off the hot path (each `--version` is a
@@ -1312,6 +1347,76 @@ pub fn run(
                     write_reset(&mut out); // undo outgoing child's terminal modes
                     let _ = out.write_all(b"\x1b[2J\x1b[H");
 
+                    let spawned = if request.resume_in_place {
+                        // GO BACK to a chapter (graph Enter): resume its native
+                        // file exactly as it is. We never distill the live thread
+                        // into it — that overwrite-on-land was the contamination
+                        // bug. The chapter file already IS a complete session, so
+                        // we just reopen it. Re-seat the harness identity from the
+                        // ledger so the bar and naming follow, and record NO new
+                        // chapter — a resume is not a hop; the next carry is.
+                        match request.landing.clone() {
+                            Some((land_id, land_path)) => {
+                                let (cid, last_n, projs) =
+                                    crate::trail::resume(&land_path, &land_id);
+                                root_id = Some(cid.clone());
+                                trail_n = last_n;
+                                owned.clear();
+                                for (rt, id, path) in projs {
+                                    owned.insert(rt, (id, path));
+                                }
+                                let slug = root_slug
+                                    .clone()
+                                    .unwrap_or_else(|| crate::trail::slug(&cid));
+                                let nm = crate::trail::naming_for(&cid, &slug, None);
+                                root_slug = Some(crate::trail::slug(&nm.name));
+                                naming = Some(nm.clone());
+                                let chap_n = crate::trail::chapters(&cid)
+                                    .iter()
+                                    .find(|c| c.id == land_id)
+                                    .map(|c| c.n)
+                                    .unwrap_or(last_n);
+                                let ct = runtime_color(target.label());
+                                let _ = out.write_all(
+                                    format!(
+                                        "\x1b[2m  {} · {} · \u{21a9} resume ch{chap_n:02} \x1b[0m{ct}{}\x1b[0m\r\n",
+                                        nm.handle,
+                                        nm.name,
+                                        target.label(),
+                                    )
+                                    .as_bytes(),
+                                );
+                                let _ = out.flush();
+                                bar_notice = Some((
+                                    format!(
+                                        " \u{21a9} ch{chap_n:02} \u{b7} {} \u{b7} resumed as it was ",
+                                        nm.name,
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                                child_spawned_at = std::time::SystemTime::now();
+                                spawn_settled(
+                                    target,
+                                    Some(&land_id),
+                                    from,
+                                    None,
+                                    host_cwd.as_deref(),
+                                    c,
+                                    r,
+                                    &tx,
+                                    &mut out,
+                                )?
+                            }
+                            None => {
+                                // No landing to resume (unreachable): keep the
+                                // current runtime alive, fresh, rather than die.
+                                child_spawned_at = std::time::SystemTime::now();
+                                spawn_settled(
+                                    target, None, from, None, None, c, r, &tx, &mut out,
+                                )?
+                            }
+                        }
+                    } else {
                     // Read source for `from`, strongest evidence first:
                     //  1. DECLARED identity — the session id we positively know
                     //     the child owns (resumed id, or minted at launch).
@@ -1354,7 +1459,7 @@ pub fn run(
                         crate::alembic::distill_source(src_path, with_tools)
                     });
 
-                    let spawned = match (src, distilled) {
+                    match (src, distilled) {
                         (Some((src_path, src_id)), Some(Ok(mut distilled))) => {
                             // Which conversation does the LIVE source belong to?
                             // Re-resolved every switch (via the ledger), not just
@@ -1606,6 +1711,7 @@ pub fn run(
                             child_spawned_at = std::time::SystemTime::now();
                             spawn_settled(target, None, from, None, None, c, r, &tx, &mut out)?
                         }
+                    }
                     };
                     session = spawned.0;
                     child_session = spawned.1;
@@ -1797,6 +1903,17 @@ pub fn run(
                                             .as_deref()
                                             .map(crate::trail::chapters)
                                             .unwrap_or_default();
+                                        // Origin = the live session is this
+                                        // conversation's source, not one of its
+                                        // chapters (lineage_index tags it so).
+                                        view_here_origin = child_session
+                                            .as_deref()
+                                            .is_some_and(|id| {
+                                                crate::trail::lineage_index()
+                                                    .get(id)
+                                                    .map(|t| t == "origin")
+                                                    .unwrap_or(false)
+                                            });
                                         view_sel = 0;
                                         view_notice = None;
                                         let now = std::time::SystemTime::now()
@@ -1811,6 +1928,8 @@ pub fn run(
                                             now,
                                             view_sel,
                                             view_notice.as_deref(),
+                                            child_session.as_deref(),
+                                            view_here_origin,
                                         );
                                         let _ = out.write_all(view.as_bytes());
                                         let _ = out.flush();
@@ -1853,6 +1972,7 @@ pub fn run(
                                             fork,
                                             default_paged,
                                             None,
+                                            false,
                                             &mut session,
                                             &mut switching_to,
                                         );
@@ -1890,6 +2010,7 @@ pub fn run(
                                         fork,
                                         paged,
                                         None,
+                                        false,
                                         &mut session,
                                         &mut switching_to,
                                     ),
@@ -2113,15 +2234,21 @@ pub fn run(
                                     _ => None,
                                 };
                             match key {
-                                // Enter: land in the selected node's projection.
+                                // Enter: GO BACK to the selected chapter — resume
+                                // its native file as it was. Not a carry: the live
+                                // thread is never written into it (forking forward
+                                // from a chapter is c/x/o). Same runtime is fine —
+                                // that's just an older chapter of the same kind.
                                 Some(0x0d) | Some(0x0a) if !view_chapters.is_empty() => {
                                     let row = view_chapters.iter().rev().nth(view_sel);
                                     match row {
                                         Some(ch) => match Runtime::parse(&ch.to) {
-                                            Ok(rt) if rt == session.runtime => {
+                                            Ok(_) if child_session.as_deref()
+                                                == Some(ch.id.as_str()) =>
+                                            {
                                                 view_notice = Some(format!(
-                                                    "ch{:02} is {} — already the runtime you're in",
-                                                    ch.n, ch.to
+                                                    "ch{:02} is where you already are",
+                                                    ch.n
                                                 ));
                                                 redraw = true;
                                             }
@@ -2183,6 +2310,8 @@ pub fn run(
                                     now,
                                     view_sel,
                                     view_notice.as_deref(),
+                                    child_session.as_deref(),
+                                    view_here_origin,
                                 );
                                 let _ = out.write_all(view.as_bytes());
                                 let _ = out.flush();
@@ -2190,7 +2319,18 @@ pub fn run(
                             if let Some((rt, fork, landing)) = switch_to {
                                 leave_view(&mut out, &mut view_alt, &mut view_buf);
                                 mode = M_NORMAL;
-                                request_switch(rt, fork, default_paged, landing, &mut session, &mut switching_to);
+                                // Enter carries a landing → resume that chapter as
+                                // it was. c/x/o carry no landing → fork forward.
+                                let resume_in_place = landing.is_some();
+                                request_switch(
+                                    rt,
+                                    fork,
+                                    default_paged,
+                                    landing,
+                                    resume_in_place,
+                                    &mut session,
+                                    &mut switching_to,
+                                );
                             }
                             if close {
                                 mode = M_NORMAL;
@@ -2223,7 +2363,7 @@ pub fn run(
                 if let Some(req) = &switching_to
                     && !term_sent
                 {
-                    let proceed = req.new || {
+                    let proceed = req.new || req.resume_in_place || {
                         let declared = child_session
                             .as_deref()
                             .and_then(|id| crate::alembic::session_by_id(session.runtime, id))
@@ -2356,7 +2496,7 @@ mod tests {
                 path: format!("/tmp/proj-{n}.jsonl"),
             })
             .collect();
-        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000, 0, None);
+        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000, 0, None, None, false);
         assert!(view.contains("cobalt-37"), "{view}");
         assert!(view.contains("auth redirect bug"));
         assert!(view.contains("ch05"), "head chapter missing: {view}");
@@ -2365,11 +2505,11 @@ mod tests {
         assert!(view.contains("rec \u{2713}"), "record marker missing");
 
         // Tiny terminal: old chapters truncate with an honest count.
-        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000, 0, None);
+        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000, 0, None, None, false);
         assert!(small.contains("earlier chapters"), "{small}");
 
         // No thread yet: says so instead of pretending.
-        let empty = render_graph(None, &[], "codex", 40, 2_000_000, 0, None);
+        let empty = render_graph(None, &[], "codex", 40, 2_000_000, 0, None, None, false);
         assert!(empty.contains("no thread yet"));
 
         // The cursor rides the selected row (newest-first), and a notice shows.
@@ -2381,9 +2521,76 @@ mod tests {
             2_000_000,
             1,
             Some("ch02's projection is gone"),
+            None,
+            false,
         );
         assert!(with_sel.contains("\u{276f}"), "no cursor: {with_sel}");
         assert!(with_sel.contains("projection is gone"));
+    }
+
+    #[test]
+    fn graph_head_reflects_where_you_actually_are() {
+        let nm = crate::trail::Naming {
+            handle: "iris-19".to_string(),
+            name: "CONSTANT FABLE".to_string(),
+            named: true,
+        };
+        let chapters: Vec<crate::trail::ChapterRow> = (1..=2)
+            .map(|n| crate::trail::ChapterRow {
+                n,
+                from: "claude".to_string(),
+                to: if n == 2 { "codex" } else { "claude" }.to_string(),
+                ts: 1_000_000 + n as u64,
+                mode: "new-fork".to_string(),
+                recorded: true,
+                id: format!("proj-{n}"),
+                path: format!("/tmp/proj-{n}.jsonl"),
+            })
+            .collect();
+
+        // Sitting IN ch01: it's marked here, and no phantom "ch03" head appears.
+        let in_ch1 = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("proj-1"),
+            false,
+        );
+        assert!(in_ch1.contains("you are here"), "{in_ch1}");
+        assert!(!in_ch1.contains("ch03"), "phantom head leaked: {in_ch1}");
+
+        // Sitting in the ORIGIN: head says so, not a chapter number it never had.
+        let at_origin = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("the-origin-id"),
+            true,
+        );
+        assert!(at_origin.contains("origin"), "{at_origin}");
+        assert!(!at_origin.contains("ch03"), "phantom head leaked: {at_origin}");
+
+        // A genuinely fresh position still earns the next-chapter head.
+        let fresh = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("brand-new-id"),
+            false,
+        );
+        assert!(fresh.contains("ch03"), "fresh head missing: {fresh}");
     }
 
     #[test]
