@@ -40,6 +40,10 @@ pub struct PickEntry {
     pub runtime_title: Option<String>,
     /// (name, handle, named) when the constant trail knows this session.
     pub trail: Option<(String, String, bool)>,
+    /// Lineage tag when this session sits in a known conversation: "ch02", or
+    /// "origin" for the source it was first carried from. Distinguishes the
+    /// projections of one conversation, which otherwise share a name.
+    pub lineage: Option<String>,
     pub cwd: Option<String>,
     pub mtime_secs: u64,
 }
@@ -70,6 +74,7 @@ impl PickEntry {
 /// reads; see the module docs for what streams in afterwards).
 pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
     let naming = trail::naming_index();
+    let lineage = trail::lineage_index();
     let mut out = Vec::new();
     for rt in [
         Runtime::Codex,
@@ -86,6 +91,7 @@ pub fn entries(cwd: Option<&std::path::Path>) -> Vec<PickEntry> {
             out.push(PickEntry {
                 runtime: rt,
                 trail: naming.get(&s.id).cloned(),
+                lineage: lineage.get(&s.id).cloned(),
                 runtime_title: s.title.filter(|t| !t.is_empty()),
                 id: s.id,
                 path: s.path,
@@ -568,6 +574,11 @@ fn draw(
         if let Some(h) = e.handle() {
             name.push_str(&format!(" {DIM}\u{b7} {}{RESET}", crate::term_safe(h)));
         }
+        // …then the chapter, so three projections of one conversation read as
+        // origin · ch01 · ch02 instead of three identical names.
+        if let Some(tag) = &e.lineage {
+            name.push_str(&format!(" {DIM}\u{b7} {tag}{RESET}"));
+        }
         // Everywhere-scope shows each session's home, shortened.
         let home = std::env::var("HOME").unwrap_or_default();
         let place = if scope.place == Place::Cwd {
@@ -623,6 +634,7 @@ mod tests {
             path: PathBuf::new(),
             runtime_title: Some(title.into()),
             trail: None,
+            lineage: None,
             cwd: None,
             mtime_secs: ts,
         }

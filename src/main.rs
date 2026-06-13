@@ -336,6 +336,7 @@ fn name_candidates(q: &str, cwd: Option<&Path>) -> Vec<picker::PickEntry> {
             let entry = picker::PickEntry {
                 runtime: rt,
                 trail: naming.get(&s.id).cloned(),
+                lineage: None,
                 runtime_title: s.title.filter(|t| !t.is_empty()),
                 id: s.id,
                 path: s.path,
