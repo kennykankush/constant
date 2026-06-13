@@ -1171,6 +1171,55 @@ pub fn naming_index() -> std::collections::HashMap<String, (String, String, bool
     out
 }
 
+/// session_id -> a one-glance lineage tag: "ch07" for a chapter's target
+/// projection, "origin" for the source a conversation was first carried from.
+/// Lets `constant resume` tell the root from its chapters when their names match
+/// — without it, three projections of one conversation read identically.
+pub fn lineage_index() -> std::collections::HashMap<String, String> {
+    let entries = load_entries(None);
+    let chapters: Vec<&TrailEntry> = entries
+        .iter()
+        .filter(|e| e.mode.as_deref() != Some("rename"))
+        .collect();
+    let mut out = std::collections::HashMap::new();
+    // Chapter targets: id -> its chapter number; the smallest n wins so a reused
+    // file reads as the chapter it was born as.
+    for e in &chapters {
+        let tag = format!("ch{:02}", e.n);
+        out.entry(e.id.clone())
+            .and_modify(|cur: &mut String| {
+                if tag.as_str() < cur.as_str() {
+                    *cur = tag.clone();
+                }
+            })
+            .or_insert(tag);
+    }
+    // Origins: each conversation's first chapter's source — unless that id is
+    // itself a chapter target somewhere (never shadow a real chapter label).
+    let mut first_by_conv: std::collections::HashMap<&str, &TrailEntry> =
+        std::collections::HashMap::new();
+    for e in &chapters {
+        first_by_conv
+            .entry(e.conversation.as_str())
+            .and_modify(|cur| {
+                if e.n < cur.n {
+                    *cur = e;
+                }
+            })
+            .or_insert(e);
+    }
+    for e in first_by_conv.values() {
+        if let Some(src) = e.source_id.as_deref()
+            && src != "?"
+            && !src.is_empty()
+            && !out.contains_key(src)
+        {
+            out.insert(src.to_string(), "origin".to_string());
+        }
+    }
+    out
+}
+
 /// The newest record volume for a conversation that still exists on disk —
 /// the lost-record fallback for `constant resume`: when every live projection
 /// is gone, the conversation is reprinted from its latest record.
