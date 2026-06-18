@@ -286,11 +286,7 @@ pub fn explore(start_cwd: Option<PathBuf>) -> Result<Option<String>> {
                     }
                 }
                 KeyCode::Up => st.chap_sel = st.chap_sel.saturating_sub(1),
-                KeyCode::Down => {
-                    if st.chap_sel + 1 < st.chapters.len() {
-                        st.chap_sel += 1;
-                    }
-                }
+                KeyCode::Down if st.chap_sel + 1 < st.chapters.len() => st.chap_sel += 1,
                 _ => {}
             },
             Level::Chapter => {
