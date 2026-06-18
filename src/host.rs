@@ -350,10 +350,14 @@ fn request_switch(
     if switching_to.is_some() || !crate::alembic::supports_target(target) {
         return;
     }
-    // A carry to the runtime you're already in is a no-op; a resume-in-place
-    // may target the same runtime (go back to an OLDER chapter of the same
-    // kind), so it's allowed through.
-    if !resume_in_place && session.runtime == target {
+    // A same-runtime carry is only meaningful as a FORK (`new`) — duplicate or
+    // compact the live thread into a FRESH projection — or as a resume-in-place
+    // (an OLDER chapter). A same-runtime CONTINUE is rejected outright: verbatim
+    // it's a pure no-op, and PAGED it would try to rewrite the live projection
+    // onto its own source file — the overwrite guard then refuses and drops the
+    // user into a fresh empty session (the compact silently lost). So gate on
+    // `new`, NOT on `paged`: the compact-in-place gesture is always a fork.
+    if !resume_in_place && !new && session.runtime == target {
         return;
     }
     // Termination is deferred to the carry gate at the end of the input
@@ -531,6 +535,14 @@ fn execute_command(
             if let Ok(target) = Runtime::parse(rt) {
                 request_switch(target, true, paged, None, false, session, switching_to);
             }
+            Action::None
+        }
+        ["compact"] | ["compact", "--new"] => {
+            // Compact-in-place: re-page the CURRENT thread into a fresh paged
+            // projection of the same runtime. paged=true forces the compaction
+            // (overriding the launch default); new=true forks so the live
+            // source session is never overwritten.
+            request_switch(session.runtime, true, true, None, false, session, switching_to);
             Action::None
         }
         ["quit"] | ["q"] | ["detach"] => Action::Quit,
@@ -876,7 +888,7 @@ fn force_repaint(session: &Session, cols: u16, rows: u16) {
 
 /// Tab-completion for the `:` command line. Returns the completed buffer.
 fn complete_command(buf: &str, current_name: Option<&str>) -> Option<String> {
-    const VERBS: [&str; 5] = ["switch", "new", "rename", "quit", "fork"];
+    const VERBS: [&str; 6] = ["switch", "new", "rename", "quit", "fork", "compact"];
     const RUNTIMES: [&str; 4] = ["claude", "codex", "opencode", "gemini"];
     let ends_space = buf.ends_with(' ');
     let words: Vec<&str> = buf.split_whitespace().collect();
@@ -1943,10 +1955,26 @@ pub fn run(
                                     _ => {} // unknown: ignore
                                 }
                                 if let Some((rt, fork)) = want {
-                                    let blocked = rt == session.runtime
-                                        || switching_to.is_some()
-                                        || !crate::alembic::supports_target(rt);
-                                    if !blocked
+                                    if rt == session.runtime
+                                        && crate::alembic::supports_target(rt)
+                                        && switching_to.is_none()
+                                    {
+                                        // The key for the runtime you're ALREADY in
+                                        // = re-carry the live thread into a FRESH
+                                        // projection of the same runtime. A plain
+                                        // continue would be a no-op, so always offer
+                                        // the choice:  c → compact (paged) ·
+                                        // v → verbatim. Both fork (`new`), so the
+                                        // source session is never overwritten.
+                                        mode = M_RENDER;
+                                        pending_switch = Some((rt, true));
+                                        render_prompt = format!(
+                                            " constant \u{25b8} new in {} \u{b7} [v]erbatim \u{b7} [c]ompact (older turns filed, recallable) \u{b7} esc ",
+                                            rt.label()
+                                        );
+                                        bottom_overlay(&mut out, &render_prompt);
+                                    } else if switching_to.is_none()
+                                        && crate::alembic::supports_target(rt)
                                         && render.is_none()
                                         && source_worth_prompting(
                                             session.runtime,
@@ -2444,6 +2472,17 @@ mod tests {
         // A MODIFIED key (Ctrl-C: mods=5) must NOT decode as plain `c`.
         assert_eq!(command_key(&Token::Seq(b"\x1b[99;5u".to_vec())), None);
         assert_eq!(command_key(&Token::Prefix), None);
+    }
+
+    #[test]
+    fn complete_command_offers_compact_and_keeps_verbs() {
+        // The new in-host compaction verb tab-completes.
+        assert_eq!(complete_command("comp", None).as_deref(), Some("compact "));
+        // Existing verbs still complete uniquely.
+        assert_eq!(complete_command("ren", None).as_deref(), Some("rename "));
+        assert_eq!(complete_command("q", None).as_deref(), Some("quit "));
+        // An unknown prefix forces nothing.
+        assert_eq!(complete_command("zzz", None), None);
     }
 
     fn classify_all(bytes: &[u8], prefix_byte: u8) -> Vec<Token> {
