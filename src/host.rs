@@ -52,7 +52,7 @@ const MAX_ESC: usize = 256;
 /// never parses the child's output (invariant #7) and so cannot detect when the
 /// reply finishes: the human is the completion detector — watch it write, then
 /// switch.
-const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a short sign-out for whoever continues it: the goal as it stands, where we are right now, the key decisions and why, the exact next step, and any gotchas. Reply with only that sign-out.";
+const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a brief sign-out for whoever continues it — the goal as it stands, where we are now, the key decisions and WHY, approaches already tried and ruled out, the exact next step, and any gotchas. Don't restate git state or repeat the transcript (the next agent has both); don't invent — if something isn't settled, say so. Reply with only the sign-out.";
 
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
 /// terminal sends in legacy mode (Ctrl-<L> == <L> & 0x1f), plus a human label.
