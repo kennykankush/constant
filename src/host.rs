@@ -263,6 +263,7 @@ fn spawn_session(
     cols: u16,
     rows: u16,
     tx: Sender<Ev>,
+    yolo: bool,
 ) -> Result<Session> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -275,8 +276,8 @@ fn spawn_session(
         .context("openpty")?;
 
     let mut cmd = match mode {
-        SpawnMode::Resume(id) => runtime.resume_command(id),
-        SpawnMode::Fresh { session_id } => runtime.fresh_command(session_id),
+        SpawnMode::Resume(id) => runtime.resume_command(id, yolo),
+        SpawnMode::Fresh { session_id } => runtime.fresh_command(session_id, yolo),
     };
     if let Some(dir) = cwd {
         cmd.cwd(dir);
@@ -441,6 +442,7 @@ fn spawn_fresh(
     cols: u16,
     rows: u16,
     tx: Sender<Ev>,
+    yolo: bool,
 ) -> Result<(Session, Option<String>)> {
     let minted = match runtime {
         Runtime::Claude => crate::alembic::claude_supports_session_id()
@@ -458,6 +460,7 @@ fn spawn_fresh(
         cols,
         rows,
         tx,
+        yolo,
     )?;
     Ok((session, minted))
 }
@@ -478,9 +481,10 @@ fn spawn_settled(
     rows: u16,
     tx: &Sender<Ev>,
     out: &mut impl Write,
+    yolo: bool,
 ) -> Result<(Session, Option<String>)> {
     if let Some(id) = resume_id {
-        match spawn_session(target, SpawnMode::Resume(id), cwd, cols, rows, tx.clone()) {
+        match spawn_session(target, SpawnMode::Resume(id), cwd, cols, rows, tx.clone(), yolo) {
             Ok(s) => return Ok((s, Some(id.to_string()))),
             Err(e) => dim(
                 out,
@@ -491,7 +495,7 @@ fn spawn_settled(
             ),
         }
     }
-    match spawn_fresh(target, None, cols, rows, tx.clone()) {
+    match spawn_fresh(target, None, cols, rows, tx.clone(), yolo) {
         Ok(r) => return Ok(r),
         Err(e) => dim(
             out,
@@ -503,11 +507,11 @@ fn spawn_settled(
         ),
     }
     if let Some(id) = from_resume
-        && let Ok(s) = spawn_session(from, SpawnMode::Resume(id), None, cols, rows, tx.clone())
+        && let Ok(s) = spawn_session(from, SpawnMode::Resume(id), None, cols, rows, tx.clone(), yolo)
     {
         return Ok((s, Some(id.to_string())));
     }
-    spawn_fresh(from, None, cols, rows, tx.clone())
+    spawn_fresh(from, None, cols, rows, tx.clone(), yolo)
 }
 
 #[derive(PartialEq)]
@@ -944,6 +948,7 @@ fn child_rows(rows: u16, bar: bool) -> u16 {
 }
 
 /// Compose the bar line, truncated and padded to exactly `cols` columns.
+#[allow(clippy::too_many_arguments)]
 fn bar_text(
     runtime: Runtime,
     with_tools: bool,
@@ -952,6 +957,7 @@ fn bar_text(
     slug: Option<&str>,
     prefix_label: &str,
     cols: u16,
+    yolo: bool,
 ) -> String {
     let tools = if with_tools { "+tools" } else { "" };
     let thread = match slug {
@@ -960,8 +966,11 @@ fn bar_text(
         None => "no thread yet".to_string(),
     };
     let warn_mark = if warn { "\u{26a0}" } else { "" };
+    // EXTREMELY DANGEROUS mode is always visible: you should never be in a
+    // no-sandbox / no-approvals session without seeing it on every redraw.
+    let yolo_mark = if yolo { " \u{26a0}yolo" } else { "" };
     let full = format!(
-        " constant \u{b7} {}{tools}{warn_mark} \u{b7} {thread} \u{b7} {prefix_label} c/x=switch d=quit ",
+        " constant \u{b7} {}{tools}{warn_mark}{yolo_mark} \u{b7} {thread} \u{b7} {prefix_label} c/x=switch d=quit ",
         runtime.label()
     );
     let width = cols as usize;
@@ -991,6 +1000,7 @@ fn refresh_bar(
     slug: Option<&str>,
     prefix_label: &str,
     fallback: (u16, u16),
+    yolo: bool,
 ) {
     if !enabled {
         return;
@@ -1002,7 +1012,7 @@ fn refresh_bar(
     draw_bar(
         out,
         r,
-        &bar_text(runtime, with_tools, warn, trail_n, slug, prefix_label, c),
+        &bar_text(runtime, with_tools, warn, trail_n, slug, prefix_label, c, yolo),
     );
 }
 
@@ -1018,6 +1028,7 @@ pub fn run(
     render: Option<bool>,
     prefix: u8,
     prefix_label: String,
+    yolo: bool,
 ) -> Result<()> {
     // None = no --render flag at launch: long-thread switches ask
     // [v]erbatim · [c]ompact; Some(_) = explicit, never second-guessed.
@@ -1151,11 +1162,12 @@ pub fn run(
                 cols,
                 child_rows(rows, bar),
                 tx.clone(),
+                yolo,
             )?
         }
         None => {
             let (s, declared) =
-                spawn_fresh(initial, None, cols, child_rows(rows, bar), tx.clone())?;
+                spawn_fresh(initial, None, cols, child_rows(rows, bar), tx.clone(), yolo)?;
             child_session = declared;
             s
         }
@@ -1268,6 +1280,7 @@ pub fn run(
                             naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                             &prefix_label,
                             (cols, rows),
+                            yolo,
                         );
                     }
                     bar_dirty = false;
@@ -1417,6 +1430,7 @@ pub fn run(
                                     r,
                                     &tx,
                                     &mut out,
+                                    yolo,
                                 )?
                             }
                             None => {
@@ -1424,7 +1438,7 @@ pub fn run(
                                 // current runtime alive, fresh, rather than die.
                                 child_spawned_at = std::time::SystemTime::now();
                                 spawn_settled(
-                                    target, None, from, None, None, c, r, &tx, &mut out,
+                                    target, None, from, None, None, c, r, &tx, &mut out, yolo,
                                 )?
                             }
                         }
@@ -1659,6 +1673,7 @@ pub fn run(
                                         r,
                                         &tx,
                                         &mut out,
+                                        yolo,
                                     )?
                                 }
                                 Err(e) => {
@@ -1692,6 +1707,7 @@ pub fn run(
                                         r,
                                         &tx,
                                         &mut out,
+                                        yolo,
                                     )?
                                 }
                             }
@@ -1709,7 +1725,7 @@ pub fn run(
                                 std::time::Instant::now(),
                             ));
                             child_spawned_at = std::time::SystemTime::now();
-                            spawn_settled(target, None, from, Some(&src_id), None, c, r, &tx, &mut out)?
+                            spawn_settled(target, None, from, Some(&src_id), None, c, r, &tx, &mut out, yolo)?
                         }
                         _ => {
                             dim(&mut out, "no conversation here to carry; starting fresh");
@@ -1721,7 +1737,7 @@ pub fn run(
                                 std::time::Instant::now(),
                             ));
                             child_spawned_at = std::time::SystemTime::now();
-                            spawn_settled(target, None, from, None, None, c, r, &tx, &mut out)?
+                            spawn_settled(target, None, from, None, None, c, r, &tx, &mut out, yolo)?
                         }
                     }
                     };
@@ -1745,6 +1761,7 @@ pub fn run(
                         naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                         &prefix_label,
                         (cols, rows),
+                        yolo,
                     );
                     bar_dirty = bar_notice.is_some() && bar;
                 } else if watchdog.elapsed() < std::time::Duration::from_secs(2)
@@ -1767,7 +1784,7 @@ pub fn run(
                     );
                     let (c, r) = size().unwrap_or((cols, rows));
                     child_spawned_at = std::time::SystemTime::now();
-                    match spawn_fresh(rt, None, c, child_rows(r, bar), tx.clone()) {
+                    match spawn_fresh(rt, None, c, child_rows(r, bar), tx.clone(), yolo) {
                         Ok((s, declared)) => {
                             session = s;
                             child_session = declared;
@@ -1783,6 +1800,7 @@ pub fn run(
                                 naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                                 &prefix_label,
                                 (cols, rows),
+                                yolo,
                             );
                             bar_dirty = false;
                         }
@@ -1811,6 +1829,7 @@ pub fn run(
                     naming.as_ref().map(|nm| nm.name.as_str()).or(root_slug.as_deref()),
                     &prefix_label,
                     (cols, rows),
+                    yolo,
                 );
                 bar_dirty = false;
             }
@@ -2706,18 +2725,22 @@ mod tests {
     #[test]
     fn bar_text_is_exactly_terminal_width() {
         // Fits: padded to width.
-        let t = bar_text(Runtime::Codex, false, false, 4, Some("fix-the-bug"), "Ctrl-B", 80);
+        let t = bar_text(Runtime::Codex, false, false, 4, Some("fix-the-bug"), "Ctrl-B", 80, false);
         assert_eq!(t.chars().count(), 80);
         assert!(t.contains("codex"), "{t}");
         assert!(t.contains("ch04\u{b7}fix-the-bug"), "{t}");
         // Tools mode is visible.
-        let t = bar_text(Runtime::Claude, true, false, 1, Some("x"), "Ctrl-B", 80);
+        let t = bar_text(Runtime::Claude, true, false, 1, Some("x"), "Ctrl-B", 80, false);
         assert!(t.contains("claude+tools"), "{t}");
         // An unvalidated runtime is marked right next to its name.
-        let t = bar_text(Runtime::Codex, false, true, 0, None, "Ctrl-B", 80);
+        let t = bar_text(Runtime::Codex, false, true, 0, None, "Ctrl-B", 80, false);
         assert!(t.contains("codex\u{26a0}"), "{t}");
-        let t = bar_text(Runtime::Codex, false, false, 0, None, "Ctrl-B", 80);
+        // Yolo mode is always visible.
+        let t = bar_text(Runtime::Codex, false, false, 0, None, "Ctrl-B", 80, true);
+        assert!(t.contains("yolo"), "{t}");
+        let t = bar_text(Runtime::Codex, false, false, 0, None, "Ctrl-B", 80, false);
         assert!(t.contains("no thread yet"), "{t}");
+        assert!(!t.contains("yolo"), "{t}");
         // Narrow terminal: truncated to width, never wider.
         let t = bar_text(
             Runtime::Codex,
@@ -2727,6 +2750,7 @@ mod tests {
             Some("a-very-long-slug-here"),
             "Ctrl-B",
             20,
+            false,
         );
         assert_eq!(t.chars().count(), 20);
     }

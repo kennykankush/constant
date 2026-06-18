@@ -43,21 +43,41 @@ impl Runtime {
     /// portable-pty's CommandBuilder does NOT inherit the parent environment by
     /// default, so we copy it explicitly — PATH, HOME, TERM all matter for the
     /// child TUI to behave natively.
-    pub fn fresh_command(self, session_id: Option<&str>) -> CommandBuilder {
-        match (self, session_id) {
-            (Runtime::Claude, Some(id)) => self.command(&["--session-id", id]),
-            _ => self.command(&[]),
+    pub fn fresh_command(self, session_id: Option<&str>, yolo: bool) -> CommandBuilder {
+        let mut args: Vec<&str> = match (self, session_id) {
+            (Runtime::Claude, Some(id)) => vec!["--session-id", id],
+            _ => vec![],
+        };
+        if yolo && let Some(flag) = self.yolo_flag() {
+            args.push(flag);
         }
+        self.command(&args)
     }
 
     /// Build a command that resumes an existing native session by id
     /// (`claude -r <id>` / `codex resume <id>`).
-    pub fn resume_command(self, session_id: &str) -> CommandBuilder {
+    pub fn resume_command(self, session_id: &str, yolo: bool) -> CommandBuilder {
+        let mut args: Vec<&str> = match self {
+            Runtime::Codex => vec!["resume", session_id],
+            Runtime::Claude => vec!["-r", session_id],
+            Runtime::Gemini => vec!["--resume", session_id],
+            Runtime::OpenCode => vec!["-s", session_id],
+        };
+        if yolo && let Some(flag) = self.yolo_flag() {
+            args.push(flag);
+        }
+        self.command(&args)
+    }
+
+    /// The runtime's "run without sandbox / approval prompts" flag, injected
+    /// only under `--yolo` (explicit opt-in; EXTREMELY DANGEROUS). opencode's
+    /// permission model is config-based (no CLI bypass); gemini is carry-
+    /// source-only and never spawned.
+    fn yolo_flag(self) -> Option<&'static str> {
         match self {
-            Runtime::Codex => self.command(&["resume", session_id]),
-            Runtime::Claude => self.command(&["-r", session_id]),
-            Runtime::Gemini => self.command(&["--resume", session_id]),
-            Runtime::OpenCode => self.command(&["-s", session_id]),
+            Runtime::Codex => Some("--dangerously-bypass-approvals-and-sandbox"),
+            Runtime::Claude => Some("--dangerously-skip-permissions"),
+            Runtime::OpenCode | Runtime::Gemini => None,
         }
     }
 
@@ -73,5 +93,46 @@ impl Runtime {
             cmd.cwd(cwd);
         }
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(cmd: CommandBuilder) -> Vec<String> {
+        cmd.get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn yolo_injects_the_per_runtime_bypass_flag_only_when_asked() {
+        // claude → --dangerously-skip-permissions, resume AND fresh, only under yolo
+        assert!(
+            argv(Runtime::Claude.resume_command("id", true))
+                .contains(&"--dangerously-skip-permissions".into())
+        );
+        assert!(
+            argv(Runtime::Claude.fresh_command(Some("id"), true))
+                .contains(&"--dangerously-skip-permissions".into())
+        );
+        assert!(
+            !argv(Runtime::Claude.resume_command("id", false))
+                .iter()
+                .any(|a| a.contains("dangerous"))
+        );
+        // codex → the bypass-approvals-and-sandbox flag
+        assert!(
+            argv(Runtime::Codex.resume_command("id", true))
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".into())
+        );
+        // opencode has no CLI bypass — never injected, even under yolo
+        assert!(
+            !argv(Runtime::OpenCode.resume_command("id", true))
+                .iter()
+                .any(|a| a.contains("dangerous"))
+        );
     }
 }

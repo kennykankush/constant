@@ -82,6 +82,7 @@ fn run_host(rest: &[String]) -> Result<()> {
     let mut bar = true;
     // None = no flag: long-thread switches ask [v]erbatim · [c]ompact.
     let mut render: Option<bool> = None;
+    let mut yolo = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -95,6 +96,13 @@ fn run_host(rest: &[String]) -> Result<()> {
             }
             "--with-tools" => {
                 with_tools = true;
+                i += 1;
+            }
+            // EXTREMELY DANGEROUS, explicit opt-in: spawn every child runtime
+            // with its bypass-sandbox / skip-approvals flag, and keep it across
+            // switches. Surfaced as a ⚠ yolo marker in the bar.
+            "--yolo" => {
+                yolo = true;
                 i += 1;
             }
             "--render" => {
@@ -127,6 +135,7 @@ fn run_host(rest: &[String]) -> Result<()> {
         render,
         prefix_byte,
         prefix_label,
+        yolo,
     )
 }
 
@@ -771,6 +780,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     let mut with_tools = false;
     let mut bar = true;
     let mut render: Option<bool> = None;
+    let mut yolo = false;
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
 
     let mut i = 0;
@@ -778,6 +788,11 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         match rest[i].as_str() {
             "--with-tools" => {
                 with_tools = true;
+                i += 1;
+            }
+            // EXTREMELY DANGEROUS, explicit opt-in — see run_host's --yolo.
+            "--yolo" => {
+                yolo = true;
                 i += 1;
             }
             "--render" => {
@@ -845,6 +860,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
             render,
             prefix_byte,
             prefix_label,
+            yolo,
         );
     }
 
@@ -950,7 +966,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         println!("{n}");
     }
     maybe_offer_update();
-    host::run(rt, Some(&id), with_tools, bar, render, prefix_byte, prefix_label)
+    host::run(rt, Some(&id), with_tools, bar, render, prefix_byte, prefix_label, yolo)
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
