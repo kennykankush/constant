@@ -2451,6 +2451,8 @@ fn print_help() {
   {bold}x{reset} / {bold}X{reset}        {dim}continue in{reset} {codex} {dim}/ new continuation{reset}
   {bold}o{reset} / {bold}O{reset}        {dim}continue in{reset} {opencode} {dim}/ new continuation{reset}
                {dim}(a long thread asks first: [v]erbatim \u{b7} [c]ompact \u{b7} esc){reset}
+  {bold}H{reset}            {dim}handover \u{2014} ask the current agent to write a sign-out for its
+               successor; watch it write, then switch (it rides the tail){reset}
   {bold}t{reset}            {dim}the trail graph: \u{2191}\u{2193} pick a chapter, Enter lands in that
                projection; c/x/o switch, r rename, t/q close{reset}
   {bold}:{reset}            {dim}command line \u{2014} switch/new/rename/quit, Tab completes, \u{2191}\u{2193} history{reset}

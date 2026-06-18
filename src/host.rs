@@ -44,6 +44,16 @@ const M_RENDER: u8 = 4;
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
 const MAX_ESC: usize = 256;
 
+/// The sign-out request injected into the child on `Ctrl-B H` (handover). ONE
+/// line — an embedded newline could submit early in some CLIs; the trailing
+/// carriage return is what submits it. The agent's reply lands as the thread's
+/// natural last turn, so it rides the verbatim tail of whatever carry follows
+/// (recitation at the recency edge, where attention is sharpest). The host
+/// never parses the child's output (invariant #7) and so cannot detect when the
+/// reply finishes: the human is the completion detector — watch it write, then
+/// switch.
+const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a short sign-out for whoever continues it: the goal as it stands, where we are right now, the key decisions and why, the exact next step, and any gotchas. Reply with only that sign-out.";
+
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
 /// terminal sends in legacy mode (Ctrl-<L> == <L> & 0x1f), plus a human label.
 pub fn parse_prefix(spec: &str) -> Result<(u8, String)> {
@@ -1894,6 +1904,24 @@ pub fn run(
                                         &mut out,
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
+                                    Some(b'h') | Some(b'H') => {
+                                        // Handover: ask the CURRENT agent to brief
+                                        // its successor. We inject the request and
+                                        // submit it; the human watches it write the
+                                        // sign-out (the host never parses output —
+                                        // invariant #7), then switches when ready.
+                                        // The sign-out rides the carried tail.
+                                        let _ = session.writer.write_all(HANDOVER_PROMPT.as_bytes());
+                                        let _ = session.writer.write_all(b"\r");
+                                        let _ = session.writer.flush();
+                                        let note = "\u{270d} sign-out requested \u{2014} let it write, then switch (prefix c/x/o); it rides the handover";
+                                        if bar {
+                                            bar_notice = Some((note.to_string(), std::time::Instant::now()));
+                                            bar_dirty = true;
+                                        } else {
+                                            dim(&mut out, note);
+                                        }
+                                    }
                                     Some(b't') => {
                                         // Late adoption: the host may not have
                                         // learned the thread yet (e.g. the user
