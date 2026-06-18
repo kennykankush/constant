@@ -12,6 +12,7 @@
 //! essence.
 
 pub mod formats;
+pub mod render;
 pub mod ir;
 pub(crate) mod sha256;
 
@@ -166,6 +167,122 @@ fn codex_thread_from_logs_in(
     None
 }
 
+/// A claude session's display name from bounded reads: the LAST customTitle
+/// record wins (a /rename, or Constant's own re-stamp — search the tail),
+/// else the first real user message (search the head), clipped. Reads at most
+/// ~80KB per file regardless of transcript size.
+pub(crate) fn claude_quick_title(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    const HEAD: usize = 16 * 1024;
+
+    let f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+
+    // Tail: the last customTitle record names the session.
+    let start = len.saturating_sub(TAIL);
+    let mut f = f;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    let _ = f.take(TAIL).read_to_string(&mut tail);
+    if let Some(ix) = tail.rfind("\"customTitle\":\"") {
+        let rest = &tail[ix + "\"customTitle\":\"".len()..];
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => {
+                    // Keep escaped quotes/backslashes readable; drop the rest.
+                    if let Some(n) = chars.next()
+                        && (n == '"' || n == '\\')
+                    {
+                        out.push(n);
+                    }
+                }
+                _ => out.push(c),
+            }
+            if out.chars().count() >= 80 {
+                break;
+            }
+        }
+        // Constant's own stamps carry trail metadata — show just the name part.
+        if let Some((name, _)) = out.split_once(" \u{b7} ch") {
+            out = name.to_string();
+        }
+        if !out.trim().is_empty() {
+            return Some(out.trim().to_string());
+        }
+    }
+
+    // Head: first real user message as an auto-title.
+    let f = fs::File::open(path).ok()?;
+    let mut head = String::new();
+    let _ = f.take(HEAD as u64).read_to_string(&mut head);
+    for line in head.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(text) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let t = text.trim();
+        if t.is_empty() || is_scaffold(t) {
+            continue;
+        }
+        let clipped: String = t.chars().take(72).collect();
+        return Some(clipped);
+    }
+    None
+}
+
+/// Every codex thread's display title from its registry (read-only, one
+/// query) — the names the user actually knows, including in-codex renames.
+fn codex_registry_titles() -> std::collections::HashMap<String, String> {
+    match formats::default_output_root(SessionFormat::Codex) {
+        Ok(root) => codex_registry_titles_in(&root),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+fn codex_registry_titles_in(root: &Path) -> std::collections::HashMap<String, String> {
+    use rusqlite::{Connection, OpenFlags};
+    let mut map = std::collections::HashMap::new();
+    let db = root.join("state_5.sqlite");
+    if !db.exists() {
+        return map;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return map;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id, COALESCE(title, '') FROM threads") else {
+        return map;
+    };
+    if let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (id, title) in rows.flatten() {
+            // Codex's own backfill can adopt a paged projection's first
+            // message — our desk furniture — as the thread title. Scaffold
+            // NEVER displays, no matter which store it leaked into.
+            if !title.is_empty() && !is_scaffold(&title) {
+                map.insert(id, title);
+            }
+        }
+    }
+    map
+}
+
 /// Newest codex thread for a directory straight from codex's own registry
 /// (read-only), respecting the spawn-time fence and requiring at least one
 /// real user turn. Returns the thread's rollout file.
@@ -304,6 +421,9 @@ pub struct CarryReceipt {
     pub dropped_scaffold: usize,
     /// Secrets burned off by redaction.
     pub redactions: usize,
+    /// Turns filed into the paged view's index — recallable from the record,
+    /// NOT dropped (only set when a carry renders the paged view).
+    pub indexed: usize,
 }
 
 impl CarryReceipt {
@@ -332,6 +452,9 @@ impl CarryReceipt {
                 self.redactions,
                 if self.redactions == 1 { "" } else { "s" }
             ));
+        }
+        if self.indexed > 0 {
+            parts.push(format!("{} filed (recallable)", self.indexed));
         }
         parts.join(" · ")
     }
@@ -969,6 +1092,7 @@ pub(crate) fn is_scaffold(text: &str) -> bool {
         "<command-message>",
         "Caveat: The messages below",
         "# AGENTS.md",
+        "[constant:",
         "# CLAUDE.md",
         "<INSTRUCTIONS>",
         "Codebase and user instructions",
@@ -1303,7 +1427,7 @@ fn same_dir(recorded: &str, here: &Path) -> bool {
 }
 
 /// Read a Codex rollout's recorded cwd from its first-line session_meta.
-fn codex_session_cwd(path: &Path) -> Option<String> {
+pub(crate) fn codex_session_cwd(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let file = fs::File::open(path).ok()?;
     let mut first = String::new();
@@ -1361,10 +1485,34 @@ pub fn list_sessions(
     cwd: Option<&Path>,
     with_titles: bool,
 ) -> Vec<SessionSummary> {
+    list_sessions_inner(runtime, cwd, with_titles, true)
+}
+
+/// The picker's fast first paint: same listing, but the per-file reads are
+/// skipped — no claude title tailing, and no codex head reads when there's no
+/// cwd filter to serve. Cheap batched sources stay (the codex registry is one
+/// query for every title). The caller streams the skipped enrichment in
+/// afterwards ([`claude_quick_title`], [`codex_session_cwd`] per row,
+/// off-thread).
+pub fn list_sessions_lazy(runtime: Runtime, cwd: Option<&Path>) -> Vec<SessionSummary> {
+    list_sessions_inner(runtime, cwd, false, false)
+}
+
+fn list_sessions_inner(
+    runtime: Runtime,
+    cwd: Option<&Path>,
+    with_titles: bool,
+    enrich: bool,
+) -> Vec<SessionSummary> {
     let fmt = session_format(runtime);
     if fmt == SessionFormat::OpenCode {
         return list_opencode_sessions(cwd);
     }
+    let codex_titles = if fmt == SessionFormat::Codex {
+        codex_registry_titles()
+    } else {
+        std::collections::HashMap::new()
+    };
     let Ok(root) = formats::default_output_root(fmt) else {
         return Vec::new();
     };
@@ -1413,8 +1561,10 @@ pub fn list_sessions(
             let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
+            // The codex head read is only unavoidable when a cwd filter needs
+            // it; the lazy listing defers it otherwise (display-only data).
             let rec_cwd = match fmt {
-                SessionFormat::Codex => codex_session_cwd(&path),
+                SessionFormat::Codex if enrich || cwd.is_some() => codex_session_cwd(&path),
                 _ => None,
             };
             let cwd_ok = match (fmt, cwd) {
@@ -1441,7 +1591,7 @@ pub fn list_sessions(
             // Reading the file body (has_conversation + title) is opt-in: the
             // default listing stays metadata-only so it doesn't scan every
             // transcript on a large store.
-            let (has_conversation, title) = if with_titles {
+            let (has_conversation, mut title) = if with_titles {
                 let has = has_conversation(&path, fmt);
                 (
                     Some(has),
@@ -1450,6 +1600,21 @@ pub fn list_sessions(
             } else {
                 (None, None)
             };
+            // Codex names its threads in its own registry (incl. user renames)
+            // — that's the name a person knows the conversation BY, and it's
+            // one free lookup. Prefer it over the derived first-message title.
+            if let Some(t) = codex_titles.get(&id)
+                && !t.is_empty()
+            {
+                title = Some(t.clone());
+            }
+            // Claude keeps names in the session file itself: /rename appends a
+            // customTitle record (tail), and the first user message makes a
+            // serviceable auto-title (head). Bounded reads — never the whole
+            // transcript — so the default listing stays fast on big stores.
+            if enrich && fmt == SessionFormat::Claude && title.is_none() {
+                title = claude_quick_title(&path);
+            }
             out.push(SessionSummary {
                 runtime: runtime.label(),
                 id,
@@ -2496,6 +2661,45 @@ Exporting session: ses_x1"#;
     /// The codex registry oracle: newest cwd-matching thread inside the spawn
     /// fence wins; threads without a user turn, archived threads, and threads
     /// last touched before the fence are invisible.
+    #[test]
+    fn registry_titles_never_surface_desk_furniture() {
+        // Codex's backfill can adopt a paged projection's first user message
+        // (the index scaffold) as the thread's registry title — seen live on
+        // 0.139 after a native resume of a paged projection. The display
+        // reader must drop it, whatever wrote it.
+        let dir = std::env::temp_dir().join(format!(
+            "constant-titles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)")
+            .unwrap();
+        for (id, title) in [
+            ("real", "WED 2"),
+            (
+                "paged",
+                "[constant: index of filed turns \u{2014} retrieve verbatim with `constant recall`]",
+            ),
+            ("blank", ""),
+        ] {
+            conn.execute("INSERT INTO threads VALUES (?1, ?2)", rusqlite::params![id, title])
+                .unwrap();
+        }
+        drop(conn);
+        let titles = codex_registry_titles_in(&dir);
+        assert_eq!(titles.get("real").map(String::as_str), Some("WED 2"));
+        assert!(
+            !titles.contains_key("paged"),
+            "desk furniture leaked as a display title"
+        );
+        assert!(!titles.contains_key("blank"));
+    }
+
     #[test]
     fn codex_registry_oracle_respects_fence_cwd_and_user_turns() {
         let dir = std::env::temp_dir().join(format!("constant-oracle-{}", std::process::id()));

@@ -35,6 +35,10 @@ const M_COMMAND: u8 = 2;
 /// toggled from prefix mode. Child output is dropped while open — the child
 /// repaints on exit via a resize wiggle.
 const M_VIEW: u8 = 3;
+/// The switch-time render prompt: `[v]erbatim · [c]ompact` in the bottom row.
+/// Entered only when the host was launched without an explicit --render AND
+/// the source thread is long enough that the answer changes anything.
+const M_RENDER: u8 = 4;
 
 // Largest escape sequence we'll buffer before giving up and flushing it as-is,
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
@@ -222,11 +226,26 @@ struct Session {
     child: Box<dyn Child + Send + Sync>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SwitchRequest {
     target: Runtime,
     new: bool,
+    /// Lay the target's desk paged (index + verbatim tail + arrival card)
+    /// instead of the full verbatim pile — per-switch, decided at the prompt
+    /// or inherited from the launch flag.
+    paged: bool,
+    /// Land in THIS projection (id, path) instead of the ledger-resolved
+    /// stable pair — the graph cursor's Enter. Validated before use.
+    landing: Option<Landing>,
+    /// Resume the landing's native file AS IT IS — go back to that chapter,
+    /// never distill the live thread into it. The graph cursor's Enter. When
+    /// false, `landing` (if any) is a carry target, the prior overwrite-on-land
+    /// behaviour. Forking from a chapter is c/x/o, which leave this false.
+    resume_in_place: bool,
 }
+
+/// A specific projection to land in: (session id, file path).
+type Landing = (String, std::path::PathBuf);
 
 enum SpawnMode<'a> {
     /// A fresh launch. For runtimes that support it, the session id is MINTED
@@ -322,19 +341,86 @@ fn terminate(child: &mut Box<dyn Child + Send + Sync>) {
 fn request_switch(
     target: Runtime,
     new: bool,
+    paged: bool,
+    landing: Option<Landing>,
+    resume_in_place: bool,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) {
-    if session.runtime == target
-        || switching_to.is_some()
-        || !crate::alembic::supports_target(target)
-    {
+    if switching_to.is_some() || !crate::alembic::supports_target(target) {
+        return;
+    }
+    // A carry to the runtime you're already in is a no-op; a resume-in-place
+    // may target the same runtime (go back to an OLDER chapter of the same
+    // kind), so it's allowed through.
+    if !resume_in_place && session.runtime == target {
         return;
     }
     // Termination is deferred to the carry gate at the end of the input
     // tick: a CONTINUE switch with nothing to carry is cancelled there
     // instead of tearing the child down for an empty target.
-    *switching_to = Some(SwitchRequest { target, new });
+    *switching_to = Some(SwitchRequest {
+        target,
+        new,
+        paged,
+        landing,
+        resume_in_place,
+    });
+}
+
+/// The thread identity of an already-known child: a projection the harness
+/// resumed (declared id), or — at view time — whatever conversation the
+/// child is sitting in per the live oracles. None when the ledger doesn't
+/// know it (a fresh thread earns its identity at the first switch, as ever).
+fn adopt_thread(
+    source: Option<(std::path::PathBuf, String)>,
+) -> Option<(String, u32, crate::trail::Naming)> {
+    let (path, id) = source?;
+    let (conv_id, max_n, _) = crate::trail::resume(&path, &id);
+    if max_n == 0 {
+        return None;
+    }
+    let (name, handle, named) = crate::trail::naming_parts_for_session(&id)?;
+    Some((
+        conv_id,
+        max_n,
+        crate::trail::Naming {
+            handle,
+            name,
+            named,
+        },
+    ))
+}
+
+/// Should the `[v]erbatim · [c]ompact` prompt appear for this switch? Only
+/// when the choice changes anything: below the tail budget the paged desk
+/// keeps the whole thread verbatim anyway, so short conversations switch
+/// without a question. Unknown source: no prompt (the carry gate may cancel
+/// the switch regardless).
+const RENDER_PROMPT_MIN_BYTES: u64 = 48 * 1024;
+
+fn source_worth_prompting(
+    runtime: Runtime,
+    declared: Option<&str>,
+    owned: &std::collections::HashMap<Runtime, (String, std::path::PathBuf)>,
+    host_cwd: Option<&std::path::Path>,
+    spawned_at: std::time::SystemTime,
+) -> bool {
+    let path = declared
+        .and_then(|id| crate::alembic::session_by_id(runtime, id))
+        .map(|(p, _)| p)
+        .or_else(|| {
+            owned
+                .get(&runtime)
+                .map(|(_, p)| p.clone())
+                .filter(|p| p.exists())
+        })
+        .or_else(|| {
+            crate::alembic::active_session(runtime, host_cwd, Some(spawned_at)).map(|(p, _)| p)
+        });
+    path.and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() >= RENDER_PROMPT_MIN_BYTES)
+        .unwrap_or(false)
 }
 
 /// One dim parenthetical status line.
@@ -429,6 +515,7 @@ enum Action {
 
 fn execute_command(
     line: &str,
+    paged: bool,
     session: &mut Session,
     switching_to: &mut Option<SwitchRequest>,
 ) -> Action {
@@ -436,13 +523,13 @@ fn execute_command(
     match parts.as_slice() {
         ["switch", rt] | ["s", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, false, session, switching_to);
+                request_switch(target, false, paged, None, false, session, switching_to);
             }
             Action::None
         }
         ["new", rt] | ["n", rt] | ["fork", rt] | ["switch", "--new", rt] | ["s", "--new", rt] => {
             if let Ok(target) = Runtime::parse(rt) {
-                request_switch(target, true, session, switching_to);
+                request_switch(target, true, paged, None, false, session, switching_to);
             }
             Action::None
         }
@@ -467,9 +554,10 @@ fn clear_bottom(out: &mut impl Write) {
 }
 
 fn banner(out: &mut impl Write, runtime: Runtime, prefix_label: &str) {
+    let color = runtime_color(runtime.label());
     let _ = write!(
         out,
-        "\x1b[2m  constant · hosting {} · {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  t=trail  :=command  d=quit\x1b[0m\r\n",
+        "\x1b[2m  constant \u{b7} hosting \x1b[0m{color}{}\x1b[0m\x1b[2m \u{b7} {prefix_label} then  c=claude  x=codex  o=opencode  (shift=new)  t=trail  :=command  d=quit\x1b[0m\r\n",
         runtime.label(),
     );
     let _ = out.flush();
@@ -577,14 +665,28 @@ fn runtime_color(runtime: &str) -> &'static str {
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
+/// How many chapter rows the graph can draw at this terminal height — shared
+/// by the renderer and the cursor clamp (one formula, or they drift).
+fn graph_shown(total: usize, rows: u16) -> usize {
+    // Budget: header(4) + head(1) + footer(2) + notice slack.
+    let budget = rows.saturating_sub(8) as usize;
+    total.min(budget.max(1))
+}
+
 /// Render the trail graph — newest chapter on top, GitLab-style rails, one
-/// dot per chapter colored by the narrator that produced it. Pure: testable.
+/// dot per chapter colored by the narrator that produced it, the cursor (`sel`,
+/// 0 = newest drawn row) marking where Enter lands. Pure: testable.
+#[allow(clippy::too_many_arguments)]
 fn render_graph(
     naming: Option<&crate::trail::Naming>,
     chapters: &[crate::trail::ChapterRow],
     hosting: &str,
     rows: u16,
     now: u64,
+    sel: usize,
+    notice: Option<&str>,
+    here_id: Option<&str>,
+    here_origin: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
@@ -604,20 +706,33 @@ fn render_graph(
         }
     }
 
-    // Head: where you are right now (the chapter being written).
-    let head_color = runtime_color(hosting);
-    out.push_str(&format!(
-        "  {head_color}\u{25c9}{RESET}  \x1b[1mch{:02}\x1b[0m  {head_color}{}{RESET}  {DIM}\u{2190} you are here{RESET}\r\n",
-        chapters.len() + 1,
-        hosting,
-    ));
+    // Head: where you are right now. Only a SEPARATE node when you're not
+    // already inside a recorded chapter — otherwise the live position is marked
+    // on that chapter's own row below (no phantom "next chapter"). The origin —
+    // the thread the chapters were carried out of — is named as such, not given
+    // a chapter number it never earned.
+    let here_in_chapter = here_id.is_some_and(|h| chapters.iter().any(|c| c.id == h));
+    if !here_in_chapter {
+        let head_color = runtime_color(hosting);
+        let (tag, hint): (String, &str) = if here_origin {
+            (
+                "origin".to_string(),
+                "\u{2190} you are here \u{b7} the thread the chapters were carried from",
+            )
+        } else {
+            (format!("ch{:02}", chapters.len() + 1), "\u{2190} you are here")
+        };
+        out.push_str(&format!(
+            "  {head_color}\u{25c9}{RESET}  \x1b[1m{tag}\x1b[0m  {head_color}{}{RESET}  {DIM}{hint}{RESET}\r\n",
+            hosting,
+        ));
+    }
 
-    // Budget: header(4) + head(1) + footer(2).
-    let budget = rows.saturating_sub(8) as usize;
-    let shown = chapters.len().min(budget.max(1));
+    let shown = graph_shown(chapters.len(), rows);
     let hidden = chapters.len() - shown;
+    let sel = sel.min(shown.saturating_sub(1));
 
-    for ch in chapters.iter().rev().take(shown) {
+    for (i, ch) in chapters.iter().rev().take(shown).enumerate() {
         let color = runtime_color(&ch.from);
         let rail = format!("  {DIM}\u{2502}{RESET}\r\n");
         out.push_str(&rail);
@@ -626,13 +741,24 @@ fn render_graph(
             "restore" => format!("{DIM}\u{2570}\u{2500}{RESET}\u{25cb}"),
             _ => format!("{color}\u{25cf}{RESET}"),
         };
-        let record = if ch.recorded {
+        let mut record = if ch.recorded {
             format!("  {DIM}rec \u{2713}{RESET}")
         } else {
             String::new()
         };
+        // When you resumed straight into a recorded chapter, mark it here
+        // rather than inventing a phantom head above.
+        if here_id == Some(ch.id.as_str()) {
+            record.push_str(&format!("  {DIM}\u{2190} you are here{RESET}"));
+        }
+        // The cursor: where Enter lands. Drawn rows are newest-first.
+        let cursor = if i == sel && !chapters.is_empty() {
+            "\x1b[7m\u{276f}\x1b[0m "
+        } else {
+            "  "
+        };
         out.push_str(&format!(
-            "  {glyph}  ch{:02}  {color}{:<8}{RESET} {DIM}\u{2192}{RESET} {:<8}  {DIM}{}{RESET}{record}\r\n",
+            "{cursor}{glyph}  ch{:02}  {color}{:<8}{RESET} {DIM}\u{2192}{RESET} {:<8}  {DIM}{}{RESET}{record}\r\n",
             ch.n,
             crate::term_safe(&ch.from),
             crate::term_safe(&ch.to),
@@ -643,8 +769,11 @@ fn render_graph(
         out.push_str(&format!("  {DIM}\u{2502}  \u{2026} {hidden} earlier chapters{RESET}\r\n"));
     }
 
+    if let Some(n) = notice {
+        out.push_str(&format!("\r\n  {n}\r\n"));
+    }
     out.push_str(&format!(
-        "\r\n  {DIM}c/x/o switch (shift=new) \u{b7} r rename \u{b7} t/q close{RESET}\r\n"
+        "\r\n  {DIM}\u{2191}\u{2193} pick \u{b7} enter land in it \u{b7} c/x/o switch (shift=new) \u{b7} r rename \u{b7} t/q close{RESET}\r\n"
     ));
     out
 }
@@ -868,14 +997,19 @@ fn refresh_bar(
 /// Entry point for `constant host [runtime] [--prefix ...]` and
 /// `constant resume` (which passes the projection id to wake up — the child's
 /// identity is then declared from birth, no detection needed).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     initial: Runtime,
     resume: Option<&str>,
     with_tools: bool,
     bar: bool,
+    render: Option<bool>,
     prefix: u8,
     prefix_label: String,
 ) -> Result<()> {
+    // None = no --render flag at launch: long-thread switches ask
+    // [v]erbatim · [c]ompact; Some(_) = explicit, never second-guessed.
+    let default_paged = render.unwrap_or(false);
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("`constant host` must run in an interactive terminal (a TTY)");
     }
@@ -919,8 +1053,14 @@ pub fn run(
         });
     }
 
+    // Colored runtime letters survive inside the inverse-video overlay.
+    let (cc, cx, co) = (
+        runtime_color("claude"),
+        runtime_color("codex"),
+        runtime_color("opencode"),
+    );
     let prefix_hint = format!(
-        " {prefix_label} ▸  c=claude   x=codex   o=opencode   (shift=new)   t=trail   :=command   d=quit "
+        " {prefix_label} ▸  c={cc}claude\x1b[39m   x={cx}codex\x1b[39m   o={co}opencode\x1b[39m   (shift=new)   t=trail   :=command   d=quit "
     );
 
     let mut out = std::io::stdout();
@@ -1008,6 +1148,16 @@ pub fn run(
             s
         }
     };
+    // A resumed projection's conversation is known from BIRTH: seed the
+    // thread identity now so the graph and the bar speak immediately,
+    // instead of pleading "no thread yet" until the first switch.
+    if let Some((conv, n, nm)) = adopt_thread(child_session.as_deref().and_then(|id| {
+        crate::alembic::session_by_id(initial, id).map(|(p, _)| (p, id.to_string()))
+    })) {
+        root_id = Some(conv);
+        trail_n = n;
+        naming = Some(nm);
+    }
     banner(&mut out, session.runtime, &prefix_label);
     // The claude-code-style "update is ready" line at startup: read from the
     // LAST check's cache — instant, offline-safe, never blocks the launch.
@@ -1034,6 +1184,19 @@ pub fn run(
     let mut typed_tail: Vec<u8> = Vec::new();
     let mut resumed_away = false;
     let mut pending_out: Vec<u8> = Vec::new();
+    // The render prompt's pending switch + its overlay line (redrawn if a
+    // chatty child floods the bottom row while the question is up).
+    let mut pending_switch: Option<(Runtime, bool)> = None;
+    let mut render_prompt = String::new();
+    // The graph's cursor: the chapters on display (newest first when drawn),
+    // which row is selected, and a one-shot notice under the rails.
+    let mut view_chapters: Vec<crate::trail::ChapterRow> = Vec::new();
+    // The live session is the conversation's origin (the thread its chapters
+    // were carried from) — computed when the graph opens, so the head reads
+    // "origin" not a phantom chapter number.
+    let mut view_here_origin = false;
+    let mut view_sel: usize = 0;
+    let mut view_notice: Option<String> = None;
     // Installed-version preflight, off the hot path (each `--version` is a
     // subprocess). An unvalidated runtime gets a warning in the bar the moment
     // the sweep lands — doctor's quiet knowledge, surfaced where it matters.
@@ -1117,7 +1280,7 @@ pub fn run(
                     // on exit via the resize wiggle; buffering would duplicate.
                     continue;
                 }
-                if mode == M_COMMAND {
+                if mode == M_COMMAND || mode == M_RENDER {
                     // Bounded: a chatty child while the user sits in the command
                     // line must not grow memory forever. Past the cap, flush
                     // through and redraw the prompt (a flicker beats a leak).
@@ -1127,7 +1290,11 @@ pub fn run(
                         pending_out.clear();
                         let _ = out.write_all(&bytes);
                         let _ = out.flush();
-                        bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                        if mode == M_RENDER {
+                            bottom_overlay(&mut out, &render_prompt);
+                        } else {
+                            bottom_overlay(&mut out, &format!(" constant ▸ {cmd_buf}"));
+                        }
                     } else {
                         pending_out.extend_from_slice(&bytes);
                     }
@@ -1180,6 +1347,76 @@ pub fn run(
                     write_reset(&mut out); // undo outgoing child's terminal modes
                     let _ = out.write_all(b"\x1b[2J\x1b[H");
 
+                    let spawned = if request.resume_in_place {
+                        // GO BACK to a chapter (graph Enter): resume its native
+                        // file exactly as it is. We never distill the live thread
+                        // into it — that overwrite-on-land was the contamination
+                        // bug. The chapter file already IS a complete session, so
+                        // we just reopen it. Re-seat the harness identity from the
+                        // ledger so the bar and naming follow, and record NO new
+                        // chapter — a resume is not a hop; the next carry is.
+                        match request.landing.clone() {
+                            Some((land_id, land_path)) => {
+                                let (cid, last_n, projs) =
+                                    crate::trail::resume(&land_path, &land_id);
+                                root_id = Some(cid.clone());
+                                trail_n = last_n;
+                                owned.clear();
+                                for (rt, id, path) in projs {
+                                    owned.insert(rt, (id, path));
+                                }
+                                let slug = root_slug
+                                    .clone()
+                                    .unwrap_or_else(|| crate::trail::slug(&cid));
+                                let nm = crate::trail::naming_for(&cid, &slug, None);
+                                root_slug = Some(crate::trail::slug(&nm.name));
+                                naming = Some(nm.clone());
+                                let chap_n = crate::trail::chapters(&cid)
+                                    .iter()
+                                    .find(|c| c.id == land_id)
+                                    .map(|c| c.n)
+                                    .unwrap_or(last_n);
+                                let ct = runtime_color(target.label());
+                                let _ = out.write_all(
+                                    format!(
+                                        "\x1b[2m  {} · {} · \u{21a9} resume ch{chap_n:02} \x1b[0m{ct}{}\x1b[0m\r\n",
+                                        nm.handle,
+                                        nm.name,
+                                        target.label(),
+                                    )
+                                    .as_bytes(),
+                                );
+                                let _ = out.flush();
+                                bar_notice = Some((
+                                    format!(
+                                        " \u{21a9} ch{chap_n:02} \u{b7} {} \u{b7} resumed as it was ",
+                                        nm.name,
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                                child_spawned_at = std::time::SystemTime::now();
+                                spawn_settled(
+                                    target,
+                                    Some(&land_id),
+                                    from,
+                                    None,
+                                    host_cwd.as_deref(),
+                                    c,
+                                    r,
+                                    &tx,
+                                    &mut out,
+                                )?
+                            }
+                            None => {
+                                // No landing to resume (unreachable): keep the
+                                // current runtime alive, fresh, rather than die.
+                                child_spawned_at = std::time::SystemTime::now();
+                                spawn_settled(
+                                    target, None, from, None, None, c, r, &tx, &mut out,
+                                )?
+                            }
+                        }
+                    } else {
                     // Read source for `from`, strongest evidence first:
                     //  1. DECLARED identity — the session id we positively know
                     //     the child owns (resumed id, or minted at launch).
@@ -1222,7 +1459,7 @@ pub fn run(
                         crate::alembic::distill_source(src_path, with_tools)
                     });
 
-                    let spawned = match (src, distilled) {
+                    match (src, distilled) {
                         (Some((src_path, src_id)), Some(Ok(mut distilled))) => {
                             // Which conversation does the LIVE source belong to?
                             // Re-resolved every switch (via the ledger), not just
@@ -1266,9 +1503,13 @@ pub fn run(
                             let title = crate::trail::title(n, from, &nm.name, &nm.handle);
 
                             let action = if request.new { "new" } else { "continue" };
+                            let (cf, ct) = (
+                                runtime_color(from.label()),
+                                runtime_color(target.label()),
+                            );
                             let _ = out.write_all(
                                 format!(
-                                    "\x1b[2m  {} · {} · ch{n:02} {} \u{2192} {} · {action} · {}\x1b[0m\r\n",
+                                    "\x1b[2m  {} · {} · ch{n:02} \x1b[0m{cf}{}\x1b[0m\x1b[2m \u{2192} \x1b[0m{ct}{}\x1b[0m\x1b[2m · {action} · {}\x1b[0m\r\n",
                                     nm.handle,
                                     nm.name,
                                     from.label(),
@@ -1294,12 +1535,41 @@ pub fn run(
                                     }
                                 });
 
+                            if request.paged {
+                                // The desk layout: the record above holds the FULL
+                                // thread; the projection wakes the target on head
+                                // card + index + verbatim tail. Index addresses
+                                // resolve via `constant recall` into that record.
+                                let anchor = crate::alembic::render::git_anchor(
+                                    host_cwd.as_deref(),
+                                );
+                                let stats = crate::alembic::render::render_paged(
+                                    &mut distilled.session,
+                                    &nm.handle,
+                                    &nm.name,
+                                    n,
+                                    from.label(),
+                                    target.label(),
+                                    anchor.as_deref(),
+                                    crate::alembic::render::TAIL_BUDGET_CHARS,
+                                );
+                                distilled.receipt.indexed = stats.indexed;
+                            }
+
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.
+                            // A graph-cursor landing overrides the stable pair —
+                            // validated: on disk, and never the source itself.
                             let reuse_owned = if request.new {
                                 None
                             } else {
-                                owned.get(&target).cloned()
+                                request
+                                    .landing
+                                    .clone()
+                                    .filter(|(_, p)| {
+                                        p.exists() && !crate::alembic::same_file(&src_path, p)
+                                    })
+                                    .or_else(|| owned.get(&target).cloned())
                             };
                             let reuse = reuse_owned
                                 .as_ref()
@@ -1441,6 +1711,7 @@ pub fn run(
                             child_spawned_at = std::time::SystemTime::now();
                             spawn_settled(target, None, from, None, None, c, r, &tx, &mut out)?
                         }
+                    }
                     };
                     session = spawned.0;
                     child_session = spawned.1;
@@ -1580,48 +1851,47 @@ pub fn run(
                             if matches!(tok, Token::Prefix) {
                                 passthrough.push(prefix); // literal prefix to child
                             } else {
+                                let mut want: Option<(Runtime, bool)> = None;
                                 match command_key(&tok) {
-                                    Some(b'c') => request_switch(
-                                        Runtime::Claude,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'C') => request_switch(
-                                        Runtime::Claude,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'x') => request_switch(
-                                        Runtime::Codex,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'X') => request_switch(
-                                        Runtime::Codex,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'o') => request_switch(
-                                        Runtime::OpenCode,
-                                        false,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
-                                    Some(b'O') => request_switch(
-                                        Runtime::OpenCode,
-                                        true,
-                                        &mut session,
-                                        &mut switching_to,
-                                    ),
+                                    Some(b'c') => want = Some((Runtime::Claude, false)),
+                                    Some(b'C') => want = Some((Runtime::Claude, true)),
+                                    Some(b'x') => want = Some((Runtime::Codex, false)),
+                                    Some(b'X') => want = Some((Runtime::Codex, true)),
+                                    Some(b'o') => want = Some((Runtime::OpenCode, false)),
+                                    Some(b'O') => want = Some((Runtime::OpenCode, true)),
                                     Some(b'g') | Some(b'G') => dim(
                                         &mut out,
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b't') => {
+                                        // Late adoption: the host may not have
+                                        // learned the thread yet (e.g. the user
+                                        // /resume'd INSIDE the child) — ask the
+                                        // oracles before declaring "no thread".
+                                        if root_id.is_none() {
+                                            let src = child_session
+                                                .as_deref()
+                                                .and_then(|id| {
+                                                    crate::alembic::session_by_id(
+                                                        session.runtime,
+                                                        id,
+                                                    )
+                                                    .map(|(p, _)| (p, id.to_string()))
+                                                })
+                                                .or_else(|| {
+                                                    crate::alembic::active_session(
+                                                        session.runtime,
+                                                        host_cwd.as_deref(),
+                                                        Some(child_spawned_at),
+                                                    )
+                                                });
+                                            if let Some((conv, n, nm)) = adopt_thread(src) {
+                                                root_id = Some(conv);
+                                                trail_n = n;
+                                                naming = Some(nm);
+                                                bar_dirty = bar;
+                                            }
+                                        }
                                         mode = M_VIEW;
                                         view_alt = !child_alt_active;
                                         if view_alt {
@@ -1629,20 +1899,37 @@ pub fn run(
                                             let _ = out.write_all(b"\x1b[?1049h");
                                         }
                                         let (_, r) = size().unwrap_or((cols, rows));
-                                        let chapters = root_id
+                                        view_chapters = root_id
                                             .as_deref()
                                             .map(crate::trail::chapters)
                                             .unwrap_or_default();
+                                        // Origin = the live session is this
+                                        // conversation's source, not one of its
+                                        // chapters (lineage_index tags it so).
+                                        view_here_origin = child_session
+                                            .as_deref()
+                                            .is_some_and(|id| {
+                                                crate::trail::lineage_index()
+                                                    .get(id)
+                                                    .map(|t| t == "origin")
+                                                    .unwrap_or(false)
+                                            });
+                                        view_sel = 0;
+                                        view_notice = None;
                                         let now = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_secs())
                                             .unwrap_or(0);
                                         let view = render_graph(
                                             naming.as_ref(),
-                                            &chapters,
+                                            &view_chapters,
                                             session.runtime.label(),
                                             r,
                                             now,
+                                            view_sel,
+                                            view_notice.as_deref(),
+                                            child_session.as_deref(),
+                                            view_here_origin,
                                         );
                                         let _ = out.write_all(view.as_bytes());
                                         let _ = out.flush();
@@ -1654,6 +1941,80 @@ pub fn run(
                                         bottom_overlay(&mut out, " constant ▸ ");
                                     }
                                     _ => {} // unknown: ignore
+                                }
+                                if let Some((rt, fork)) = want {
+                                    let blocked = rt == session.runtime
+                                        || switching_to.is_some()
+                                        || !crate::alembic::supports_target(rt);
+                                    if !blocked
+                                        && render.is_none()
+                                        && source_worth_prompting(
+                                            session.runtime,
+                                            child_session.as_deref(),
+                                            &owned,
+                                            host_cwd.as_deref(),
+                                            child_spawned_at,
+                                        )
+                                    {
+                                        // Long thread, no launch flag: ask how
+                                        // the next desk should be laid out.
+                                        mode = M_RENDER;
+                                        pending_switch = Some((rt, fork));
+                                        let action = if fork { "new" } else { "continue" };
+                                        render_prompt = format!(
+                                            " constant \u{25b8} {action} in {} \u{b7} [v]erbatim \u{b7} [c]ompact (older turns filed, recallable) \u{b7} esc ",
+                                            rt.label()
+                                        );
+                                        bottom_overlay(&mut out, &render_prompt);
+                                    } else {
+                                        request_switch(
+                                            rt,
+                                            fork,
+                                            default_paged,
+                                            None,
+                                            false,
+                                            &mut session,
+                                            &mut switching_to,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        M_RENDER => {
+                            // One decisive key; unknown keys keep the prompt up,
+                            // esc (either encoding) cancels with the child untouched.
+                            let key = command_key(&tok);
+                            let mut decided: Option<bool> = None;
+                            let mut cancel = matches!(tok, Token::Prefix);
+                            match key {
+                                Some(b'v') | Some(b'V') | Some(0x0d) | Some(0x0a) => {
+                                    decided = Some(false)
+                                }
+                                Some(b'c') | Some(b'C') => decided = Some(true),
+                                Some(0x1b) | Some(b'q') | Some(0x03) => cancel = true,
+                                _ => {}
+                            }
+                            if decided.is_some() || cancel {
+                                clear_bottom(&mut out);
+                                mode = M_NORMAL;
+                                bar_dirty = bar;
+                                if !pending_out.is_empty() {
+                                    let _ = out.write_all(&pending_out);
+                                    let _ = out.flush();
+                                    pending_out.clear();
+                                }
+                                match (decided, pending_switch.take()) {
+                                    (Some(paged), Some((rt, fork))) => request_switch(
+                                        rt,
+                                        fork,
+                                        paged,
+                                        None,
+                                        false,
+                                        &mut session,
+                                        &mut switching_to,
+                                    ),
+                                    _ => pending_switch = None,
                                 }
                             }
                         }
@@ -1770,6 +2131,7 @@ pub fn run(
                                     hist_ix = None;
                                     match execute_command(
                                         cmd_buf.trim(),
+                                        default_paged,
                                         &mut session,
                                         &mut switching_to,
                                     ) {
@@ -1820,35 +2182,108 @@ pub fn run(
 
                         M_VIEW => {
                             // The cockpit: act from inside the graph. Letter
-                            // keys arrive as bytes or kitty presses — normalize.
+                            // keys arrive as bytes or kitty presses — normalize;
+                            // arrow sequences move the node cursor.
+                            let mut arrow: Option<i8> = None;
                             let key: Option<u8> = match &tok {
                                 Token::Byte(b) => Some(*b),
-                                Token::Seq(seq) => match parse_kitty_u(seq) {
-                                    Some((cp, mods, ev)) if ev != 3 && mods <= 2 => {
-                                        u8::try_from(cp).ok()
+                                Token::Seq(seq) => match seq.as_slice() {
+                                    b"\x1b[A" | b"\x1bOA" => {
+                                        arrow = Some(-1);
+                                        None
                                     }
-                                    Some(_) => None,
-                                    // any unrecognized escape (incl. bare Esc) closes
-                                    None => Some(b'q'),
+                                    b"\x1b[B" | b"\x1bOB" => {
+                                        arrow = Some(1);
+                                        None
+                                    }
+                                    _ => match parse_kitty_u(seq) {
+                                        Some((cp, mods, ev)) if ev != 3 && mods <= 2 => {
+                                            u8::try_from(cp).ok()
+                                        }
+                                        Some(_) => None,
+                                        // any unrecognized escape (incl. bare Esc) closes
+                                        None => Some(b'q'),
+                                    },
                                 },
                                 Token::Prefix => None,
                             };
                             let mut close = false;
+                            let mut redraw = false;
+                            let (_, view_rows) = size().unwrap_or((cols, rows));
+                            let shown = graph_shown(view_chapters.len(), view_rows);
+                            if let Some(step) = arrow {
+                                view_sel = if step < 0 {
+                                    view_sel.saturating_sub(1)
+                                } else {
+                                    (view_sel + 1).min(shown.saturating_sub(1))
+                                };
+                                view_notice = None;
+                                redraw = true;
+                            }
                             // Switch straight from the graph: leave the view
                             // first (restoring the child's screen), then the
                             // switch flow owns the screen from there.
-                            let switch_to: Option<(Runtime, bool)> = match key {
-                                Some(b'c') => Some((Runtime::Claude, false)),
-                                Some(b'C') => Some((Runtime::Claude, true)),
-                                Some(b'x') => Some((Runtime::Codex, false)),
-                                Some(b'X') => Some((Runtime::Codex, true)),
-                                Some(b'o') => Some((Runtime::OpenCode, false)),
-                                Some(b'O') => Some((Runtime::OpenCode, true)),
-                                _ => None,
-                            };
+                            let mut switch_to: Option<(Runtime, bool, Option<Landing>)> =
+                                match key {
+                                    Some(b'c') => Some((Runtime::Claude, false, None)),
+                                    Some(b'C') => Some((Runtime::Claude, true, None)),
+                                    Some(b'x') => Some((Runtime::Codex, false, None)),
+                                    Some(b'X') => Some((Runtime::Codex, true, None)),
+                                    Some(b'o') => Some((Runtime::OpenCode, false, None)),
+                                    Some(b'O') => Some((Runtime::OpenCode, true, None)),
+                                    _ => None,
+                                };
                             match key {
-                                Some(b't') | Some(b'q') | Some(0x0d) | Some(0x0a)
-                                | Some(b' ') | Some(0x03) | Some(27) => close = true,
+                                // Enter: GO BACK to the selected chapter — resume
+                                // its native file as it was. Not a carry: the live
+                                // thread is never written into it (forking forward
+                                // from a chapter is c/x/o). Same runtime is fine —
+                                // that's just an older chapter of the same kind.
+                                Some(0x0d) | Some(0x0a) if !view_chapters.is_empty() => {
+                                    let row = view_chapters.iter().rev().nth(view_sel);
+                                    match row {
+                                        Some(ch) => match Runtime::parse(&ch.to) {
+                                            Ok(_) if child_session.as_deref()
+                                                == Some(ch.id.as_str()) =>
+                                            {
+                                                view_notice = Some(format!(
+                                                    "ch{:02} is where you already are",
+                                                    ch.n
+                                                ));
+                                                redraw = true;
+                                            }
+                                            Ok(rt) => {
+                                                if !ch.path.is_empty()
+                                                    && std::path::Path::new(&ch.path).exists()
+                                                {
+                                                    switch_to = Some((
+                                                        rt,
+                                                        false,
+                                                        Some((
+                                                            ch.id.clone(),
+                                                            std::path::PathBuf::from(&ch.path),
+                                                        )),
+                                                    ));
+                                                } else {
+                                                    view_notice = Some(format!(
+                                                        "ch{:02}'s projection is gone — restore it from the record (constant snapshots)",
+                                                        ch.n
+                                                    ));
+                                                    redraw = true;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                view_notice =
+                                                    Some(format!("can't host {}", ch.to));
+                                                redraw = true;
+                                            }
+                                        },
+                                        None => close = true,
+                                    }
+                                }
+                                Some(b't') | Some(b'q') | Some(b' ') | Some(0x03)
+                                | Some(27) => close = true,
+                                Some(0x0d) | Some(0x0a) => close = true,
                                 // Rename without leaving: command line over the
                                 // graph, prefilled with the current name.
                                 Some(b'r') => {
@@ -1862,10 +2297,40 @@ pub fn run(
                                 }
                                 _ => {}
                             }
-                            if let Some((rt, fork)) = switch_to {
+                            if redraw && !close && switch_to.is_none() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let view = render_graph(
+                                    naming.as_ref(),
+                                    &view_chapters,
+                                    session.runtime.label(),
+                                    view_rows,
+                                    now,
+                                    view_sel,
+                                    view_notice.as_deref(),
+                                    child_session.as_deref(),
+                                    view_here_origin,
+                                );
+                                let _ = out.write_all(view.as_bytes());
+                                let _ = out.flush();
+                            }
+                            if let Some((rt, fork, landing)) = switch_to {
                                 leave_view(&mut out, &mut view_alt, &mut view_buf);
                                 mode = M_NORMAL;
-                                request_switch(rt, fork, &mut session, &mut switching_to);
+                                // Enter carries a landing → resume that chapter as
+                                // it was. c/x/o carry no landing → fork forward.
+                                let resume_in_place = landing.is_some();
+                                request_switch(
+                                    rt,
+                                    fork,
+                                    default_paged,
+                                    landing,
+                                    resume_in_place,
+                                    &mut session,
+                                    &mut switching_to,
+                                );
                             }
                             if close {
                                 mode = M_NORMAL;
@@ -1898,7 +2363,7 @@ pub fn run(
                 if let Some(req) = &switching_to
                     && !term_sent
                 {
-                    let proceed = req.new || {
+                    let proceed = req.new || req.resume_in_place || {
                         let declared = child_session
                             .as_deref()
                             .and_then(|id| crate::alembic::session_by_id(session.runtime, id))
@@ -2027,9 +2492,11 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: if n == 3 { "new-fork" } else { "refresh-existing" }.to_string(),
                 recorded: n > 1,
+                id: format!("proj-{n}"),
+                path: format!("/tmp/proj-{n}.jsonl"),
             })
             .collect();
-        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000);
+        let view = render_graph(Some(&nm), &chapters, "codex", 40, 2_000_000, 0, None, None, false);
         assert!(view.contains("cobalt-37"), "{view}");
         assert!(view.contains("auth redirect bug"));
         assert!(view.contains("ch05"), "head chapter missing: {view}");
@@ -2038,12 +2505,92 @@ mod tests {
         assert!(view.contains("rec \u{2713}"), "record marker missing");
 
         // Tiny terminal: old chapters truncate with an honest count.
-        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000);
+        let small = render_graph(Some(&nm), &chapters, "codex", 10, 2_000_000, 0, None, None, false);
         assert!(small.contains("earlier chapters"), "{small}");
 
         // No thread yet: says so instead of pretending.
-        let empty = render_graph(None, &[], "codex", 40, 2_000_000);
+        let empty = render_graph(None, &[], "codex", 40, 2_000_000, 0, None, None, false);
         assert!(empty.contains("no thread yet"));
+
+        // The cursor rides the selected row (newest-first), and a notice shows.
+        let with_sel = render_graph(
+            Some(&nm),
+            &chapters,
+            "codex",
+            40,
+            2_000_000,
+            1,
+            Some("ch02's projection is gone"),
+            None,
+            false,
+        );
+        assert!(with_sel.contains("\u{276f}"), "no cursor: {with_sel}");
+        assert!(with_sel.contains("projection is gone"));
+    }
+
+    #[test]
+    fn graph_head_reflects_where_you_actually_are() {
+        let nm = crate::trail::Naming {
+            handle: "iris-19".to_string(),
+            name: "CONSTANT FABLE".to_string(),
+            named: true,
+        };
+        let chapters: Vec<crate::trail::ChapterRow> = (1..=2)
+            .map(|n| crate::trail::ChapterRow {
+                n,
+                from: "claude".to_string(),
+                to: if n == 2 { "codex" } else { "claude" }.to_string(),
+                ts: 1_000_000 + n as u64,
+                mode: "new-fork".to_string(),
+                recorded: true,
+                id: format!("proj-{n}"),
+                path: format!("/tmp/proj-{n}.jsonl"),
+            })
+            .collect();
+
+        // Sitting IN ch01: it's marked here, and no phantom "ch03" head appears.
+        let in_ch1 = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("proj-1"),
+            false,
+        );
+        assert!(in_ch1.contains("you are here"), "{in_ch1}");
+        assert!(!in_ch1.contains("ch03"), "phantom head leaked: {in_ch1}");
+
+        // Sitting in the ORIGIN: head says so, not a chapter number it never had.
+        let at_origin = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("the-origin-id"),
+            true,
+        );
+        assert!(at_origin.contains("origin"), "{at_origin}");
+        assert!(!at_origin.contains("ch03"), "phantom head leaked: {at_origin}");
+
+        // A genuinely fresh position still earns the next-chapter head.
+        let fresh = render_graph(
+            Some(&nm),
+            &chapters,
+            "claude",
+            40,
+            2_000_000,
+            0,
+            None,
+            Some("brand-new-id"),
+            false,
+        );
+        assert!(fresh.contains("ch03"), "fresh head missing: {fresh}");
     }
 
     #[test]

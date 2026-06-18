@@ -146,6 +146,79 @@ fn carry_requires_a_source() {
     assert!(err(&o).contains("requires"), "{}", err(&o));
 }
 
+/// `--session` resolves the spellings a person actually types: the trail
+/// HANDLE (globally unique) and the conversation NAME — and duplicate names
+/// are refused with the candidates listed (claude/codex allow duplicates).
+#[test]
+fn carry_session_resolves_handles_and_names() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let o = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+
+    // The handle the trail minted for this conversation.
+    let trail_out = out(&run(&dir, &["trail", "--all", "--plain"]));
+    let handle = trail_out
+        .split_whitespace()
+        .find(|w| {
+            w.contains('-')
+                && w.split_once('-')
+                    .map(|(c, t)| c.chars().all(|ch| ch.is_ascii_lowercase())
+                        && !c.is_empty()
+                        && t.chars().all(|ch| ch.is_ascii_digit())
+                        && !t.is_empty())
+                    .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("no handle in trail output: {trail_out}"))
+        .to_string();
+
+    // Carry BY HANDLE: resolves to the conversation's latest projection.
+    let o = run(&dir, &["carry", "--to", "codex", "--session", &handle, "--json"]);
+    assert!(o.status.success(), "carry by handle failed: {}", err(&o));
+
+    // Carry BY NAME: the projection's display name (the stamped trail name,
+    // "from-the-fixture") — a unique contains-match resolves without a TTY.
+    let o = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", "from-the-fixture", "--json"],
+    );
+    assert!(o.status.success(), "carry by name failed: {}", err(&o));
+}
+
+#[test]
+fn carry_session_refuses_duplicate_names_without_a_terminal() {
+    let dir = tmpdir();
+    let a = ir_fixture_named(&dir, "a.json", "dup-aaaa", "duplicate name here");
+    let b = ir_fixture_named(&dir, "b.json", "dup-bbbb", "duplicate name here");
+    for f in [&a, &b] {
+        let o = run(
+            &dir,
+            &["carry", "--to", "claude", "--session", f.to_str().unwrap()],
+        );
+        assert!(o.status.success(), "{}", err(&o));
+    }
+
+    // Two claude projections now share the name. Piped (no TTY): list + bail.
+    let o = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", "duplicate-name-here"],
+    );
+    assert!(!o.status.success(), "duplicate names must not auto-pick");
+    assert!(
+        err(&o).contains("several sessions match"),
+        "wrong error: {}",
+        err(&o)
+    );
+    assert!(
+        err(&o).contains("pick one by id"),
+        "should teach the way out: {}",
+        err(&o)
+    );
+}
+
 #[test]
 fn carry_from_and_session_are_mutually_exclusive() {
     let dir = tmpdir();
@@ -346,12 +419,19 @@ fn trail_dedupes_projection_refreshes_and_events_shows_raw_ledger() {
         assert!(c.status.success(), "{}", err(&c));
     }
 
-    let current = run(&dir, &["trail", "--all"]);
+    let current = run(&dir, &["trail", "--all", "--full"]);
     assert!(current.status.success(), "{}", err(&current));
     let current_out = out(&current);
     assert!(
         current_out.contains("synced 2x"),
-        "trail should collapse repeated writes to one projection: {current_out}"
+        "trail --full should collapse repeated writes to one projection: {current_out}"
+    );
+    // The default view stays compact: sync counts render as ×N.
+    let compact = run(&dir, &["trail", "--all"]);
+    assert!(
+        out(&compact).contains("\u{d7}2"),
+        "compact trail should show the refresh count: {}",
+        out(&compact)
     );
     assert!(
         current_out.contains("events: 2"),
@@ -369,6 +449,40 @@ fn trail_dedupes_projection_refreshes_and_events_shows_raw_ledger() {
         raw_out.contains("ch02"),
         "raw ledger missing second event: {raw_out}"
     );
+}
+
+/// In a terminal `constant trail` opens the interactive explorer; everywhere
+/// else (pipes, scripts, --plain) it MUST stay the printable card view. The
+/// other trail tests already pipe bare `trail`, so this pins the explicit
+/// opt-out: --plain is accepted and prints the same cards.
+#[test]
+fn trail_plain_and_sessions_plain_keep_the_printouts() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+        ],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let plain = run(&dir, &["trail", "--all", "--plain"]);
+    assert!(plain.status.success(), "{}", err(&plain));
+    let plain_out = out(&plain);
+    assert!(
+        plain_out.contains("constant resume"),
+        "trail --plain should print the card view: {plain_out}"
+    );
+    // Identical to the piped default — --plain is the same view, just forced.
+    assert_eq!(plain_out, out(&run(&dir, &["trail", "--all"])));
+
+    let sessions = run(&dir, &["sessions", "--all", "--plain"]);
+    assert!(sessions.status.success(), "{}", err(&sessions));
 }
 
 #[test]
@@ -802,7 +916,7 @@ fn trail_current_view_hides_deleted_projection_but_events_keep_it() {
     assert!(current.status.success(), "{}", err(&current));
     let current_out = out(&current);
     assert!(
-        current_out.contains("projections: none"),
+        current_out.contains("no live projections"),
         "deleted projection should not be current: {current_out}"
     );
     assert!(
@@ -1660,7 +1774,7 @@ fn carry_writes_a_record_volume_and_restore_reprints_it() {
     assert!(ls_out.contains("ch01"), "listing missing the volume: {ls_out}");
     assert!(ls_out.contains("ok"), "volume not marked ok: {ls_out}");
     assert!(
-        ls_out.contains("restore latest:"),
+        ls_out.contains("constant restore"),
         "listing missing restore hint: {ls_out}"
     );
 
@@ -1758,4 +1872,154 @@ fn export_refuses_to_overwrite_its_source() {
     );
     assert!(!o.status.success(), "export overwrote its own source!");
     assert_eq!(before, std::fs::read(&fix).unwrap(), "source was modified");
+}
+
+/// A long IR fixture: `pairs` user/assistant exchanges, each turn padded so a
+/// paged render must file most of the conversation.
+fn ir_fixture_long(dir: &Path, id: &str, pairs: usize) -> PathBuf {
+    let path = dir.join(format!("{id}.json"));
+    let pad = "lorem ".repeat(220); // ~1.3k chars per turn
+    let mut events = String::new();
+    for i in 0..pairs {
+        if i > 0 {
+            events.push_str(",\n");
+        }
+        events.push_str(&format!(
+            r#"    {{ "kind": "message", "role": "user",
+      "blocks": [ {{ "kind": "text", "text": "question {i} {pad}" }} ] }},
+    {{ "kind": "message", "role": "assistant",
+      "blocks": [ {{ "kind": "text", "text": "answer {i} {pad}" }} ] }}"#
+        ));
+    }
+    let ir = format!(
+        r#"{{
+  "ir_version": "transession/v1",
+  "metadata": {{ "session_id": "{id}", "source_format": "codex", "cwd": "/tmp/constant-cli-proj" }},
+  "events": [
+{events}
+  ]
+}}"#
+    );
+    std::fs::write(&path, ir).unwrap();
+    path
+}
+
+/// Move 1+2 round trip: a paged carry files old turns behind addresses, the
+/// projection wakes on head card + index + verbatim tail, and `constant
+/// recall` resolves any filed address back to the exact original words.
+#[test]
+fn paged_render_files_turns_and_recall_reads_them_back() {
+    let dir = tmpdir();
+    let src = ir_fixture_long(&dir, "paged-0001", 20); // ~52k chars: must file
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "paged carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let handle = v["handle"].as_str().unwrap().to_string();
+    let indexed = v["receipt"]["indexed"].as_u64().unwrap();
+    assert!(indexed > 0, "long conversation was not filed: {v}");
+
+    // The projection: head card + index + verbatim tail, older turns ABSENT.
+    let projection = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+    assert!(projection.contains("[constant: taking over]"), "no head card");
+    assert!(projection.contains("index of filed turns"), "no index");
+    assert!(
+        projection.contains(&format!("constant recall {handle}")),
+        "head card does not teach recall"
+    );
+    assert!(projection.contains("answer 19"), "tail not verbatim");
+    let full_first_turn = format!("question 0 {}", "lorem ".repeat(220));
+    assert!(
+        !projection.contains(full_first_turn.trim_end()),
+        "filed turn leaked verbatim into the projection"
+    );
+
+    // The record still holds the FULL thread (indexed is never lost)...
+    let record = std::fs::read_to_string(v["snapshot"].as_str().unwrap()).unwrap();
+    assert!(record.contains("question 0"), "record lost a filed turn");
+
+    // ...and recall resolves a filed address to the exact words.
+    let o = run(&dir, &["recall", &handle, "1-2"]);
+    assert!(o.status.success(), "recall failed: {}", err(&o));
+    let text = out(&o);
+    assert!(text.contains("question 0"), "recall missing turn 1: {text}");
+    assert!(text.contains("answer 0"), "recall missing turn 2");
+    assert!(text.contains("\u{b7}1] user:"), "recall lost addressing: {text}");
+
+    // Single-turn recall stays scoped.
+    let o = run(&dir, &["recall", &handle, "3"]);
+    assert!(o.status.success());
+    let text = out(&o);
+    assert!(text.contains("question 1"));
+    assert!(!text.contains("answer 1\n"), "range leaked: {text}");
+}
+
+/// The paged view's desk furniture is scaffold: a RE-carry of a paged
+/// projection strips the head card and index instead of carrying them
+/// forward as fake user turns.
+#[test]
+fn paged_desk_furniture_self_cleans_on_recarry() {
+    let dir = tmpdir();
+    let src = ir_fixture_long(&dir, "paged-0002", 20);
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let projection = v["path"].as_str().unwrap().to_string();
+
+    // Re-carry the paged projection (full render this time).
+    let o = run(
+        &dir,
+        &["carry", "--session", &projection, "--to", "codex", "--json"],
+    );
+    assert!(o.status.success(), "re-carry failed: {}", err(&o));
+    let v2: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let reprojection = std::fs::read_to_string(v2["path"].as_str().unwrap()).unwrap();
+    assert!(
+        !reprojection.contains("[constant: taking over]"),
+        "head card carried forward as a conversation turn"
+    );
+    assert!(
+        !reprojection.contains("index of filed turns"),
+        "index carried forward as a conversation turn"
+    );
+    assert!(
+        v2["receipt"]["dropped_scaffold"].as_u64().unwrap() >= 2,
+        "receipt did not declare the stripped desk furniture: {v2}"
+    );
+}
+
+/// Short conversations never get filed — paged mode degrades to
+/// orientation-only, and recall still works against the record.
+#[test]
+fn paged_render_keeps_short_conversations_whole() {
+    let dir = tmpdir();
+    let src = ir_fixture(&dir);
+
+    let o = run(
+        &dir,
+        &[
+            "carry", "--session", src.to_str().unwrap(), "--to", "claude",
+            "--render", "paged", "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["receipt"]["indexed"].as_u64().unwrap(), 0);
+    let projection = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+    assert!(projection.contains("[constant: taking over]"));
+    assert!(!projection.contains("index of filed turns"));
+    assert!(projection.contains("hello from the fixture"), "turns must stay verbatim");
 }

@@ -5,10 +5,13 @@
 //! the conversation.
 
 mod alembic;
+mod explorer;
 mod host;
 mod live;
+mod picker;
 mod runtime;
 mod trail;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 use runtime::Runtime;
@@ -29,6 +32,7 @@ fn main() -> Result<()> {
         Some("status") => run_status(&args[1..]),
         Some("trail") => run_trail(&args[1..]),
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
+        Some("recall") => run_recall(&args[1..]),
         Some("ps") | Some("live") => run_ps(&args[1..]),
         Some("rename") => run_rename(&args[1..]),
         Some("pack") => run_pack(&args[1..]),
@@ -76,6 +80,8 @@ fn run_host(rest: &[String]) -> Result<()> {
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
     let mut with_tools = false;
     let mut bar = true;
+    // None = no flag: long-thread switches ask [v]erbatim · [c]ompact.
+    let mut render: Option<bool> = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -90,6 +96,14 @@ fn run_host(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                render = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => Some(true),
+                    "full" => Some(false),
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
             }
             "--no-bar" => {
                 bar = false;
@@ -110,6 +124,7 @@ fn run_host(rest: &[String]) -> Result<()> {
         None,
         with_tools,
         bar,
+        render,
         prefix_byte,
         prefix_label,
     )
@@ -208,6 +223,146 @@ fn install_channel(exe: &str) -> InstallChannel {
     }
 }
 
+/// Resolve a `--session` argument the way a person types it. In order:
+/// a path or native session id (exact, scriptable — unchanged), then a
+/// conversation HANDLE from the trail (globally unambiguous by construction;
+/// falls back to the conversation's latest record volume when no projection
+/// lives), then a NAME. Names can be duplicated — claude and codex both
+/// allow several sessions to share a title — so several matches open a
+/// picker in a terminal, or list the candidates and bail in a script.
+fn resolve_session_arg(q: &str) -> Result<PathBuf> {
+    // 1. Path or native id — the exact, scriptable spelling. An AMBIGUOUS id
+    // (one id in two runtimes' stores) is a refusal, not a miss: it must
+    // propagate, never fall through to fuzzier matching.
+    match alembic::resolve_session(Path::new(q)) {
+        Ok(p) => return Ok(p),
+        Err(e) if e.to_string().contains("more than one") => return Err(e),
+        Err(_) => {}
+    }
+
+    // 2. Trail handle: cobalt-37 names exactly one conversation, ever.
+    let convs = trail::conversations(None);
+    if let Some(c) = convs.iter().find(|c| c.handle.eq_ignore_ascii_case(q)) {
+        if let Some(p) = c.projections.iter().max_by_key(|p| p.last_n)
+            && let Ok(rt) = Runtime::parse(&p.runtime)
+            && let Some((path, _)) = alembic::session_by_id(rt, &p.id)
+        {
+            return Ok(path);
+        }
+        // Every projection gone: the record volume is itself a valid carry
+        // source (carry reads IR), so a packed/expired conversation still
+        // carries by handle.
+        if let Some(snap) = trail::latest_snapshot(&c.conversation) {
+            return Ok(snap);
+        }
+        bail!(
+            "{} has no live projection and no record volume on this machine",
+            term_safe(q)
+        );
+    }
+
+    // 3. A name. Scan this folder first, widen to everywhere only when the
+    // folder has no match (the near thing is almost always the meant thing).
+    let here = std::env::current_dir().ok();
+    let mut candidates = name_candidates(q, here.as_deref());
+    if candidates.is_empty() {
+        candidates = name_candidates(q, None);
+    }
+    match candidates.len() {
+        0 => bail!(
+            "could not resolve {} as a path, session id, handle, or name \
+             (see `constant sessions`)",
+            term_safe(q)
+        ),
+        1 => Ok(candidates.remove(0).path),
+        _ => {
+            // Several files, ONE conversation: projections of the same
+            // conversation share its name by design (the codex copy, the
+            // claude copy). The user means the conversation — its newest
+            // projection wins. Real ambiguity is DIFFERENT conversations
+            // (or unknown sessions) wearing one name.
+            let handles: std::collections::HashSet<&str> =
+                candidates.iter().filter_map(|c| c.handle()).collect();
+            if handles.len() == 1 && candidates.iter().all(|c| c.handle().is_some()) {
+                return Ok(candidates.remove(0).path); // newest-first order
+            }
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                let heading = format!("several sessions are named \u{201c}{}\u{201d}", term_safe(q));
+                match picker::pick_among(&heading, candidates)? {
+                    Some(choice) => Ok(choice.path),
+                    None => bail!("cancelled"),
+                }
+            } else {
+                let a = trail::ansi();
+                eprintln!("several sessions match \u{201c}{}\u{201d}:", term_safe(q));
+                for c in &candidates {
+                    let age = trail::ago(c.mtime_secs);
+                    eprintln!(
+                        "  {age:>8}  {:<9} {}  {}{}{}",
+                        c.runtime.label(),
+                        term_safe(&c.display()),
+                        a.dim,
+                        term_safe(&c.id),
+                        a.reset
+                    );
+                }
+                bail!("pick one by id: constant carry --session <id> ...");
+            }
+        }
+    }
+}
+
+/// Sessions whose display name matches `q` (case-insensitive; exact-name
+/// matches outrank contains-matches), newest first, names fully resolved
+/// (this is a one-shot lookup — the per-file title reads are worth it).
+fn name_candidates(q: &str, cwd: Option<&Path>) -> Vec<picker::PickEntry> {
+    let ql = q.to_lowercase();
+    let naming = trail::naming_index();
+    let mut exact = Vec::new();
+    let mut partial = Vec::new();
+    for rt in [
+        Runtime::Codex,
+        Runtime::Claude,
+        Runtime::OpenCode,
+        Runtime::Gemini,
+    ] {
+        for s in alembic::list_sessions(rt, cwd, false) {
+            let mtime_secs = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let entry = picker::PickEntry {
+                runtime: rt,
+                trail: naming.get(&s.id).cloned(),
+                lineage: None,
+                runtime_title: s.title.filter(|t| !t.is_empty()),
+                id: s.id,
+                path: s.path,
+                cwd: s.cwd,
+                mtime_secs,
+            };
+            // Only REAL names participate — when display() falls back to the
+            // raw id, "name matching" would just be a looser, more dangerous
+            // version of the id resolution step 1 already does exactly.
+            let name = entry.display();
+            if name == entry.id {
+                continue;
+            }
+            let name = name.to_lowercase();
+            if name == ql {
+                exact.push(entry);
+            } else if name.contains(&ql) {
+                partial.push(entry);
+            }
+        }
+    }
+    let mut out = if exact.is_empty() { partial } else { exact };
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime_secs));
+    out
+}
+
 fn run_carry(rest: &[String]) -> Result<()> {
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
@@ -217,6 +372,8 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let mut debug = false;
     let mut new = false;
     let mut with_tools = false;
+    let mut paged = false;
+    let mut tail_budget = alembic::render::TAIL_BUDGET_CHARS;
 
     let mut i = 0;
     while i < rest.len() {
@@ -224,6 +381,20 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                paged = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => true,
+                    "full" => false,
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
+            }
+            "--tail" => {
+                tail_budget = flag_value(rest, i, "--tail")?
+                    .parse()
+                    .context("--tail takes a character budget, e.g. --tail 8000")?;
+                i += 2;
             }
             "--from" => {
                 from = Some(flag_value(rest, i, "--from")?);
@@ -268,8 +439,8 @@ fn run_carry(rest: &[String]) -> Result<()> {
     // Resolve the source: its path, native id, and which runtime it belongs to.
     let (src_path, src_id, from_rt) = match &session {
         Some(p) => {
-            // Resolve a path OR session id to the real file, then identify it.
-            let resolved = alembic::resolve_session(p)?;
+            // Resolve a path, session id, handle, or name to the real file.
+            let resolved = resolve_session_arg(&p.display().to_string())?;
             let (rt, id) = alembic::identify(&resolved)
                 .with_context(|| format!("could not identify session {}", resolved.display()))?;
             (resolved, id, rt)
@@ -323,13 +494,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
     };
 
     let receipt = distilled.receipt;
-    let receipt_json = serde_json::json!({
+    let mut receipt_json = serde_json::json!({
         "turns": receipt.turns,
         "tools": receipt.tools,
         "dropped_tools": receipt.dropped_tools,
         "dropped_reasoning": receipt.dropped_reasoning,
         "dropped_scaffold": receipt.dropped_scaffold,
         "redactions": receipt.redactions,
+        "indexed": receipt.indexed,
     });
 
     if dry_run {
@@ -386,6 +558,25 @@ fn run_carry(rest: &[String]) -> Result<()> {
             }
         }
     });
+    if paged {
+        // The desk layout: the record above holds the FULL thread (the index's
+        // addresses point into it); the projection gets head + index + tail.
+        let anchor = alembic::render::git_anchor(
+            distilled.session.metadata.cwd.as_deref().map(Path::new),
+        );
+        let stats = alembic::render::render_paged(
+            &mut distilled.session,
+            &naming.handle,
+            &naming.name,
+            n,
+            from_rt.label(),
+            to.label(),
+            anchor.as_deref(),
+            tail_budget,
+        );
+        distilled.receipt.indexed = stats.indexed;
+        receipt_json["indexed"] = serde_json::json!(stats.indexed);
+    }
     let (id, written, cwd) =
         alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
     // Record the trail under the CONVERSATION's own cwd (carried from the source
@@ -422,6 +613,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
             "from": from_rt.label(),
             "to": to.label(),
             "cwd": cwd.as_ref().map(|p| p.display().to_string()),
+            "path": written.display().to_string(),
             "resume": &resume,
             "trail": &title,
             "handle": &naming.handle,
@@ -444,8 +636,16 @@ fn run_carry(rest: &[String]) -> Result<()> {
         }
         println!("{out}");
     } else {
-        println!("carried → {} session {id}  ({title})", to.label());
-        println!("{}", receipt.summary());
+        let a = trail::ansi();
+        let color = if a.tty { trail::runtime_paint(to.label()) } else { "" };
+        println!(
+            "carried \u{2192} {color}{}{} session {id}  {}({title}){}",
+            to.label(),
+            a.reset,
+            a.dim,
+            a.reset
+        );
+        println!("{}", distilled.receipt.summary());
         if let Some(cwd) = cwd {
             println!("cwd: {}", term_safe(&cwd.display().to_string()));
         }
@@ -520,10 +720,14 @@ fn run_export(rest: &[String]) -> Result<()> {
 fn run_trail(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut events = false;
+    let mut full = false;
+    let mut plain = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
             "--events" => events = true,
+            "--full" => full = true,
+            "--plain" => plain = true,
             other => bail!("unknown flag: {other}"),
         }
     }
@@ -533,10 +737,23 @@ fn run_trail(rest: &[String]) -> Result<()> {
         std::env::current_dir().ok()
     };
     if events {
-        trail::print_events(cwd.as_deref())
-    } else {
-        trail::print(cwd.as_deref())
+        return trail::print_events(cwd.as_deref());
     }
+    if full {
+        return trail::print_full(cwd.as_deref());
+    }
+    // In a terminal the trail is a place, not a printout: the explorer zooms
+    // conversations → chapters → filed turns. Piped output (and --plain)
+    // keeps the card view for scripts and quick glances.
+    if !plain && tui::interactive() {
+        return match explorer::explore(cwd)? {
+            // Handles are globally unambiguous, and the explorer's everywhere
+            // scope can pick a conversation from any folder — resume unscoped.
+            Some(handle) => run_resume_cmd(&[handle, "--all".to_string()]),
+            None => Ok(()),
+        };
+    }
+    trail::print(cwd.as_deref())
 }
 
 /// `constant resume [QUERY]` — re-host a conversation from the trail: pick its
@@ -553,6 +770,7 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     let mut list = false;
     let mut with_tools = false;
     let mut bar = true;
+    let mut render: Option<bool> = None;
     let mut prefix_str = std::env::var("CONSTANT_PREFIX").unwrap_or_else(|_| "C-b".to_string());
 
     let mut i = 0;
@@ -561,6 +779,14 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
             "--with-tools" => {
                 with_tools = true;
                 i += 1;
+            }
+            "--render" => {
+                render = match flag_value(rest, i, "--render")?.as_str() {
+                    "paged" => Some(true),
+                    "full" => Some(false),
+                    other => bail!("unknown render mode: {other} (full|paged)"),
+                };
+                i += 2;
             }
             "--no-bar" => {
                 bar = false;
@@ -598,6 +824,30 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
     } else {
         std::env::current_dir().ok()
     };
+    // No query, interactive terminal → the picker: every session in scope,
+    // type-to-search, Enter wakes it hosted. (Non-TTY and explicit queries
+    // keep the scriptable paths below.)
+    if query.is_none()
+        && !list
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        let Some(choice) = picker::pick(cwd.clone())? else {
+            return Ok(());
+        };
+        let (prefix_byte, prefix_label) = host::parse_prefix(&prefix_str)?;
+        maybe_offer_update();
+        return host::run(
+            choice.runtime,
+            Some(&choice.id),
+            with_tools,
+            bar,
+            render,
+            prefix_byte,
+            prefix_label,
+        );
+    }
+
     let convs = trail::conversations(cwd.as_deref());
     if convs.is_empty() {
         let scope = if all {
@@ -700,28 +950,40 @@ fn run_resume_cmd(rest: &[String]) -> Result<()> {
         println!("{n}");
     }
     maybe_offer_update();
-    host::run(rt, Some(&id), with_tools, bar, prefix_byte, prefix_label)
+    host::run(rt, Some(&id), with_tools, bar, render, prefix_byte, prefix_label)
 }
 
 fn print_resume_list(convs: &[trail::ConversationView]) {
-    println!("resumable conversations (newest first):");
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+    println!("{dim}resumable conversations (newest first){reset}");
+    let handle_w = convs
+        .iter()
+        .map(|c| c.handle.chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(8);
     for c in convs {
         let lives_in = if c.projections.is_empty() {
-            "record only".to_string()
+            format!("{dim}record only{reset}")
         } else {
             c.projections
                 .iter()
-                .map(|p| p.runtime.as_str())
+                .map(|p| {
+                    let color = if a.tty { trail::runtime_paint(&p.runtime) } else { "" };
+                    format!("{color}{}{reset}", term_safe(&p.runtime))
+                })
                 .collect::<Vec<_>>()
-                .join("·")
+                .join(&format!("{dim}\u{b7}{reset}"))
         };
         println!(
-            "  {:<12} {:<40}  {}",
+            "  {bold}{:<42}{reset} {dim}{:<handle_w$}{reset} {}  {dim}{}{reset}",
+            trail::clip(&term_safe(&c.name), 40),
             term_safe(&c.handle),
-            term_safe(&c.name),
-            lives_in
+            lives_in,
+            trail::ago(c.last_ts)
         );
-        println!("      constant resume {}", term_safe(&c.handle));
+        println!("  {dim}{:<handle_w$} \u{21b3} constant resume {}{reset}", "", term_safe(&c.handle));
     }
 }
 
@@ -1005,26 +1267,35 @@ fn run_ps(rest: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    println!("live agent sessions ({}):", agents.len());
+    let a_style = trail::ansi();
+    let (dim, bold, reset) = (a_style.dim, a_style.bold, a_style.reset);
+    println!("{dim}{} live agent session{}{reset}", agents.len(), if agents.len() == 1 { "" } else { "s" });
+    println!();
     let home = std::env::var("HOME").unwrap_or_default();
     for a in &agents {
-        let conversation = a
+        let color = if a_style.tty {
+            trail::runtime_paint(a.runtime.label())
+        } else {
+            ""
+        };
+        // Pad BEFORE styling: escape codes inside a width spec break columns.
+        let raw_label = a
             .session_id
             .as_deref()
-            .and_then(trail::label_for_session)
-            .unwrap_or_else(|| "-".to_string());
+            .and_then(trail::naming_parts_for_session)
+            .map(|(n, h, _)| term_safe(&trail::clip(&format!("{n} \u{b7} {h}"), 44)));
+        let conversation = match &raw_label {
+            Some(l) => format!("{bold}{:<44}{reset}", l),
+            None => format!("{dim}{:<44}{reset}", "\u{2014}"),
+        };
         let session = a
             .session_id
             .as_deref()
             .map(|id| {
-                if id.chars().count() > 14 {
-                    let head: String = id.chars().take(12).collect();
-                    format!("{head}\u{2026}")
-                } else {
-                    id.to_string()
-                }
+                let head: String = id.chars().take(8).collect();
+                format!("{head}\u{2026}")
             })
-            .unwrap_or_else(|| "(session unknown)".to_string());
+            .unwrap_or_else(|| "fresh".to_string());
         let cwd = a
             .cwd
             .as_deref()
@@ -1037,10 +1308,9 @@ fn run_ps(rest: &[String]) -> Result<()> {
             })
             .unwrap_or_default();
         println!(
-            "  {:<9} {:>12}  {:<30} {:<16} {}",
+            "  {color}{:<9}{reset} {dim}{:>12}{reset}  {dim}{:<10}{reset} {conversation} {dim}{}{reset}",
             a.runtime.label(),
             term_safe(&a.up),
-            term_safe(&conversation),
             term_safe(&session),
             term_safe(&cwd),
         );
@@ -1052,11 +1322,154 @@ fn run_ps(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `constant recall HANDLE [chNN] [TURN | A-B]` — read filed turns back from
+/// the record, verbatim. The pager's other half: rendered projections file
+/// older turns under addresses like `ch04·12`; this command resolves them.
+/// Read-only — the record is never written, only opened.
+fn run_recall(rest: &[String]) -> Result<()> {
+    const MAX_TURNS: usize = 40;
+    const MAX_CHARS: usize = 20_000;
+
+    let mut query: Option<String> = None;
+    let mut chapter: Option<u32> = None;
+    let mut range: Option<(usize, usize)> = None;
+    for arg in rest {
+        let a = arg.as_str();
+        if let Some(n) = a.strip_prefix("ch").and_then(|x| x.parse::<u32>().ok()) {
+            chapter = Some(n);
+        } else if let Some((lo, hi)) = parse_turn_range(a) {
+            range = Some((lo, hi));
+        } else if a.starts_with("--") {
+            bail!("unknown flag: {a}");
+        } else if query.is_none() {
+            query = Some(a.to_string());
+        } else {
+            bail!("recall takes one conversation, e.g. `constant recall cobalt-37 ch04 12-18`");
+        }
+    }
+    let q = query.context("recall needs a conversation handle (see `constant trail --all`)")?;
+
+    // Resolve the conversation: handle exact first (never ambiguous), then
+    // name/slug contains, then conversation-id prefix.
+    let convs = trail::conversations(None);
+    let ql = q.to_lowercase();
+    let conv = convs
+        .iter()
+        .find(|c| c.handle.to_lowercase() == ql)
+        .or_else(|| {
+            let hits: Vec<_> = convs
+                .iter()
+                .filter(|c| {
+                    c.name.to_lowercase().contains(&ql)
+                        || c.slug.to_lowercase().contains(&ql)
+                        || c.conversation.starts_with(&q)
+                })
+                .collect();
+            match hits.len() {
+                1 => Some(hits[0]),
+                0 => None,
+                _ => {
+                    eprintln!("\"{q}\" matches several conversations — use the handle:");
+                    for c in &hits {
+                        eprintln!("  {}  {}", c.handle, c.name);
+                    }
+                    None
+                }
+            }
+        })
+        .with_context(|| format!("no conversation matches \"{q}\""))?;
+
+    // Resolve the volume: a named chapter's, else the newest on disk.
+    let volume = match chapter {
+        Some(n) => {
+            let row = trail::chapters(&conv.conversation)
+                .into_iter()
+                .find(|c| c.n == n)
+                .with_context(|| format!("{} has no chapter {n}", conv.handle))?;
+            let path = trail::snapshot_path(&conv.conversation, n, Runtime::parse(&row.from)?)
+                .context("record vault unavailable")?;
+            if !path.exists() {
+                bail!(
+                    "chapter {n}'s record volume is missing on this machine \
+                     (see `constant snapshots`)"
+                );
+            }
+            path
+        }
+        None => trail::latest_snapshot(&conv.conversation).with_context(|| {
+            format!("{} has no record volumes on this machine", conv.handle)
+        })?,
+    };
+
+    let text = std::fs::read_to_string(&volume)
+        .with_context(|| format!("could not read {}", volume.display()))?;
+    let session: alembic::ir::UniversalSession =
+        serde_json::from_str(&text).context("record volume is not a valid IR volume")?;
+    let turns = alembic::render::message_turns(&session);
+    if turns.is_empty() {
+        bail!("that volume holds no conversational turns");
+    }
+
+    let (lo, hi) = range.unwrap_or((1, turns.len()));
+    let lo = lo.max(1);
+    let hi = hi.min(turns.len());
+    if lo > hi {
+        bail!("turn range {lo}-{hi} is out of bounds (1-{})", turns.len());
+    }
+
+    let ch = chapter
+        .or_else(|| {
+            trail::chapters(&conv.conversation)
+                .last()
+                .map(|c| c.n)
+        })
+        .unwrap_or(0);
+    let a = trail::ansi();
+    println!(
+        "{}{}{} {}({}) \u{b7} ch{ch:02} \u{b7} turns {lo}-{hi} of {}{}",
+        a.bold,
+        trail::clip(&term_safe(&conv.name), 56),
+        a.reset,
+        a.dim,
+        term_safe(&conv.handle),
+        turns.len(),
+        a.reset
+    );
+
+    let mut chars = 0usize;
+    let mut last = lo;
+    for (shown, (n, role, text)) in turns.iter().skip(lo - 1).take(hi - lo + 1).enumerate() {
+        if shown >= MAX_TURNS || chars >= MAX_CHARS {
+            println!(
+                "\u{2026} output capped \u{b7} next: constant recall {} ch{ch:02} {}-{hi}",
+                conv.handle, last
+            );
+            break;
+        }
+        let safe = term_safe(text);
+        println!("\n[ch{ch:02}\u{b7}{n}] {role}:\n{safe}");
+        chars += safe.chars().count();
+        last = n + 1;
+    }
+    Ok(())
+}
+
+/// `"14"` → (14,14) · `"12-18"` → (12,18) · anything else → None.
+fn parse_turn_range(s: &str) -> Option<(usize, usize)> {
+    if let Ok(n) = s.parse::<usize>() {
+        return Some((n, n));
+    }
+    let (a, b) = s.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
 fn run_snapshots(rest: &[String]) -> Result<()> {
     let mut all = false;
+    let mut full = false;
     for arg in rest {
         match arg.as_str() {
             "--all" => all = true,
+            "--full" => full = true,
             other => bail!("unknown flag: {other}"),
         }
     }
@@ -1065,7 +1478,7 @@ fn run_snapshots(rest: &[String]) -> Result<()> {
     } else {
         std::env::current_dir().ok()
     };
-    trail::print_snapshots(cwd.as_deref())
+    trail::print_snapshots(cwd.as_deref(), full)
 }
 
 /// A restore's outcome: the freshly minted projection and where it came from.
@@ -1306,6 +1719,8 @@ fn run_status(rest: &[String]) -> Result<()> {
     println!();
     trail::print_status(cwd.as_deref())?;
 
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
     println!("\nlatest sessions:");
     for rt in [
         Runtime::Codex,
@@ -1316,10 +1731,29 @@ fn run_status(rest: &[String]) -> Result<()> {
         // Keep `status` cheap and privacy-minimal: no transcript reads here.
         // Use `constant sessions --titles` when the prompt-derived title is wanted.
         let sessions = alembic::list_sessions(rt, cwd.as_deref(), false);
+        let color = if a.tty { trail::runtime_paint(rt.label()) } else { "" };
         if let Some(s) = sessions.first() {
-            println!("  {:<6} {}", s.runtime, term_safe(&s.id));
+            let age = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| trail::ago(d.as_secs()))
+                .unwrap_or_default();
+            let known = trail::naming_parts_for_session(&s.id)
+                .map(|(n, h, _)| {
+                    format!(
+                        "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
+                        term_safe(&trail::clip(&n, 44)),
+                        term_safe(&h)
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  {color}{:<8}{reset} {dim}{}{reset}  {dim}{age}{reset}{known}",
+                s.runtime,
+                term_safe(&s.id)
+            );
         } else {
-            println!("  {:<6} none", rt.label());
+            println!("  {color}{:<8}{reset} {dim}none{reset}", rt.label());
         }
     }
     Ok(())
@@ -1330,6 +1764,8 @@ fn run_sessions(rest: &[String]) -> Result<()> {
     let mut all = false;
     let mut json = false;
     let mut titles = false;
+    let mut plain = false;
+    let mut query: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1349,8 +1785,27 @@ fn run_sessions(rest: &[String]) -> Result<()> {
                 titles = true;
                 i += 1;
             }
+            "--plain" => {
+                plain = true;
+                i += 1;
+            }
+            q if !q.starts_with('-') => {
+                if query.is_some() {
+                    bail!("sessions takes one search query, e.g. `constant sessions market`");
+                }
+                query = Some(q.to_lowercase());
+                i += 1;
+            }
             other => bail!("unknown flag: {other}"),
         }
+    }
+
+    // Bare `constant sessions` in a terminal opens the same picker as
+    // `constant resume`: the sessions ARE its rows, Enter wakes one hosted.
+    // Any query/flag (or a pipe) keeps the scriptable printout below.
+    if !plain && !json && !titles && from.is_none() && query.is_none() && tui::interactive() {
+        let fwd: Vec<String> = if all { vec!["--all".to_string()] } else { Vec::new() };
+        return run_resume_cmd(&fwd);
     }
 
     let cwd = if all {
@@ -1372,6 +1827,23 @@ fn run_sessions(rest: &[String]) -> Result<()> {
         sessions.extend(alembic::list_sessions(rt, cwd.as_deref(), titles));
     }
     sessions.sort_by_key(|b| std::cmp::Reverse(b.mtime));
+    if let Some(q) = &query {
+        sessions.retain(|s| {
+            s.id.to_lowercase().contains(q)
+                || s.title
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(q))
+                    .unwrap_or(false)
+                || trail::label_for_session(&s.id)
+                    .map(|l| l.to_lowercase().contains(q))
+                    .unwrap_or(false)
+        });
+        if sessions.is_empty() {
+            println!("no sessions match \u{201c}{}\u{201d}", term_safe(q));
+            println!("(codex titles come from its registry; claude/gemini need --titles to search transcripts)");
+            return Ok(());
+        }
+    }
 
     if json {
         let arr: Vec<_> = sessions
@@ -1397,17 +1869,42 @@ fn run_sessions(rest: &[String]) -> Result<()> {
         };
         println!("no sessions found{scope}");
     } else {
+        let a = trail::ansi();
+        let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+        // One ledger read for every row's naming, not one per row.
+        let naming = trail::naming_index();
         for s in &sessions {
             // `·` marks a session known to be empty (only determinable with --titles).
             let mark = match s.has_conversation {
-                Some(false) => "·",
+                Some(false) => "\u{b7}",
                 _ => " ",
             };
+            let color = if a.tty { trail::runtime_paint(s.runtime) } else { "" };
+            let age = s
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| trail::ago(d.as_secs()))
+                .unwrap_or_default();
+            let label = naming
+                .get(&s.id)
+                .map(|(n, h, _)| {
+                    format!(
+                        "  {bold}{}{reset} {dim}\u{b7} {}{reset}",
+                        term_safe(&trail::clip(n, 44)),
+                        term_safe(h)
+                    )
+                })
+                .unwrap_or_default();
+            let title = s
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("  {}", term_safe(&trail::clip(t, 56))))
+                .unwrap_or_default();
             println!(
-                "{mark} {:6}  {}  {}",
+                "{mark} {color}{:<8}{reset} {} {dim}{age:>8}{reset}{label}{title}",
                 s.runtime,
-                term_safe(&s.id),
-                term_safe(s.title.as_deref().unwrap_or(""))
+                term_safe(&s.id)
             );
         }
     }
@@ -1466,17 +1963,28 @@ fn run_doctor(rest: &[String]) -> Result<()> {
             })
         );
     } else {
+        let a = trail::ansi();
+        let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+        let amber = if a.tty { "\x1b[38;5;214m" } else { "" };
         let mark = |b: bool| if b { "ok" } else { "MISSING" };
-        println!("constant doctor");
+        println!("{bold}constant doctor{reset}");
         match (&update, &latest) {
             (Some(u), _) => println!(
-                "  constant : {current} — v{u} AVAILABLE · brew upgrade kennykankush/constant/constant"
+                "  {bold}constant{reset} : {current} {amber}\u{2014} v{u} AVAILABLE{reset} {dim}\u{b7} brew upgrade kennykankush/constant/constant{reset}"
             ),
-            (None, Some(_)) => println!("  constant : {current} (latest)"),
-            (None, None) => println!("  constant : {current} (release check skipped — offline?)"),
+            (None, Some(_)) => println!("  {bold}constant{reset} : {current} {dim}(latest){reset}"),
+            (None, None) => println!("  {bold}constant{reset} : {current} {dim}(release check skipped \u{2014} offline?){reset}"),
         }
+        let rt_line = |rt: &str| -> String {
+            if a.tty {
+                format!("{}{rt:<8}{reset}", trail::runtime_paint(rt))
+            } else {
+                format!("{rt:<8}")
+            }
+        };
         println!(
-            "  codex  : {} (cli {}, sessions {}, db {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, sessions {}, db {}) \u{2014} validated against {}.x{reset}",
+            rt_line("codex"),
             r.codex_version.as_deref().unwrap_or("not found"),
             mark(r.codex_version.is_some()),
             mark(r.codex_store),
@@ -1484,21 +1992,24 @@ fn run_doctor(rest: &[String]) -> Result<()> {
             alembic::SUPPORTED_CODEX,
         );
         println!(
-            "  claude : {} (cli {}, projects {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, projects {}) \u{2014} validated against {}.x{reset}",
+            rt_line("claude"),
             r.claude_version.as_deref().unwrap_or("not found"),
             mark(r.claude_version.is_some()),
             mark(r.claude_store),
             alembic::SUPPORTED_CLAUDE,
         );
         println!(
-            "  opencode : {} (cli {}, db {}) — validated against {}.x",
+            "  {} : {} {dim}(cli {}, db {}) \u{2014} validated against {}.x{reset}",
+            rt_line("opencode"),
             r.opencode_version.as_deref().unwrap_or("not found"),
             mark(r.opencode_version.is_some()),
             mark(r.opencode_db),
             alembic::SUPPORTED_OPENCODE,
         );
         println!(
-            "  gemini : {} (cli {}, store {}) — validated against {}.x; carry source only",
+            "  {} : {} {dim}(cli {}, store {}) \u{2014} validated against {}.x; carry source only{reset}",
+            rt_line("gemini"),
             r.gemini_version.as_deref().unwrap_or("not found"),
             mark(r.gemini_version.is_some()),
             mark(r.gemini_store),
@@ -1509,93 +2020,103 @@ fn run_doctor(rest: &[String]) -> Result<()> {
 }
 
 fn print_help() {
+    let a = trail::ansi();
+    let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+    let paint = |rt: &str| -> String {
+        if a.tty {
+            format!("{}{rt}{reset}", trail::runtime_paint(rt))
+        } else {
+            rt.to_string()
+        }
+    };
+    let (codex, claude, opencode, gemini) = (
+        paint("codex"),
+        paint("claude"),
+        paint("opencode"),
+        paint("gemini"),
+    );
     println!(
-        r#"Constant — one conversation, any agent runtime.
+        "\
+{bold}constant{reset} \u{2014} one conversation, any agent runtime.
 
-USAGE:
-  constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
-        Host an agent CLI in a Constant PTY (default runtime: codex, prefix: Ctrl-B).
-        A persistent status bar lives on the bottom row (runtime, thread, keys);
-        --no-bar disables it.
+{dim}LIVE{reset}
+  {bold}constant host{reset} [codex|claude|opencode] {dim}[--prefix C-t] [--with-tools] [--no-bar] [--render full|paged]{reset}
+        {dim}Host an agent CLI in a Constant PTY (default: codex, prefix: Ctrl-B).
+        A status bar lives on the bottom row; --no-bar disables it.
+        No --render flag: switching a LONG thread asks [v]erbatim \u{b7} [c]ompact
+        (compact files older turns in the record \u{2014} recallable, never lost).{reset}
 
-  constant carry --to codex|claude|opencode [--from RT | --session PATH_OR_ID] [--json] [--dry-run] [--debug] [--new] [--with-tools]
-        Sources: codex, claude, opencode (ses_… ids resolve automatically), and
-        gemini (source only — carrying INTO gemini lands after one live check).
-        Headless: carry a conversation into the target runtime's native session and
-        print the resume command (no terminal). --json for machine output;
-        --dry-run previews without writing; --debug shows the route decision;
-        --new creates a fresh target continuation instead of refreshing one.
-        (`distill` is an alias.)
+  {bold}constant resume{reset} [QUERY] {dim}[--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]{reset}
+        {dim}No QUERY (in a terminal): an interactive picker over every session
+        in scope \u{2014} type to search, \u{2191}\u{2193} browse, Tab toggles folder/everywhere,
+        Ctrl-T narrows to constant conversations, Enter wakes it hosted.
+        With QUERY: matches a handle, name, or id from the trail. If every
+        projection is gone, reprints from the record.{reset}
 
-        --with-tools (experimental, also on host/resume): carry tool calls and
-        results too — redacted and size-capped. Default carries conversation only.
+{dim}CARRY{reset}
+  {bold}constant carry{reset} --to codex|claude|opencode {dim}[--from RT | --session PATH_OR_ID]
+        [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged] [--tail CHARS]{reset}
+        {dim}Headless: carry a conversation into the target's native session and
+        print the receipt + resume command. Sources: codex, claude, opencode,
+        and gemini (source only). --new forks instead of refreshing;
+        --with-tools carries tool calls/results (redacted, capped).
+        (`distill` is an alias.){reset}
 
-  constant resume [QUERY] [--in codex|claude] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar]
-        Re-host a conversation from the trail: wakes its latest projection live
-        (prefix switching ready). No QUERY = the newest conversation here;
-        QUERY matches the slug or conversation id. If every projection is gone,
-        reprints one from the latest record volume first.
+{dim}THE RECORD{reset}  {dim}\u{2014} every carry snapshots the FULL thread; filed is never lost{reset}
+  {bold}constant recall{reset} HANDLE {dim}[chNN] [TURN | A-B]{reset}
+        {dim}Read filed turns back, verbatim, by address (ch04\u{b7}12). Read-only.
+        --render paged lays projections out as head card + index + recent
+        turns verbatim; the index's addresses resolve here.{reset}
 
-  constant sessions [--from codex|claude] [--all] [--titles] [--json]
-        List carryable sessions (this directory, or --all). --titles adds a preview
-        (reads transcripts; slower on large stores). Discovery for carry.
+  {bold}constant snapshots{reset} {dim}[--all] [--full]{reset}
+        {dim}List the record volumes per conversation (--full shows paths).{reset}
 
-  constant export (--from codex|claude | --session PATH) [--out FILE]
-        Export a conversation as the neutral IR master (distilled + redacted JSON):
-        a portable, runtime-agnostic copy. Writes to --out FILE, else stdout.
+  {bold}constant restore{reset} SNAPSHOT {dim}[--to codex|claude] [--json]{reset}
+        {dim}Reprint a fresh native session from any volume. Never overwrites.{reset}
 
-  constant doctor [--json]
-        Preflight: which runtimes/versions are installed and whether supported.
+{dim}NAME & MOVE{reset}
+  {bold}constant rename{reset} {dim}[--of HANDLE]{reset} NEW NAME...
+        {dim}Name a conversation (locks the title; native pickers re-stamped).
+        Inside a hosted session:  prefix then  :rename NEW NAME{reset}
 
-  constant status [--all]
-        Show current project, runtime readiness, latest sessions, and Constant trail.
+  {bold}constant pack{reset} HANDLE {dim}[--out FILE]{reset}   {bold}constant unpack{reset} FILE
+        {dim}Bundle a conversation (ledger + record volumes) into one portable
+        file; unpack it on another machine, then resume by handle.{reset}
 
-  constant trail [--all] [--events]
-        Show current projections by conversation. --events shows the raw switch ledger.
+{dim}LOOK AROUND{reset}
+  {bold}constant trail{reset} {dim}[--all] [--plain] [--full] [--events]{reset}
+        {dim}In a terminal: the explorer \u{2014} type to search, Enter zooms into a
+        conversation \u{2192} its chapters \u{2192} the filed turns, verbatim; Esc backs
+        out, r resumes hosted. --plain prints the cards instead.{reset}
+  {bold}constant sessions{reset} {dim}[QUERY] [--from RT] [--all] [--titles] [--plain] [--json]{reset}
+        {dim}Carryable sessions on disk, newest first, linked to their handles.
+        Bare in a terminal: the resume picker. QUERY filters the printout
+        by name/id (codex names come from its own registry).{reset}
+  {bold}constant ps{reset} {dim}[--json]{reset}
+        {dim}Every live agent process right now (alias: `live`). Read-only.{reset}
+  {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all]{reset}
+        {dim}Orientation \u{b7} runtime/codec preflight + update check \u{b7} fork-graph debug.{reset}
+  {bold}constant export{reset} {dim}(--from RT | --session PATH) [--out FILE]{reset}
+        {dim}The distilled, redacted neutral IR of a thread (stdout or FILE).{reset}
 
-  constant rename [--of HANDLE] NEW NAME...
-        Name a conversation (locks the title; native pickers re-stamped).
-        Inside a hosted session: prefix then  :rename NEW NAME
-
-  constant pack HANDLE [--out FILE]
-        Bundle a conversation (ledger rows + record volumes) into one portable
-        file — move conversations between machines.
-
-  constant unpack FILE
-        Import a packed conversation; then `constant resume <handle>` reprints
-        it from the record.
-
-  constant ps [--json]
-        Every agent CLI process alive on this machine right now: runtime,
-        uptime, the conversation it holds (when the trail knows it), and cwd.
-        Read-only. (`live` is an alias.)
-
-  constant snapshots [--all]
-        List the record volumes (per-hop IR snapshots, written at every carry).
-
-  constant restore SNAPSHOT [--to codex|claude] [--json]
-        Reprint a fresh native session from a record volume (never overwrites
-        anything). Default target: the runtime the record came from.
-
-  constant route [--all] [--session PATH_OR_ID]
-        Show the reconstructed fork graph with aliases like codex[1] and claude[1.1].
-
-PREFIX KEY:
-  Default is Ctrl-B. If you run inside tmux (which also uses Ctrl-B), pick another:
+{dim}PREFIX KEY{reset}
+  {dim}Default Ctrl-B. Inside tmux (which owns Ctrl-B), pick another:{reset}
       constant host codex --prefix C-t
       CONSTANT_PREFIX=C-g constant host codex
 
-INSIDE A HOSTED SESSION (press the prefix, then):
-  c              continue in claude
-  C              create a new claude continuation
-  x              continue in codex
-  X              create a new codex continuation
-  o              continue in opencode
-  O              create a new opencode continuation
-  :              open the command line (e.g. `switch claude`, `new claude`, `quit`)
-  d              quit Constant (the hosted CLI exits with it)
-  <prefix> again send a literal prefix key to the child
-"#
+{dim}INSIDE A HOSTED SESSION{reset} {dim}(press the prefix, release, then){reset}
+  {bold}c{reset} / {bold}C{reset}        {dim}continue in{reset} {claude} {dim}/ new continuation{reset}
+  {bold}x{reset} / {bold}X{reset}        {dim}continue in{reset} {codex} {dim}/ new continuation{reset}
+  {bold}o{reset} / {bold}O{reset}        {dim}continue in{reset} {opencode} {dim}/ new continuation{reset}
+               {dim}(a long thread asks first: [v]erbatim \u{b7} [c]ompact \u{b7} esc){reset}
+  {bold}t{reset}            {dim}the trail graph: \u{2191}\u{2193} pick a chapter, Enter lands in that
+               projection; c/x/o switch, r rename, t/q close{reset}
+  {bold}:{reset}            {dim}command line \u{2014} switch/new/rename/quit, Tab completes, \u{2191}\u{2193} history{reset}
+  {bold}d{reset}            {dim}quit (the hosted CLI exits with it){reset}
+  {bold}prefix again{reset} {dim}send a literal prefix key to the child{reset}
+
+  {dim}({gemini} is a carry source \u{2014} its conversations carry IN; hosting it lands later){reset}
+"
     );
 }
 
