@@ -528,6 +528,67 @@ fn route_prints_aliases_and_refreshes() {
 }
 
 #[test]
+fn route_json_emits_the_lineage_dag() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let r = run(&dir, &["route", "--json", "--all"]);
+    assert!(r.status.success(), "{}", err(&r));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&r)).expect("route --json emitted invalid JSON");
+    let convs = v.as_array().expect("route --json is an array");
+    assert!(!convs.is_empty(), "route --json empty after a carry");
+    let nodes = convs[0]["nodes"].as_array().expect("nodes array");
+    let node = &nodes[0];
+    assert_eq!(node["runtime"], "claude");
+    assert_eq!(node["parent"], "codex[1]", "parent alias missing from DAG");
+    assert!(
+        node["alias"].as_str().unwrap().starts_with("claude["),
+        "node alias: {}",
+        node["alias"]
+    );
+    assert!(
+        node["resume"].as_str().unwrap().starts_with("claude -r "),
+        "node resume: {}",
+        node["resume"]
+    );
+    assert_eq!(node["active"], true);
+}
+
+#[test]
+fn audit_reports_paged_render_stats_per_chapter() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let a = run(&dir, &["audit", "--all", "--json"]);
+    assert!(a.status.success(), "{}", err(&a));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&a)).expect("audit --json emitted invalid JSON");
+    let convs = v.as_array().expect("audit --json is an array");
+    assert!(
+        !convs.is_empty(),
+        "audit found no recorded chapters after a carry"
+    );
+    let chapters = convs[0]["chapters"].as_array().expect("chapters array");
+    let ch = &chapters[0];
+    // The 2-turn fixture fits the tail budget: everything stays verbatim, nothing filed.
+    assert_eq!(ch["turns"], 2);
+    assert_eq!(ch["verbatim"], 2);
+    assert_eq!(ch["filed"], 0);
+    assert!(ch["tail_chars"].as_u64().unwrap() > 0);
+}
+
+#[test]
 fn legacy_trail_rows_still_refresh_existing_projection() {
     let dir = tmpdir();
     let fix = ir_fixture(&dir);

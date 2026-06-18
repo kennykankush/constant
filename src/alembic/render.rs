@@ -30,9 +30,7 @@ pub const MIN_TAIL_TURNS: usize = 4;
 /// What the paged render did, for the receipt.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RenderStats {
-    /// Turns kept verbatim in the tail (read by tests and the coming
-    /// continuation-fidelity benchmark).
-    #[allow(dead_code)]
+    /// Turns kept verbatim in the tail (surfaced by `constant audit`).
     pub verbatim: usize,
     /// Turns filed into the index (recallable from the record, not dropped).
     pub indexed: usize,
@@ -65,6 +63,40 @@ fn joined_text(message: &MessageEvent) -> String {
         .filter_map(|b| b.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Where the verbatim tail begins (0-based turn index): the newest turns whose
+/// combined size fits the budget, never fewer than [`MIN_TAIL_TURNS`]. The one
+/// tail-selection function — both [`render_paged`] and [`render_stats`] call it,
+/// so the audit's numbers and the real render can never disagree.
+fn tail_start_for(turns: &[(usize, String, String)], tail_budget_chars: usize) -> usize {
+    let mut tail_start = turns.len();
+    let mut used = 0usize;
+    for (i, (_, _, text)) in turns.iter().enumerate().rev() {
+        let cost = text.chars().count() + 64;
+        if used + cost > tail_budget_chars && turns.len() - i > MIN_TAIL_TURNS {
+            break;
+        }
+        used += cost;
+        tail_start = i;
+    }
+    tail_start
+}
+
+/// What a paged render WOULD do to this session, computed WITHOUT mutating it:
+/// how many newest turns stay verbatim vs how many older turns get filed into
+/// the index. The read-only half of the renderer — `constant audit` uses it to
+/// show, per hop, what the pager keeps on the desk vs files in the cabinet.
+pub fn render_stats(session: &UniversalSession, tail_budget_chars: usize) -> RenderStats {
+    let turns = message_turns(session);
+    if turns.is_empty() {
+        return RenderStats::default();
+    }
+    let tail_start = tail_start_for(&turns, tail_budget_chars);
+    RenderStats {
+        verbatim: turns.len() - tail_start,
+        indexed: tail_start,
+    }
 }
 
 /// First line of a turn, clipped for the index (also the trail explorer's
@@ -128,18 +160,9 @@ pub fn render_paged(
         return RenderStats::default();
     }
 
-    // Choose the verbatim tail: newest turns whose combined size fits the
-    // budget, never fewer than MIN_TAIL_TURNS.
-    let mut tail_start = turns.len();
-    let mut used = 0usize;
-    for (i, (_, _, text)) in turns.iter().enumerate().rev() {
-        let cost = text.chars().count() + 64;
-        if used + cost > tail_budget_chars && turns.len() - i > MIN_TAIL_TURNS {
-            break;
-        }
-        used += cost;
-        tail_start = i;
-    }
+    // Choose the verbatim tail (shared math with `render_stats`, so the audit's
+    // numbers and the real render can never drift apart).
+    let tail_start = tail_start_for(&turns, tail_budget_chars);
     let stats = RenderStats {
         verbatim: turns.len() - tail_start,
         indexed: tail_start,
@@ -297,6 +320,47 @@ mod tests {
         assert!(
             !turns[0].2.contains(&format!("\u{b7}{}  ", stats.indexed + 1)),
             "index leaked a verbatim-tail turn"
+        );
+    }
+
+    #[test]
+    fn render_stats_is_read_only_and_agrees_with_render_paged() {
+        let long = "x".repeat(400);
+        let mut texts: Vec<(String, String)> = Vec::new();
+        for i in 0..30 {
+            texts.push((
+                if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                format!("turn {i} {long}"),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = texts
+            .iter()
+            .map(|(r, t)| (r.as_str(), t.as_str()))
+            .collect();
+
+        // render_stats must NOT mutate the session (it's the audit's read-only eye).
+        let s = session(&refs);
+        let stats = render_stats(&s, 3_000);
+        assert_eq!(s.events.len(), 30, "render_stats mutated the session");
+        assert_eq!(stats.indexed + stats.verbatim, 30);
+        assert!(stats.verbatim >= MIN_TAIL_TURNS);
+
+        // …and it must agree with what the real paged render actually does.
+        let mut rendered_session = session(&refs);
+        let rendered = render_paged(
+            &mut rendered_session,
+            "h",
+            "n",
+            1,
+            "codex",
+            "claude",
+            None,
+            3_000,
+        );
+        assert_eq!(
+            (stats.verbatim, stats.indexed),
+            (rendered.verbatim, rendered.indexed),
+            "audit numbers drifted from the real render"
         );
     }
 
