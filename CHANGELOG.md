@@ -3,6 +3,70 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - Observability and the handover
+
+New surfaces onto structure Constant already owns, plus a runtime-validation
+refresh.
+
+### Added
+- **`constant route --json`** — the fork-graph the trail reconstructs, as JSON
+  (alias, parent, mode, active, per-node resume command), so external tools read
+  a conversation's lineage without scraping the debug view.
+- **`constant ps --deep`** — joins each live agent to the trail: which chapter of
+  the thread it holds, and a flag when two live agents are double-booked on one
+  conversation. Adds `chapter`/`shared_with` to `ps --json`.
+- **`constant audit`** — a read-only command reporting, per chapter, what a paged
+  render keeps verbatim vs files (recallable), via a pure `render_stats` that
+  shares the tail math with the renderer so the two can't drift. Missing or
+  corrupt record volumes are surfaced, never silently dropped.
+- **`Ctrl-B H` — the handover gesture.** Pastes a sign-out request into the
+  hosted agent (bracketed paste + Enter); the departing mind briefs its
+  successor — goal, decisions and why, dead-ends, next step, gotchas — and the
+  sign-out rides the carried tail (recitation at the recency edge). Input-only:
+  the host never parses the child's output.
+- **`constant host --yolo`** — spawn the child runtime with its own
+  approvals-bypass flag (codex `--dangerously-bypass-approvals-and-sandbox`,
+  claude `--dangerously-skip-permissions`), opt-in and never leaked outside the
+  hosted session.
+
+### Validated
+- **Codex `0.139` → `0.141`, OpenCode `1.14` → `1.17`.** The continue-eval drift
+  matrix went 36/36 verbatim message-by-message identical across every
+  source→target pair on the live runtimes (codex 0.141, claude 2.1.170,
+  opencode 1.17.3).
+
+## [0.4.1] - Compact in place
+
+### Added
+- **Compact-in-place.** Pressing the hosted runtime's own switch key (`Ctrl-B`
+  then the current runtime) re-lays the live thread in a fresh projection of the
+  same runtime, asking `[v]erbatim · [c]ompact` rather than no-opping.
+
+### Fixed
+- A `collapsible_match` lint in the explorer surfaced by CI's newer clippy.
+
+## [0.4.0] - v2 genesis (conversation virtual memory)
+
+The doctrine: the CONVERSATION is total and immutable in the record; the CONTEXT
+a runtime wakes up to is a compiled VIEW of it. The pager, retrofitted onto
+third-party CLIs from outside.
+
+### Added
+- **`constant recall`** — read filed turns back from the record by stable address
+  (`ch04·12`), verbatim, speaker-labeled, output-capped.
+- **The paged renderer** (`--render paged`) — head card + deterministic index +
+  verbatim tail. Zero model calls (a table of contents cannot hallucinate);
+  `--tail CHARS` overrides the budget.
+- **The trail explorer** — `constant trail` in a terminal becomes a place:
+  type-to-search → a conversation → its chapters → the filed turns, verbatim.
+- **The resume picker** — instant open, names streamed in, true pagination, scope
+  as two axes (place × the constant-trail lens).
+- **Carry by name** — `carry --session` resolves handles and names; duplicates of
+  one conversation auto-pick newest, different conversations get a picker.
+- **A traversable cockpit** — `Ctrl-B t` graph gains an ↑↓ cursor; Enter lands in
+  the selected chapter's projection; the head shows where you are.
+- One design language across every printout; lineage tags (`origin` · `chNN`).
+
 ## [0.3.3]
 
 Maintenance release with no functional changes — cut to verify the update
