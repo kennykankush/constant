@@ -1905,19 +1905,21 @@ pub fn run(
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b'h') | Some(b'H') => {
-                                        // Handover: drop a sign-out request into the
-                                        // CURRENT agent's input box so the user
-                                        // doesn't have to type it — but do NOT submit
-                                        // it. A written CR is swallowed as a literal
-                                        // newline by paste-buffering CLIs, and the
-                                        // host never parses output to know when a
-                                        // reply is done (invariant #7) anyway. So the
-                                        // human stays in the loop: press Enter to
-                                        // send, watch it write, then switch — the
-                                        // sign-out rides the carried tail.
+                                        // Handover: paste a sign-out request into the
+                                        // CURRENT agent's input box as a BRACKETED
+                                        // PASTE (CSI 200~ … 201~), so the CLI inserts
+                                        // it as one literal block instead of
+                                        // interpreting the bytes as keystrokes — but
+                                        // do NOT submit it. A written CR is unreliable
+                                        // across CLIs, and the host never parses output
+                                        // to know when a reply is done (invariant #7)
+                                        // anyway. The human sends it (Enter), watches,
+                                        // then switches; the sign-out rides the tail.
+                                        let _ = session.writer.write_all(b"\x1b[200~");
                                         let _ = session.writer.write_all(HANDOVER_PROMPT.as_bytes());
+                                        let _ = session.writer.write_all(b"\x1b[201~");
                                         let _ = session.writer.flush();
-                                        let note = "\u{270d} sign-out request dropped in \u{2014} press Enter to send, then switch (prefix c/x/o) when it's written";
+                                        let note = "\u{270d} sign-out request pasted in \u{2014} press Enter to send, then switch (prefix c/x/o) when it's written";
                                         if bar {
                                             bar_notice = Some((note.to_string(), std::time::Instant::now()));
                                             bar_dirty = true;
