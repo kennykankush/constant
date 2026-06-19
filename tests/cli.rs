@@ -612,6 +612,10 @@ fn route_json_excludes_rename_nodes() {
     let v: serde_json::Value =
         serde_json::from_str(&out(&j)).expect("route --json emitted invalid JSON");
     for conv in v.as_array().unwrap() {
+        // The rename row (recorded the same second as the carry) must not become
+        // the root either.
+        assert_ne!(conv["root_runtime"], "?", "rename poisoned the DAG root: {conv}");
+        assert_ne!(conv["root"], "?[1]", "rename poisoned the DAG root alias: {conv}");
         for node in conv["nodes"].as_array().unwrap() {
             assert_ne!(node["mode"], "rename", "rename leaked into the DAG: {node}");
             assert_ne!(node["runtime"], "?", "phantom node in the DAG: {node}");

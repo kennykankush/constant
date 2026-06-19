@@ -1636,10 +1636,16 @@ fn run_audit(rest: &[String]) -> Result<()> {
             let Some(snapshot) = row.snapshot.as_deref() else {
                 continue;
             };
-            let vol = match std::fs::read_to_string(snapshot) {
+            // A read-only audit must not block or exhaust memory on a malformed
+            // or hostile ledger/pack pointing a snapshot at a FIFO, device, or a
+            // very large file — only ever read a regular, in-bounds file.
+            const MAX_VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+            let vol = match std::fs::metadata(snapshot) {
                 Err(_) => Vol::Missing,
-                Ok(text) => {
-                    match serde_json::from_str::<alembic::ir::UniversalSession>(&text) {
+                Ok(m) if !m.is_file() || m.len() > MAX_VOLUME_BYTES => Vol::Corrupt,
+                Ok(_) => match std::fs::read_to_string(snapshot) {
+                    Err(_) => Vol::Missing,
+                    Ok(text) => match serde_json::from_str::<alembic::ir::UniversalSession>(&text) {
                         Err(_) => Vol::Corrupt,
                         Ok(session) => {
                             let turns = alembic::render::message_turns(&session);
@@ -1656,8 +1662,8 @@ fn run_audit(rest: &[String]) -> Result<()> {
                                 tail_chars,
                             }
                         }
-                    }
-                }
+                    },
+                },
             };
             chapters.push(ChapterAudit {
                 n: row.n,

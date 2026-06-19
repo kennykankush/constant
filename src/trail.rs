@@ -535,7 +535,15 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
     let mut out = Vec::new();
     for (conversation, mut entries) in grouped {
         entries.sort_by_key(|e| (e.ts, e.n));
-        let Some(first) = entries.first().cloned() else {
+        // Root the DAG at the first real CARRY, never a rename: a rename has no
+        // runtime/session (`from` parses as `?`) and `n` defaults to 0, so on a
+        // same-second tie it would otherwise sort first and poison the root. A
+        // conversation with only rename rows has no DAG.
+        let Some(first) = entries
+            .iter()
+            .find(|e| e.mode.as_deref() != Some("rename"))
+            .cloned()
+        else {
             continue;
         };
         let slug = entries
