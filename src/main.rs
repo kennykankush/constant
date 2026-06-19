@@ -1619,16 +1619,14 @@ fn run_audit(rest: &[String]) -> Result<()> {
     for conv in &convs {
         let mut chapters = Vec::new();
         for row in trail::chapters(&conv.conversation) {
-            if !row.recorded {
-                continue;
-            }
-            let Ok(from_rt) = Runtime::parse(&row.from) else {
-                continue;
-            };
-            let Some(path) = trail::snapshot_path(&conv.conversation, row.n, from_rt) else {
+            // Open the volume the LEDGER recorded — never reconstruct the path.
+            // Reconstructing would miss restored/imported/legacy volumes, and
+            // would route a read-only command through the write-side
+            // `snapshot_path` helper (which creates + chmods vault dirs).
+            let Some(snapshot) = row.snapshot.as_deref() else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = std::fs::read_to_string(snapshot) else {
                 continue;
             };
             let Ok(session) = serde_json::from_str::<alembic::ir::UniversalSession>(&text) else {

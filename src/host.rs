@@ -2583,6 +2583,7 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: if n == 3 { "new-fork" } else { "refresh-existing" }.to_string(),
                 recorded: n > 1,
+                snapshot: None,
                 id: format!("proj-{n}"),
                 path: format!("/tmp/proj-{n}.jsonl"),
             })
@@ -2634,6 +2635,7 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: "new-fork".to_string(),
                 recorded: true,
+                snapshot: None,
                 id: format!("proj-{n}"),
                 path: format!("/tmp/proj-{n}.jsonl"),
             })

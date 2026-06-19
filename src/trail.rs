@@ -960,6 +960,10 @@ pub struct ChapterRow {
     pub mode: String,
     /// The hop's record volume still exists on disk.
     pub recorded: bool,
+    /// The record volume's path exactly as the ledger wrote it — so readers
+    /// open the real path instead of reconstructing the conventional one (which
+    /// would miss restored/imported/legacy volumes). `None` when no record.
+    pub snapshot: Option<String>,
     /// The hop's target projection — the graph cursor's landing pad.
     pub id: String,
     /// Target projection path; may no longer exist (checked before landing).
@@ -982,6 +986,7 @@ pub fn chapters(conv_id: &str) -> Vec<ChapterRow> {
                 .as_deref()
                 .map(|p| Path::new(p).exists())
                 .unwrap_or(false),
+            snapshot: e.snapshot.clone(),
             id: e.id.clone(),
             path: e.path.clone(),
         })
