@@ -1688,7 +1688,14 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
         .collect()
 }
 
-pub const SUPPORTED_CODEX: &str = "0.139";
+// The runtime versions Constant has been VALIDATED against — `doctor`/`status`
+// show the installed version beside these, and a mismatch warns. Bump a pin
+// ONLY after a real validation pass on that version: a version that merely runs
+// is not validated (codex 0.139 bit precisely because it ran while carrying the
+// wrong thread). SUPPORTED_CODEX → 0.141: the continue-eval drift suite went
+// 36/36 green on live codex 0.141 (2026-06-18, verbatim message-by-message via
+// `constant export`). OpenCode stays pinned at 1.14 until 1.17 gets the same pass.
+pub const SUPPORTED_CODEX: &str = "0.141";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.40";
 pub const SUPPORTED_OPENCODE: &str = "1.14";
