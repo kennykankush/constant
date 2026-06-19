@@ -44,14 +44,14 @@ const M_RENDER: u8 = 4;
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
 const MAX_ESC: usize = 256;
 
-/// The sign-out request injected into the child on `Ctrl-B H` (handover). ONE
-/// line — an embedded newline could submit early in some CLIs; the trailing
-/// carriage return is what submits it. The agent's reply lands as the thread's
-/// natural last turn, so it rides the verbatim tail of whatever carry follows
-/// (recitation at the recency edge, where attention is sharpest). The host
-/// never parses the child's output (invariant #7) and so cannot detect when the
-/// reply finishes: the human is the completion detector — watch it write, then
-/// switch.
+/// The sign-out request `Ctrl-B H` drops into the child's input box (handover).
+/// ONE line so it sits as a single clean input the user sends with one Enter —
+/// Constant does NOT auto-submit it (a written carriage return gets swallowed as
+/// a literal newline by paste-buffering CLIs, and the host never parses output
+/// to know when a reply finishes — invariant #7). The agent's reply lands as the
+/// thread's natural last turn, riding the verbatim tail of whatever carry
+/// follows (recitation at the recency edge, where attention is sharpest). The
+/// human is the completion detector: send it, watch it write, then switch.
 const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a brief sign-out for whoever continues it — the goal as it stands, where we are now, the key decisions and WHY, approaches already tried and ruled out, the exact next step, and any gotchas. Don't restate git state or repeat the transcript (the next agent has both); don't invent — if something isn't settled, say so. Reply with only the sign-out.";
 
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
@@ -1905,16 +1905,19 @@ pub fn run(
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b'h') | Some(b'H') => {
-                                        // Handover: ask the CURRENT agent to brief
-                                        // its successor. We inject the request and
-                                        // submit it; the human watches it write the
-                                        // sign-out (the host never parses output —
-                                        // invariant #7), then switches when ready.
-                                        // The sign-out rides the carried tail.
+                                        // Handover: drop a sign-out request into the
+                                        // CURRENT agent's input box so the user
+                                        // doesn't have to type it — but do NOT submit
+                                        // it. A written CR is swallowed as a literal
+                                        // newline by paste-buffering CLIs, and the
+                                        // host never parses output to know when a
+                                        // reply is done (invariant #7) anyway. So the
+                                        // human stays in the loop: press Enter to
+                                        // send, watch it write, then switch — the
+                                        // sign-out rides the carried tail.
                                         let _ = session.writer.write_all(HANDOVER_PROMPT.as_bytes());
-                                        let _ = session.writer.write_all(b"\r");
                                         let _ = session.writer.flush();
-                                        let note = "\u{270d} sign-out requested \u{2014} let it write, then switch (prefix c/x/o); it rides the handover";
+                                        let note = "\u{270d} sign-out request dropped in \u{2014} press Enter to send, then switch (prefix c/x/o) when it's written";
                                         if bar {
                                             bar_notice = Some((note.to_string(), std::time::Instant::now()));
                                             bar_dirty = true;
