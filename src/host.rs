@@ -44,6 +44,16 @@ const M_RENDER: u8 = 4;
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
 const MAX_ESC: usize = 256;
 
+/// The sign-out request `Ctrl-B H` pastes into the child and submits (handover).
+/// ONE line, delivered as a bracketed paste + a trailing carriage return OUTSIDE
+/// the paste — the exact bytes a human "paste, then Enter" produces, so the CLI
+/// submits it natively. The host still never parses output to know when the
+/// REPLY is done (invariant #7), so the human waits, watches, then switches. The
+/// agent's reply lands as the thread's natural last turn, riding the verbatim
+/// tail of whatever carry follows (recitation at the recency edge, where
+/// attention is sharpest).
+const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a brief sign-out for whoever continues it — the goal as it stands, where we are now, the key decisions and WHY, approaches already tried and ruled out, the exact next step, and any gotchas. Don't restate git state or repeat the transcript (the next agent has both); don't invent — if something isn't settled, say so. Reply with only the sign-out.";
+
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
 /// terminal sends in legacy mode (Ctrl-<L> == <L> & 0x1f), plus a human label.
 pub fn parse_prefix(spec: &str) -> Result<(u8, String)> {
@@ -1894,6 +1904,29 @@ pub fn run(
                                         &mut out,
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
+                                    Some(b'h') | Some(b'H') => {
+                                        // Handover: deliver a sign-out request as a
+                                        // BRACKETED PASTE (CSI 200~ … 201~) followed by
+                                        // a SEPARATE carriage return OUTSIDE the paste —
+                                        // the exact byte sequence a human "paste, then
+                                        // Enter" produces, so the CLI submits it
+                                        // natively. (The host still never parses output
+                                        // to know when the REPLY is done — invariant #7
+                                        // — so the human waits, watches, then switches;
+                                        // the sign-out rides the carried tail.)
+                                        let _ = session.writer.write_all(b"\x1b[200~");
+                                        let _ = session.writer.write_all(HANDOVER_PROMPT.as_bytes());
+                                        let _ = session.writer.write_all(b"\x1b[201~");
+                                        let _ = session.writer.write_all(b"\r");
+                                        let _ = session.writer.flush();
+                                        let note = "\u{270d} handover sent \u{2014} watch it write the sign-out, then switch (prefix c/x/o)";
+                                        if bar {
+                                            bar_notice = Some((note.to_string(), std::time::Instant::now()));
+                                            bar_dirty = true;
+                                        } else {
+                                            dim(&mut out, note);
+                                        }
+                                    }
                                     Some(b't') => {
                                         // Late adoption: the host may not have
                                         // learned the thread yet (e.g. the user
@@ -2550,6 +2583,7 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: if n == 3 { "new-fork" } else { "refresh-existing" }.to_string(),
                 recorded: n > 1,
+                snapshot: None,
                 id: format!("proj-{n}"),
                 path: format!("/tmp/proj-{n}.jsonl"),
             })
@@ -2601,6 +2635,7 @@ mod tests {
                 ts: 1_000_000 + n as u64,
                 mode: "new-fork".to_string(),
                 recorded: true,
+                snapshot: None,
                 id: format!("proj-{n}"),
                 path: format!("/tmp/proj-{n}.jsonl"),
             })

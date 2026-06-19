@@ -528,6 +528,141 @@ fn route_prints_aliases_and_refreshes() {
 }
 
 #[test]
+fn route_json_emits_the_lineage_dag() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let r = run(&dir, &["route", "--json", "--all"]);
+    assert!(r.status.success(), "{}", err(&r));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&r)).expect("route --json emitted invalid JSON");
+    let convs = v.as_array().expect("route --json is an array");
+    assert!(!convs.is_empty(), "route --json empty after a carry");
+    let nodes = convs[0]["nodes"].as_array().expect("nodes array");
+    let node = &nodes[0];
+    assert_eq!(node["runtime"], "claude");
+    assert_eq!(node["parent"], "codex[1]", "parent alias missing from DAG");
+    assert!(
+        node["alias"].as_str().unwrap().starts_with("claude["),
+        "node alias: {}",
+        node["alias"]
+    );
+    assert!(
+        node["resume"].as_str().unwrap().starts_with("claude -r "),
+        "node resume: {}",
+        node["resume"]
+    );
+    assert_eq!(node["active"], true);
+}
+
+#[test]
+fn audit_reports_paged_render_stats_per_chapter() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap()],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+
+    let a = run(&dir, &["audit", "--all", "--json"]);
+    assert!(a.status.success(), "{}", err(&a));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&a)).expect("audit --json emitted invalid JSON");
+    let convs = v.as_array().expect("audit --json is an array");
+    assert!(
+        !convs.is_empty(),
+        "audit found no recorded chapters after a carry"
+    );
+    let chapters = convs[0]["chapters"].as_array().expect("chapters array");
+    let ch = &chapters[0];
+    // The 2-turn fixture fits the tail budget: everything stays verbatim, nothing filed.
+    assert_eq!(ch["turns"], 2);
+    assert_eq!(ch["verbatim"], 2);
+    assert_eq!(ch["filed"], 0);
+    assert!(ch["tail_chars"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn route_json_excludes_rename_nodes() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json",
+        ],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    let cj: serde_json::Value =
+        serde_json::from_str(&out(&c)).expect("carry --json emitted invalid JSON");
+    let handle = cj["handle"].as_str().expect("carry --json has no handle").to_string();
+
+    // A rename is a naming event, not a carry — it must never become a DAG node.
+    let r = run(&dir, &["rename", "--of", &handle, "renamed", "thread"]);
+    assert!(r.status.success(), "rename failed: {}", err(&r));
+
+    let j = run(&dir, &["route", "--json", "--all"]);
+    assert!(j.status.success(), "{}", err(&j));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&j)).expect("route --json emitted invalid JSON");
+    for conv in v.as_array().unwrap() {
+        // The rename row (recorded the same second as the carry) must not become
+        // the root either.
+        assert_ne!(conv["root_runtime"], "?", "rename poisoned the DAG root: {conv}");
+        assert_ne!(conv["root"], "?[1]", "rename poisoned the DAG root alias: {conv}");
+        for node in conv["nodes"].as_array().unwrap() {
+            assert_ne!(node["mode"], "rename", "rename leaked into the DAG: {node}");
+            assert_ne!(node["runtime"], "?", "phantom node in the DAG: {node}");
+        }
+    }
+}
+
+#[test]
+fn audit_surfaces_a_missing_record_volume() {
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    let c = run(
+        &dir,
+        &[
+            "carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json",
+        ],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    let cj: serde_json::Value =
+        serde_json::from_str(&out(&c)).expect("carry --json emitted invalid JSON");
+    let snapshot = cj["snapshot"].as_str().expect("carry recorded no snapshot").to_string();
+    assert!(Path::new(&snapshot).exists(), "snapshot volume was not written");
+
+    // Simulate record loss (a cleanup or drift deleted the volume the ledger
+    // still references) — in this isolated test store only.
+    std::fs::remove_file(&snapshot).expect("could not remove test snapshot");
+
+    let a = run(&dir, &["audit", "--all", "--json"]);
+    assert!(a.status.success(), "{}", err(&a));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&a)).expect("audit --json emitted invalid JSON");
+    // The chapter must be SURFACED with a missing-record status, not silently
+    // dropped (declared lossiness — an audit can't hide a record-integrity hole).
+    let statuses: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["chapters"].as_array().unwrap())
+        .map(|ch| ch["status"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        statuses.iter().any(|s| s.contains("missing")),
+        "a missing record volume was hidden by audit; statuses: {statuses:?}"
+    );
+}
+
+#[test]
 fn legacy_trail_rows_still_refresh_existing_projection() {
     let dir = tmpdir();
     let fix = ir_fixture(&dir);

@@ -474,9 +474,9 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume) — validated against `0.139.x`
+- Codex CLI: full (host, carry in/out, resume) — validated against `0.141.x`
 - Claude Code: full — validated against `2.1.x`
-- OpenCode: full — validated against `1.14.x`; reads via `opencode export`,
+- OpenCode: full — validated against `1.17.x`; reads via `opencode export`,
   writes via `opencode import`, resumes via `opencode -s <id>`
 - Gemini CLI: carry **source** — validated against `0.40.x`; existing gemini
   conversations load, list, and carry into the other runtimes

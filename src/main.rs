@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         Some("trail") => run_trail(&args[1..]),
         Some("snapshots") | Some("records") => run_snapshots(&args[1..]),
         Some("recall") => run_recall(&args[1..]),
+        Some("audit") => run_audit(&args[1..]),
         Some("ps") | Some("live") => run_ps(&args[1..]),
         Some("rename") => run_rename(&args[1..]),
         Some("pack") => run_pack(&args[1..]),
@@ -1249,21 +1250,45 @@ fn run_unpack(rest: &[String]) -> Result<()> {
 
 fn run_ps(rest: &[String]) -> Result<()> {
     let mut json = false;
+    let mut deep = false;
     for arg in rest {
         match arg.as_str() {
             "--json" => json = true,
+            "--deep" => deep = true,
             other => bail!("unknown flag: {other}"),
         }
     }
 
     let agents = live::census();
 
+    // --deep joins each live process to the trail: which chapter of the thread
+    // it holds, and whether two live agents are unknowingly on the SAME
+    // conversation (a silent double-booking). Indexes built once, only on --deep.
+    let naming = deep.then(trail::naming_index).unwrap_or_default();
+    let lineage = deep.then(trail::lineage_index).unwrap_or_default();
+    let mut live_by_handle: std::collections::HashMap<String, Vec<i32>> =
+        std::collections::HashMap::new();
+    if deep {
+        for a in &agents {
+            if let Some((_, handle, _)) = a.session_id.as_deref().and_then(|id| naming.get(id)) {
+                live_by_handle.entry(handle.clone()).or_default().push(a.pid);
+            }
+        }
+    }
+    let chapter_of = |id: Option<&str>| -> Option<String> { id.and_then(|id| lineage.get(id)).cloned() };
+    let shared_with = |id: Option<&str>, pid: i32| -> Vec<i32> {
+        id.and_then(|id| naming.get(id))
+            .and_then(|(_, h, _)| live_by_handle.get(h))
+            .map(|pids| pids.iter().copied().filter(|p| *p != pid).collect())
+            .unwrap_or_default()
+    };
+
     if json {
         let arr: Vec<_> = agents
             .iter()
             .map(|a| {
                 let conversation = a.session_id.as_deref().and_then(trail::label_for_session);
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "runtime": a.runtime.label(),
                     "pid": a.pid,
                     "up": a.up,
@@ -1271,7 +1296,13 @@ fn run_ps(rest: &[String]) -> Result<()> {
                     "conversation": conversation,
                     "cwd": a.cwd,
                     "resume": a.session_id.as_deref().map(|id| native_resume_cmd(a.runtime, id)),
-                })
+                });
+                if deep {
+                    obj["chapter"] = serde_json::json!(chapter_of(a.session_id.as_deref()));
+                    obj["shared_with"] =
+                        serde_json::json!(shared_with(a.session_id.as_deref(), a.pid));
+                }
+                obj
             })
             .collect();
         println!("{}", serde_json::Value::Array(arr));
@@ -1323,8 +1354,19 @@ fn run_ps(rest: &[String]) -> Result<()> {
                 }
             })
             .unwrap_or_default();
+        let mut extra = String::new();
+        if deep {
+            if let Some(ch) = chapter_of(a.session_id.as_deref()) {
+                extra.push_str(&format!("  {dim}{}{reset}", term_safe(&ch)));
+            }
+            let shared = shared_with(a.session_id.as_deref(), a.pid);
+            if !shared.is_empty() {
+                let pids = shared.iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+                extra.push_str(&format!("  {bold}\u{26a0} shared w/ pid {pids}{reset}"));
+            }
+        }
         println!(
-            "  {color}{:<9}{reset} {dim}{:>12}{reset}  {dim}{:<10}{reset} {conversation} {dim}{}{reset}",
+            "  {color}{:<9}{reset} {dim}{:>12}{reset}  {dim}{:<10}{reset} {conversation} {dim}{}{reset}{extra}",
             a.runtime.label(),
             term_safe(&a.up),
             term_safe(&session),
@@ -1332,6 +1374,17 @@ fn run_ps(rest: &[String]) -> Result<()> {
         );
     }
     println!();
+    if deep {
+        let booked = live_by_handle.values().filter(|p| p.len() > 1).count();
+        if booked > 0 {
+            println!(
+                "{dim}\u{26a0} {booked} conversation{} held by more than one live agent \u{2014} \
+                 they ping-pong the same projections silently{reset}",
+                if booked == 1 { "" } else { "s" }
+            );
+            println!();
+        }
+    }
     println!(
         "resume any of them: constant resume <conversation>, or the native command via `constant ps --json`"
     );
@@ -1477,6 +1530,240 @@ fn parse_turn_range(s: &str) -> Option<(usize, usize)> {
     }
     let (a, b) = s.split_once('-')?;
     Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// `constant audit [HANDLE] [--all] [--json] [--tail CHARS]` — turn on the
+/// renderer's instruments. For each recorded chapter it reads the record volume
+/// and reports, READ-ONLY, what a paged render would keep on the desk (the
+/// verbatim tail) vs file in the cabinet (the recallable index) — the
+/// measurement substrate the continuation-fidelity work needs, on real
+/// conversations, today. Zero model calls, zero writes.
+fn run_audit(rest: &[String]) -> Result<()> {
+    let mut query: Option<String> = None;
+    let mut all = false;
+    let mut json = false;
+    let mut tail_budget = alembic::render::TAIL_BUDGET_CHARS;
+
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--tail" => {
+                tail_budget = flag_value(rest, i, "--tail")?
+                    .parse()
+                    .context("--tail wants a character count, e.g. --tail 24000")?;
+                i += 2;
+            }
+            a if a.starts_with("--") => bail!("unknown flag: {a}"),
+            a if query.is_none() => {
+                query = Some(a.to_string());
+                i += 1;
+            }
+            _ => bail!("audit takes one conversation, e.g. `constant audit iris-19`"),
+        }
+    }
+
+    // Pick the conversations: one when a handle/name is given, else cwd-scoped.
+    let scope = if all || query.is_some() {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    let mut convs = trail::conversations(scope.as_deref());
+    if let Some(q) = &query {
+        let ql = q.to_lowercase();
+        let chosen = convs
+            .iter()
+            .find(|c| c.handle.to_lowercase() == ql)
+            .cloned()
+            .or_else(|| {
+                let hits: Vec<_> = convs
+                    .iter()
+                    .filter(|c| {
+                        c.name.to_lowercase().contains(&ql)
+                            || c.slug.to_lowercase().contains(&ql)
+                            || c.conversation.starts_with(q.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                (hits.len() == 1).then(|| hits[0].clone())
+            })
+            .with_context(|| {
+                format!("no conversation matches \"{q}\" (see `constant trail --all`)")
+            })?;
+        convs = vec![chosen];
+    }
+
+    enum Vol {
+        Ok {
+            turns: usize,
+            verbatim: usize,
+            filed: usize,
+            tail_chars: usize,
+        },
+        Missing,
+        Corrupt,
+    }
+    struct ChapterAudit {
+        n: u32,
+        from: String,
+        to: String,
+        vol: Vol,
+    }
+    struct ConvAudit<'a> {
+        conv: &'a trail::ConversationView,
+        chapters: Vec<ChapterAudit>,
+    }
+
+    let mut audited: Vec<ConvAudit> = Vec::new();
+    for conv in &convs {
+        let mut chapters = Vec::new();
+        for row in trail::chapters(&conv.conversation) {
+            // Open the volume the LEDGER recorded — never reconstruct the path
+            // (that would miss restored/imported/legacy volumes AND, via the
+            // write-side `snapshot_path` helper, create vault dirs from a
+            // read-only command). A hop with no record is skipped; a recorded
+            // volume that is gone or corrupt is SURFACED, never hidden — the
+            // record integrity is exactly what an audit must declare (no silent
+            // loss).
+            let Some(snapshot) = row.snapshot.as_deref() else {
+                continue;
+            };
+            // A read-only audit must not block or exhaust memory on a malformed
+            // or hostile ledger/pack pointing a snapshot at a FIFO, device, or a
+            // very large file — only ever read a regular, in-bounds file.
+            const MAX_VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+            let vol = match std::fs::metadata(snapshot) {
+                Err(_) => Vol::Missing,
+                Ok(m) if !m.is_file() || m.len() > MAX_VOLUME_BYTES => Vol::Corrupt,
+                Ok(_) => match std::fs::read_to_string(snapshot) {
+                    Err(_) => Vol::Missing,
+                    Ok(text) => match serde_json::from_str::<alembic::ir::UniversalSession>(&text) {
+                        Err(_) => Vol::Corrupt,
+                        Ok(session) => {
+                            let turns = alembic::render::message_turns(&session);
+                            let stats = alembic::render::render_stats(&session, tail_budget);
+                            let tail_start = turns.len().saturating_sub(stats.verbatim);
+                            let tail_chars: usize = turns[tail_start..]
+                                .iter()
+                                .map(|(_, _, t)| t.chars().count())
+                                .sum();
+                            Vol::Ok {
+                                turns: turns.len(),
+                                verbatim: stats.verbatim,
+                                filed: stats.indexed,
+                                tail_chars,
+                            }
+                        }
+                    },
+                },
+            };
+            chapters.push(ChapterAudit {
+                n: row.n,
+                from: row.from.clone(),
+                to: row.to.clone(),
+                vol,
+            });
+        }
+        if !chapters.is_empty() {
+            audited.push(ConvAudit { conv, chapters });
+        }
+    }
+
+    if json {
+        let arr: Vec<_> = audited
+            .iter()
+            .map(|ca| {
+                serde_json::json!({
+                    "handle": ca.conv.handle,
+                    "name": ca.conv.name,
+                    "conversation": ca.conv.conversation,
+                    "tail_budget": tail_budget,
+                    "chapters": ca.chapters.iter().map(|c| {
+                        let mut obj = serde_json::json!({
+                            "n": c.n,
+                            "from": c.from,
+                            "to": c.to,
+                        });
+                        match &c.vol {
+                            Vol::Ok { turns, verbatim, filed, tail_chars } => {
+                                obj["status"] = serde_json::json!("ok");
+                                obj["turns"] = serde_json::json!(turns);
+                                obj["verbatim"] = serde_json::json!(verbatim);
+                                obj["filed"] = serde_json::json!(filed);
+                                obj["tail_chars"] = serde_json::json!(tail_chars);
+                            }
+                            Vol::Missing => obj["status"] = serde_json::json!("record volume missing"),
+                            Vol::Corrupt => obj["status"] = serde_json::json!("record volume unreadable"),
+                        }
+                        obj
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+        return Ok(());
+    }
+
+    if audited.is_empty() {
+        let scope_note = query
+            .as_deref()
+            .map(|q| format!(" for \"{q}\""))
+            .unwrap_or_default();
+        println!(
+            "no recorded chapters to audit{scope_note} \
+             (records are written at every carry; try `constant audit --all`)"
+        );
+        return Ok(());
+    }
+
+    let a = trail::ansi();
+    for ca in &audited {
+        println!(
+            "{}{}{} {}({}){} \u{b7} tail budget {}k chars",
+            a.bold,
+            trail::clip(&term_safe(&ca.conv.name), 56),
+            a.reset,
+            a.dim,
+            term_safe(&ca.conv.handle),
+            a.reset,
+            tail_budget / 1000,
+        );
+        for c in &ca.chapters {
+            let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+            let (from, to) = (term_safe(&c.from), term_safe(&c.to));
+            match &c.vol {
+                Vol::Ok { turns, verbatim, filed, tail_chars } => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {turns} turns \u{b7} \
+                     keep {verbatim} verbatim \u{b7} file {filed} \u{b7} ~{tail}k tail",
+                    n = c.n,
+                    tail = tail_chars.div_ceil(1000),
+                ),
+                Vol::Missing => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {bold}\u{26a0} record volume missing{reset}",
+                    n = c.n,
+                ),
+                Vol::Corrupt => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {bold}\u{26a0} record volume unreadable{reset}",
+                    n = c.n,
+                ),
+            }
+        }
+        println!();
+    }
+    println!(
+        "{}filed turns are never lost \u{2014} read any back with \
+         `constant recall <handle> chNN <turn>`{}",
+        a.dim, a.reset
+    );
+    Ok(())
 }
 
 fn run_snapshots(rest: &[String]) -> Result<()> {
@@ -1649,6 +1936,7 @@ fn run_restore(rest: &[String]) -> Result<()> {
 
 fn run_route(rest: &[String]) -> Result<()> {
     let mut all = false;
+    let mut json = false;
     let mut session: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -1656,6 +1944,10 @@ fn run_route(rest: &[String]) -> Result<()> {
         match rest[i].as_str() {
             "--all" => {
                 all = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
                 i += 1;
             }
             "--session" => {
@@ -1666,12 +1958,73 @@ fn run_route(rest: &[String]) -> Result<()> {
         }
     }
 
-    if let Some(session) = session {
-        let resolved = alembic::resolve_session(&session)?;
-        let (_, id) = alembic::identify(&resolved)
-            .with_context(|| format!("could not identify session {}", resolved.display()))?;
-        let (conv_id, _, _) = trail::resume(&resolved, &id);
-        return trail::print_routes(None, Some(&conv_id));
+    // Resolve a single-conversation filter when --session is given.
+    let conv_id = match &session {
+        Some(session) => {
+            let resolved = alembic::resolve_session(session)?;
+            let (_, id) = alembic::identify(&resolved)
+                .with_context(|| format!("could not identify session {}", resolved.display()))?;
+            Some(trail::resume(&resolved, &id).0)
+        }
+        None => None,
+    };
+
+    // --json: emit the fork-DAG the trail already reconstructs, so external
+    // tools read lineage without screen-scraping the debug view.
+    if json {
+        let cwd = if all || conv_id.is_some() {
+            None
+        } else {
+            std::env::current_dir().ok()
+        };
+        let mut views = trail::route_views(cwd.as_deref());
+        if let Some(cid) = &conv_id {
+            views.retain(|v| &v.conversation == cid);
+        }
+        let arr: Vec<_> = views
+            .iter()
+            .map(|v| {
+                let nodes: Vec<_> = v
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        let resume = Runtime::parse(&n.runtime)
+                            .ok()
+                            .map(|rt| native_resume_cmd(rt, &n.id));
+                        serde_json::json!({
+                            "alias": n.alias,
+                            "runtime": n.runtime,
+                            "id": n.id,
+                            "path": n.path,
+                            "title": n.title,
+                            "parent": n.parent_alias,
+                            "mode": n.mode,
+                            "last_from": n.last_from,
+                            "last_n": n.last_n,
+                            "refreshes": n.refreshes,
+                            "active": n.active,
+                            "resume": resume,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "conversation": v.conversation,
+                    "slug": v.slug,
+                    "cwd": v.cwd,
+                    "root": v.root_alias,
+                    "root_runtime": v.root_runtime,
+                    "entries": v.entries,
+                    "last_ts": v.last_ts,
+                    "nodes": nodes,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+        return Ok(());
+    }
+
+    if let Some(cid) = conv_id {
+        return trail::print_routes(None, Some(&cid));
     }
 
     let cwd = if all {
@@ -2087,6 +2440,10 @@ fn print_help() {
   {bold}constant snapshots{reset} {dim}[--all] [--full]{reset}
         {dim}List the record volumes per conversation (--full shows paths).{reset}
 
+  {bold}constant audit{reset} {dim}[HANDLE] [--all] [--json] [--tail CHARS]{reset}
+        {dim}Per chapter, what a paged render keeps verbatim vs files (recallable)
+        \u{2014} the renderer's instruments, read-only, on real conversations.{reset}
+
   {bold}constant restore{reset} SNAPSHOT {dim}[--to codex|claude] [--json]{reset}
         {dim}Reprint a fresh native session from any volume. Never overwrites.{reset}
 
@@ -2108,10 +2465,12 @@ fn print_help() {
         {dim}Carryable sessions on disk, newest first, linked to their handles.
         Bare in a terminal: the resume picker. QUERY filters the printout
         by name/id (codex names come from its own registry).{reset}
-  {bold}constant ps{reset} {dim}[--json]{reset}
-        {dim}Every live agent process right now (alias: `live`). Read-only.{reset}
-  {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all]{reset}
-        {dim}Orientation \u{b7} runtime/codec preflight + update check \u{b7} fork-graph debug.{reset}
+  {bold}constant ps{reset} {dim}[--deep] [--json]{reset}
+        {dim}Every live agent process right now (alias: `live`). Read-only.
+        --deep adds each agent's chapter and flags double-booked conversations.{reset}
+  {bold}constant status{reset} {dim}[--all]{reset}    {bold}constant doctor{reset} {dim}[--json]{reset}    {bold}constant route{reset} {dim}[--all] [--json]{reset}
+        {dim}Orientation \u{b7} runtime/codec preflight + update check \u{b7} fork-graph
+        (--json emits the lineage DAG for external tools).{reset}
   {bold}constant export{reset} {dim}(--from RT | --session PATH) [--out FILE]{reset}
         {dim}The distilled, redacted neutral IR of a thread (stdout or FILE).{reset}
 
@@ -2125,6 +2484,8 @@ fn print_help() {
   {bold}x{reset} / {bold}X{reset}        {dim}continue in{reset} {codex} {dim}/ new continuation{reset}
   {bold}o{reset} / {bold}O{reset}        {dim}continue in{reset} {opencode} {dim}/ new continuation{reset}
                {dim}(a long thread asks first: [v]erbatim \u{b7} [c]ompact \u{b7} esc){reset}
+  {bold}H{reset}            {dim}handover \u{2014} sends a sign-out request to the agent; watch it
+               write, then switch (the sign-out rides the carried tail){reset}
   {bold}t{reset}            {dim}the trail graph: \u{2191}\u{2193} pick a chapter, Enter lands in that
                projection; c/x/o switch, r rename, t/q close{reset}
   {bold}:{reset}            {dim}command line \u{2014} switch/new/rename/quit, Tab completes, \u{2191}\u{2193} history{reset}

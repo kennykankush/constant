@@ -535,7 +535,15 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
     let mut out = Vec::new();
     for (conversation, mut entries) in grouped {
         entries.sort_by_key(|e| (e.ts, e.n));
-        let Some(first) = entries.first().cloned() else {
+        // Root the DAG at the first real CARRY, never a rename: a rename has no
+        // runtime/session (`from` parses as `?`) and `n` defaults to 0, so on a
+        // same-second tie it would otherwise sort first and poison the root. A
+        // conversation with only rename rows has no DAG.
+        let Some(first) = entries
+            .iter()
+            .find(|e| e.mode.as_deref() != Some("rename"))
+            .cloned()
+        else {
             continue;
         };
         let slug = entries
@@ -561,6 +569,12 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
         let mut node_index: HashMap<String, usize> = HashMap::new();
 
         for e in &entries {
+            // Renames are naming events, not carries — they carry no runtime/
+            // session target, so they must never become DAG nodes (the chapters
+            // view excludes them the same way).
+            if e.mode.as_deref() == Some("rename") {
+                continue;
+            }
             let source_exact_key = e
                 .source_id
                 .as_deref()
@@ -960,6 +974,10 @@ pub struct ChapterRow {
     pub mode: String,
     /// The hop's record volume still exists on disk.
     pub recorded: bool,
+    /// The record volume's path exactly as the ledger wrote it — so readers
+    /// open the real path instead of reconstructing the conventional one (which
+    /// would miss restored/imported/legacy volumes). `None` when no record.
+    pub snapshot: Option<String>,
     /// The hop's target projection — the graph cursor's landing pad.
     pub id: String,
     /// Target projection path; may no longer exist (checked before landing).
@@ -982,6 +1000,7 @@ pub fn chapters(conv_id: &str) -> Vec<ChapterRow> {
                 .as_deref()
                 .map(|p| Path::new(p).exists())
                 .unwrap_or(false),
+            snapshot: e.snapshot.clone(),
             id: e.id.clone(),
             path: e.path.clone(),
         })
