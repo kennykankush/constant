@@ -1601,14 +1601,21 @@ fn run_audit(rest: &[String]) -> Result<()> {
         convs = vec![chosen];
     }
 
+    enum Vol {
+        Ok {
+            turns: usize,
+            verbatim: usize,
+            filed: usize,
+            tail_chars: usize,
+        },
+        Missing,
+        Corrupt,
+    }
     struct ChapterAudit {
         n: u32,
         from: String,
         to: String,
-        turns: usize,
-        verbatim: usize,
-        filed: usize,
-        tail_chars: usize,
+        vol: Vol,
     }
     struct ConvAudit<'a> {
         conv: &'a trail::ConversationView,
@@ -1619,37 +1626,44 @@ fn run_audit(rest: &[String]) -> Result<()> {
     for conv in &convs {
         let mut chapters = Vec::new();
         for row in trail::chapters(&conv.conversation) {
-            // Open the volume the LEDGER recorded — never reconstruct the path.
-            // Reconstructing would miss restored/imported/legacy volumes, and
-            // would route a read-only command through the write-side
-            // `snapshot_path` helper (which creates + chmods vault dirs).
+            // Open the volume the LEDGER recorded — never reconstruct the path
+            // (that would miss restored/imported/legacy volumes AND, via the
+            // write-side `snapshot_path` helper, create vault dirs from a
+            // read-only command). A hop with no record is skipped; a recorded
+            // volume that is gone or corrupt is SURFACED, never hidden — the
+            // record integrity is exactly what an audit must declare (no silent
+            // loss).
             let Some(snapshot) = row.snapshot.as_deref() else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(snapshot) else {
-                continue;
+            let vol = match std::fs::read_to_string(snapshot) {
+                Err(_) => Vol::Missing,
+                Ok(text) => {
+                    match serde_json::from_str::<alembic::ir::UniversalSession>(&text) {
+                        Err(_) => Vol::Corrupt,
+                        Ok(session) => {
+                            let turns = alembic::render::message_turns(&session);
+                            let stats = alembic::render::render_stats(&session, tail_budget);
+                            let tail_start = turns.len().saturating_sub(stats.verbatim);
+                            let tail_chars: usize = turns[tail_start..]
+                                .iter()
+                                .map(|(_, _, t)| t.chars().count())
+                                .sum();
+                            Vol::Ok {
+                                turns: turns.len(),
+                                verbatim: stats.verbatim,
+                                filed: stats.indexed,
+                                tail_chars,
+                            }
+                        }
+                    }
+                }
             };
-            let Ok(session) = serde_json::from_str::<alembic::ir::UniversalSession>(&text) else {
-                continue;
-            };
-            let turns = alembic::render::message_turns(&session);
-            if turns.is_empty() {
-                continue;
-            }
-            let stats = alembic::render::render_stats(&session, tail_budget);
-            let tail_start = turns.len() - stats.verbatim;
-            let tail_chars: usize = turns[tail_start..]
-                .iter()
-                .map(|(_, _, t)| t.chars().count())
-                .sum();
             chapters.push(ChapterAudit {
                 n: row.n,
                 from: row.from.clone(),
                 to: row.to.clone(),
-                turns: turns.len(),
-                verbatim: stats.verbatim,
-                filed: stats.indexed,
-                tail_chars,
+                vol,
             });
         }
         if !chapters.is_empty() {
@@ -1666,15 +1680,25 @@ fn run_audit(rest: &[String]) -> Result<()> {
                     "name": ca.conv.name,
                     "conversation": ca.conv.conversation,
                     "tail_budget": tail_budget,
-                    "chapters": ca.chapters.iter().map(|c| serde_json::json!({
-                        "n": c.n,
-                        "from": c.from,
-                        "to": c.to,
-                        "turns": c.turns,
-                        "verbatim": c.verbatim,
-                        "filed": c.filed,
-                        "tail_chars": c.tail_chars,
-                    })).collect::<Vec<_>>(),
+                    "chapters": ca.chapters.iter().map(|c| {
+                        let mut obj = serde_json::json!({
+                            "n": c.n,
+                            "from": c.from,
+                            "to": c.to,
+                        });
+                        match &c.vol {
+                            Vol::Ok { turns, verbatim, filed, tail_chars } => {
+                                obj["status"] = serde_json::json!("ok");
+                                obj["turns"] = serde_json::json!(turns);
+                                obj["verbatim"] = serde_json::json!(verbatim);
+                                obj["filed"] = serde_json::json!(filed);
+                                obj["tail_chars"] = serde_json::json!(tail_chars);
+                            }
+                            Vol::Missing => obj["status"] = serde_json::json!("record volume missing"),
+                            Vol::Corrupt => obj["status"] = serde_json::json!("record volume unreadable"),
+                        }
+                        obj
+                    }).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -1707,19 +1731,24 @@ fn run_audit(rest: &[String]) -> Result<()> {
             tail_budget / 1000,
         );
         for c in &ca.chapters {
-            println!(
-                "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {turns} turns \u{b7} \
-                 keep {verbatim} verbatim \u{b7} file {filed} \u{b7} ~{tail}k tail",
-                dim = a.dim,
-                reset = a.reset,
-                n = c.n,
-                from = term_safe(&c.from),
-                to = term_safe(&c.to),
-                turns = c.turns,
-                verbatim = c.verbatim,
-                filed = c.filed,
-                tail = c.tail_chars.div_ceil(1000),
-            );
+            let (dim, bold, reset) = (a.dim, a.bold, a.reset);
+            let (from, to) = (term_safe(&c.from), term_safe(&c.to));
+            match &c.vol {
+                Vol::Ok { turns, verbatim, filed, tail_chars } => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {turns} turns \u{b7} \
+                     keep {verbatim} verbatim \u{b7} file {filed} \u{b7} ~{tail}k tail",
+                    n = c.n,
+                    tail = tail_chars.div_ceil(1000),
+                ),
+                Vol::Missing => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {bold}\u{26a0} record volume missing{reset}",
+                    n = c.n,
+                ),
+                Vol::Corrupt => println!(
+                    "  {dim}ch{n:02}{reset}  {from}\u{2192}{to}   {bold}\u{26a0} record volume unreadable{reset}",
+                    n = c.n,
+                ),
+            }
         }
         println!();
     }

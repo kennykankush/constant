@@ -561,6 +561,12 @@ pub fn route_views(cwd_filter: Option<&Path>) -> Vec<RouteConversationView> {
         let mut node_index: HashMap<String, usize> = HashMap::new();
 
         for e in &entries {
+            // Renames are naming events, not carries — they carry no runtime/
+            // session target, so they must never become DAG nodes (the chapters
+            // view excludes them the same way).
+            if e.mode.as_deref() == Some("rename") {
+                continue;
+            }
             let source_exact_key = e
                 .source_id
                 .as_deref()
