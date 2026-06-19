@@ -44,14 +44,14 @@ const M_RENDER: u8 = 4;
 // so a malformed/never-terminating stream can't grow the buffer forever (M8).
 const MAX_ESC: usize = 256;
 
-/// The sign-out request `Ctrl-B H` drops into the child's input box (handover).
-/// ONE line so it sits as a single clean input the user sends with one Enter —
-/// Constant does NOT auto-submit it (a written carriage return gets swallowed as
-/// a literal newline by paste-buffering CLIs, and the host never parses output
-/// to know when a reply finishes — invariant #7). The agent's reply lands as the
-/// thread's natural last turn, riding the verbatim tail of whatever carry
-/// follows (recitation at the recency edge, where attention is sharpest). The
-/// human is the completion detector: send it, watch it write, then switch.
+/// The sign-out request `Ctrl-B H` pastes into the child and submits (handover).
+/// ONE line, delivered as a bracketed paste + a trailing carriage return OUTSIDE
+/// the paste — the exact bytes a human "paste, then Enter" produces, so the CLI
+/// submits it natively. The host still never parses output to know when the
+/// REPLY is done (invariant #7), so the human waits, watches, then switches. The
+/// agent's reply lands as the thread's natural last turn, riding the verbatim
+/// tail of whatever carry follows (recitation at the recency edge, where
+/// attention is sharpest).
 const HANDOVER_PROMPT: &str = "Before this conversation is handed to another agent, write a brief sign-out for whoever continues it — the goal as it stands, where we are now, the key decisions and WHY, approaches already tried and ruled out, the exact next step, and any gotchas. Don't restate git state or repeat the transcript (the next agent has both); don't invent — if something isn't settled, say so. Reply with only the sign-out.";
 
 /// Parse a prefix-key spec like `C-b`, `ctrl-t`, `^g` into the control byte the
@@ -1905,21 +1905,21 @@ pub fn run(
                                         "gemini isn't a switch target yet — it works as a carry source (writer pending one live-format check)",
                                     ),
                                     Some(b'h') | Some(b'H') => {
-                                        // Handover: paste a sign-out request into the
-                                        // CURRENT agent's input box as a BRACKETED
-                                        // PASTE (CSI 200~ … 201~), so the CLI inserts
-                                        // it as one literal block instead of
-                                        // interpreting the bytes as keystrokes — but
-                                        // do NOT submit it. A written CR is unreliable
-                                        // across CLIs, and the host never parses output
-                                        // to know when a reply is done (invariant #7)
-                                        // anyway. The human sends it (Enter), watches,
-                                        // then switches; the sign-out rides the tail.
+                                        // Handover: deliver a sign-out request as a
+                                        // BRACKETED PASTE (CSI 200~ … 201~) followed by
+                                        // a SEPARATE carriage return OUTSIDE the paste —
+                                        // the exact byte sequence a human "paste, then
+                                        // Enter" produces, so the CLI submits it
+                                        // natively. (The host still never parses output
+                                        // to know when the REPLY is done — invariant #7
+                                        // — so the human waits, watches, then switches;
+                                        // the sign-out rides the carried tail.)
                                         let _ = session.writer.write_all(b"\x1b[200~");
                                         let _ = session.writer.write_all(HANDOVER_PROMPT.as_bytes());
                                         let _ = session.writer.write_all(b"\x1b[201~");
+                                        let _ = session.writer.write_all(b"\r");
                                         let _ = session.writer.flush();
-                                        let note = "\u{270d} sign-out request pasted in \u{2014} press Enter to send, then switch (prefix c/x/o) when it's written";
+                                        let note = "\u{270d} handover sent \u{2014} watch it write the sign-out, then switch (prefix c/x/o)";
                                         if bar {
                                             bar_notice = Some((note.to_string(), std::time::Instant::now()));
                                             bar_dirty = true;
