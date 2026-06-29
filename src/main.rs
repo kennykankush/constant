@@ -1455,8 +1455,19 @@ fn run_recall(rest: &[String]) -> Result<()> {
                 .into_iter()
                 .find(|c| c.n == n)
                 .with_context(|| format!("{} has no chapter {n}", conv.handle))?;
-            let path = trail::snapshot_path(&conv.conversation, n, Runtime::parse(&row.from)?)
-                .context("record vault unavailable")?;
+            // Open the volume the LEDGER recorded — never reconstruct the path.
+            // The physical `chNN-from-<rt>.json` filename is a per-carry write
+            // counter; the chapter `n` is the collapsed user-facing number. After
+            // a reseat / compaction / restore / import the two diverge, so
+            // reconstructing `snapshot_path(conv, n, from)` opens the WRONG volume
+            // (it also wouldn't find restored/imported/legacy volumes). Mirror
+            // `audit` and `latest_snapshot`, which already read `snapshot`. Fall
+            // back to reconstruction only for pre-`snapshot`-field ledger rows.
+            let path = match row.snapshot.as_deref() {
+                Some(s) => PathBuf::from(s),
+                None => trail::snapshot_path(&conv.conversation, n, Runtime::parse(&row.from)?)
+                    .context("record vault unavailable")?,
+            };
             if !path.exists() {
                 bail!(
                     "chapter {n}'s record volume is missing on this machine \

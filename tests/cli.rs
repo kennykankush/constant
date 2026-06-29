@@ -663,6 +663,91 @@ fn audit_surfaces_a_missing_record_volume() {
 }
 
 #[test]
+fn recall_reads_the_ledgers_snapshot_not_the_reconstructed_path() {
+    // Regression: `recall <handle> chNN` must open the volume the LEDGER recorded,
+    // never reconstruct `snapshot_path(conv, n, from)`. The physical
+    // `chNN-from-<rt>.json` filename is a per-carry write counter; the chapter `n`
+    // is the collapsed user-facing number. After a reseat / compaction / restore /
+    // import the two diverge, and reconstruction then opens the WRONG volume
+    // (proven live on iris-19: `recall ch01` reconstructed an orphaned 805-turn
+    // first volume while the ledger's chapter 1 pointed at a 79-turn one). `audit`
+    // and `latest_snapshot` already read the recorded path; recall must too.
+    let dir = tmpdir();
+    // A fixed user subject (so the conversation NAME never contains the markers)
+    // plus a swappable assistant turn that carries the decoy / needle.
+    let fix = dir.join("decoy.json");
+    std::fs::write(
+        &fix,
+        r#"{
+  "ir_version": "transession/v1",
+  "metadata": { "session_id": "recall-divergence-0001", "source_format": "codex", "cwd": "/tmp/constant-cli-proj" },
+  "events": [
+    { "kind": "message", "role": "user", "blocks": [ { "kind": "text", "text": "recall divergence subject" } ] },
+    { "kind": "message", "role": "assistant", "blocks": [ { "kind": "text", "text": "DECOY_at_reconstructed_path" } ] }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let c = run(
+        &dir,
+        &["carry", "--to", "claude", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    let cj: serde_json::Value =
+        serde_json::from_str(&out(&c)).expect("carry --json emitted invalid JSON");
+    let handle = cj["handle"].as_str().expect("carry has no handle").to_string();
+    let recon = PathBuf::from(cj["snapshot"].as_str().expect("carry recorded no snapshot"));
+    assert!(recon.exists(), "the volume at the reconstructed path was not written");
+
+    // The volume the ledger will actually point at: same IR shape, distinct
+    // content (NEEDLE), at a NON-conventional filename beside the decoy.
+    let ledger_vol = recon.with_file_name("ledger-pointed-volume.json");
+    let needle = std::fs::read_to_string(&recon)
+        .expect("read the volume")
+        .replace("DECOY_at_reconstructed_path", "NEEDLE_in_ledger_snapshot");
+    assert!(needle.contains("NEEDLE_in_ledger_snapshot"), "marker not in the volume");
+    std::fs::write(&ledger_vol, &needle).expect("write ledger-pointed volume");
+
+    // Repoint the ledger's carry row at the non-conventional volume (the decoy
+    // stays at the conventional reconstructed path). Capture the chapter number.
+    let trail = dir.join(".constant").join("trail.jsonl");
+    let recon_str = recon.to_string_lossy().to_string();
+    let mut chapter = String::from("ch01");
+    let mut repointed = false;
+    let mut rewritten = String::new();
+    for line in std::fs::read_to_string(&trail).expect("read ledger").lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row: serde_json::Value = serde_json::from_str(line).expect("ledger row is JSON");
+        if row.get("snapshot").and_then(|s| s.as_str()) == Some(recon_str.as_str()) {
+            if let Some(n) = row.get("n").and_then(serde_json::Value::as_u64) {
+                chapter = format!("ch{n:02}");
+            }
+            row["snapshot"] = serde_json::Value::String(ledger_vol.to_string_lossy().into_owned());
+            repointed = true;
+        }
+        rewritten.push_str(&row.to_string());
+        rewritten.push('\n');
+    }
+    assert!(repointed, "did not find the carry row to repoint in the ledger");
+    std::fs::write(&trail, rewritten).expect("rewrite ledger");
+
+    let r = run(&dir, &["recall", &handle, &chapter]);
+    assert!(r.status.success(), "recall failed: {}", err(&r));
+    let text = out(&r);
+    assert!(
+        text.contains("NEEDLE_in_ledger_snapshot"),
+        "recall ignored the ledger's snapshot and read the reconstructed path; got:\n{text}"
+    );
+    assert!(
+        !text.contains("DECOY_at_reconstructed_path"),
+        "recall read the decoy at the reconstructed path instead of the ledger's volume; got:\n{text}"
+    );
+}
+
+#[test]
 fn legacy_trail_rows_still_refresh_existing_projection() {
     let dir = tmpdir();
     let fix = ir_fixture(&dir);

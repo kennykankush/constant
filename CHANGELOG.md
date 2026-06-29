@@ -3,6 +3,24 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - Recall opens the volume the ledger recorded
+
+### Fixed
+- **`constant recall <handle> chNN` opened the wrong record volume.** It
+  reconstructed the conventional `chNN-from-<runtime>.json` path instead of the
+  path the ledger actually recorded, so after a reseat, compaction, restore, or
+  import — anywhere the physical volume number diverged from the chapter number —
+  it surfaced a different chapter's turns under misleading `[chNN·N]` addresses.
+  Recall now reads the ledger's `snapshot` (falling back to reconstruction only
+  for legacy rows written before that field), exactly as `audit` and
+  `latest_snapshot` already do. Read-only throughout — no record was ever at
+  risk. Covered by a regression test.
+
+### Validated
+- **Codex `0.141` → `0.142`.** The continue-eval drift matrix went 36/36
+  verbatim message-by-message identical across every source→target pair on live
+  codex 0.142.3 (claude 2.1.170, opencode 1.17.3).
+
 ## [0.5.0] - Observability and the handover
 
 New surfaces onto structure Constant already owns, plus a runtime-validation
