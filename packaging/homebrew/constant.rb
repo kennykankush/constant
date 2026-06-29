@@ -1,27 +1,27 @@
 class Constant < Formula
   desc "Switch active agent CLIs mid-conversation without re-explaining the thread"
   homepage "https://github.com/kennykankush/constant"
-  version "0.5.0"
+  version "0.5.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://api.github.com/repos/kennykankush/constant/releases/assets/451807506",
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/461009359",
           headers: ["Accept: application/octet-stream"]
-      sha256 "37b9c4134c40dbd2852bd6a56a8ac8820f9d2b52af8666d044406060fb6210e8"
+      sha256 "35e32840fa32d186869004fb96b9c32963978abbc87d3b315fc4a974aadf3046"
     end
     on_intel do
-      url "https://api.github.com/repos/kennykankush/constant/releases/assets/451807504",
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/461009363",
           headers: ["Accept: application/octet-stream"]
-      sha256 "f75d2579c99c38933e22d67722602926240328122dab96df893c7ac62e40c07e"
+      sha256 "5c496b8950e730005aff35e8f77607ab413ffe79955128993822e06e63cef036"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://api.github.com/repos/kennykankush/constant/releases/assets/451807503",
+      url "https://api.github.com/repos/kennykankush/constant/releases/assets/461009361",
           headers: ["Accept: application/octet-stream"]
-      sha256 "00def2777f3e7ed0aafe2f8f2a63c44b98acbccd735053d42566b905e00b0ca2"
+      sha256 "8d24d07bf7df1391d0817a30f84797b034d1bcc6c9becef98d2b4fb5b6eeff76"
     end
   end
 
