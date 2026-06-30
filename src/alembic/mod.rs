@@ -614,6 +614,116 @@ pub fn distill_write(
     Ok((id, written, session.metadata.cwd.clone()))
 }
 
+/// Return-switch optimization: instead of rewriting `reuse_path` wholesale from
+/// `source` (which re-distills the returning runtime's OWN earlier turns and
+/// loses fidelity each round-trip), KEEP the existing projection byte-for-byte
+/// and APPEND only the foreign segment — the turns added in the other runtime
+/// while this one was away.
+///
+/// Strictly never-worse-than-today: returns `Ok(None)` whenever the boundary
+/// between "already in the projection" and "new" can't be computed cleanly, and
+/// the caller falls back to the wholesale [`distill_write`]. `Err` (a real IO
+/// fault mid-append) is also a fallback signal — the existing file is left
+/// intact by the atomic tmp+rename. `Ok(Some((id, path)))` on a clean append.
+///
+/// `source` MUST be the RAW distilled thread (before any paged render mutates
+/// it). opencode/gemini always fall back (their stores can't append in place).
+#[allow(clippy::too_many_arguments)]
+pub fn append_refresh(
+    source: &UniversalSession,
+    target: Runtime,
+    reuse_id: &str,
+    reuse_path: &Path,
+    title: &str,
+    handle: &str,
+    name: &str,
+    chapter: u32,
+    from_label: &str,
+    to_label: &str,
+    anchor: Option<&str>,
+) -> Result<Option<(String, PathBuf)>> {
+    // Gate 1 — codec: only claude/codex can append; everything else falls back.
+    let fmt = session_format(target);
+    if !matches!(fmt, SessionFormat::Claude | SessionFormat::Codex) {
+        return Ok(None);
+    }
+
+    // Gate 2 — loadable: a torn/unreadable projection → fall back (the wholesale
+    // path recreates it cleanly).
+    let Ok(existing) = formats::load_session(reuse_path, SourceFormat::Auto) else {
+        return Ok(None);
+    };
+
+    // Boundary: how many leading turns the projection already holds. Exclude the
+    // renderer's own scaffold cards (`[constant: …]`) so a previously-paged or
+    // previously-appended projection still lines up against the raw source.
+    let e_clean: Vec<(usize, String, String)> = render::message_turns(&existing)
+        .into_iter()
+        .filter(|(_, _, text)| !is_scaffold(text))
+        .collect();
+    let s_turns = render::message_turns(source);
+    let m = e_clean.len();
+    let n = s_turns.len();
+
+    // Gate 3 — strictly grew (and the projection isn't empty). `n == m`: nothing
+    // new. `n < m`: the projection has turns the source lacks (divergence).
+    if m == 0 || n <= m {
+        return Ok(None);
+    }
+
+    // Gate 4 — structural alignment: the shared prefix's role sequence must
+    // match. Roles survive re-distillation (which mangles text, not turn order),
+    // so a mismatch means a reorder/branch — fall back rather than risk a
+    // dup/drop. (This also subsumes any scaffold-tangling check: filtering
+    // preserves order, so a misordered prefix trips the role compare.)
+    let roles_align = s_turns[..m]
+        .iter()
+        .map(|(_, role, _)| role.as_str())
+        .eq(e_clean.iter().map(|(_, role, _)| role.as_str()));
+    if !roles_align {
+        return Ok(None);
+    }
+
+    // Gate 5 — root anchor: the same conversation, not a sibling branch. Compare
+    // the first user turn, normalized the way `first_user_text` does.
+    let norm = |t: &str| -> String {
+        t.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(120)
+            .collect()
+    };
+    let first_user = |turns: &[(usize, String, String)]| -> Option<String> {
+        turns
+            .iter()
+            .find(|(_, role, _)| role == "user")
+            .map(|(_, _, text)| norm(text))
+    };
+    match (first_user(&s_turns), first_user(&e_clean)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return Ok(None),
+    }
+
+    // Gates passed — render ONLY the foreign segment and append it in place.
+    let Some(delta) =
+        render::render_delta(source, m, handle, name, chapter, from_label, to_label, anchor)
+    else {
+        return Ok(None);
+    };
+    let written = formats::append(fmt, reuse_path, &delta)?;
+
+    // Codex orders its resume picker by the registry's `updated_at`; bump it so
+    // the freshly-appended thread surfaces. Best-effort — the rollout is already
+    // written and resumable from its existing row, so a registry hiccup never
+    // fails the append.
+    if fmt == SessionFormat::Codex {
+        let _ = upsert_codex_thread(source, reuse_id, &written, title);
+    }
+
+    Ok(Some((reuse_id.to_string(), written)))
+}
+
 /// Run `opencode import` on a materialized export file and verify it landed
 /// under the id we wrote (import preserves ids — verified live).
 fn import_opencode(file: &Path, expected: &str) -> Result<()> {
@@ -1945,6 +2055,104 @@ mod tests {
         ));
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    fn sess(events: Vec<SessionEvent>) -> UniversalSession {
+        let mut s = UniversalSession::new("append-test-0001".to_string());
+        s.events = events;
+        s
+    }
+
+    // --- append-refresh (return-switch: keep own turns, append the foreign tail) ---
+    // Codex's append path is covered by the isolated CLI integration test (it can
+    // touch state_5.sqlite via the registry bump); these stay on claude, which has
+    // no sqlite side effect, so they never reach a real store.
+
+    #[test]
+    fn append_refresh_falls_back_for_non_appendable_targets() {
+        // OpenCode (whole-session import) and Gemini (source-only) are gated out
+        // BEFORE any file is touched, so a bogus path is fine.
+        let source = sess(vec![msg("user", "hi"), msg("assistant", "yo"), msg("user", "more")]);
+        for rt in [Runtime::OpenCode, Runtime::Gemini] {
+            let got = append_refresh(
+                &source, rt, "id", Path::new("/nonexistent/x"), "t", "h", "n", 1, "codex", "x", None,
+            )
+            .unwrap();
+            assert!(got.is_none(), "{rt:?} must fall back, never append");
+        }
+    }
+
+    #[test]
+    fn append_refresh_appends_only_the_new_segment_preserving_the_prefix() {
+        let dir = unique_tmp();
+        let proj = dir.join("p.jsonl");
+        let mut existing = sess(vec![msg("user", "root question"), msg("assistant", "first answer")]);
+        existing.metadata.cwd = Some(dir.clone());
+        formats::materialize(&existing, SessionFormat::Claude, &proj).unwrap();
+        let before = fs::read_to_string(&proj).unwrap();
+
+        // Same conversation, grown by one foreign turn while we were away.
+        let source = sess(vec![
+            msg("user", "root question"),
+            msg("assistant", "first answer"),
+            msg("assistant", "FRESH_FOREIGN_TURN"),
+        ]);
+        let got = append_refresh(
+            &source, Runtime::Claude, "claude-id", &proj, "title", "iris-19", "thread", 2, "codex",
+            "claude", None,
+        )
+        .unwrap();
+        assert!(got.is_some(), "append should have fired");
+
+        let after = fs::read_to_string(&proj).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "the existing projection's own lines were NOT preserved byte-for-byte"
+        );
+        assert!(after.contains("FRESH_FOREIGN_TURN"), "the new turn was not appended");
+
+        let reloaded = formats::load_session(&proj, SourceFormat::Auto).unwrap();
+        let texts: Vec<String> = render::message_turns(&reloaded)
+            .iter()
+            .map(|(_, _, t)| t.clone())
+            .collect();
+        assert!(texts.iter().any(|t| t == "root question"), "lost the root turn");
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("FRESH_FOREIGN_TURN")).count(),
+            1,
+            "the foreign turn was duplicated or dropped"
+        );
+    }
+
+    #[test]
+    fn append_refresh_falls_back_when_nothing_new_or_diverged() {
+        let dir = unique_tmp();
+        let proj = dir.join("p.jsonl");
+        let mut existing = sess(vec![msg("user", "root"), msg("assistant", "ans")]);
+        existing.metadata.cwd = Some(dir.clone());
+        formats::materialize(&existing, SessionFormat::Claude, &proj).unwrap();
+
+        // n == m: nothing new → fall back (let the wholesale path pick up edits).
+        let same = sess(vec![msg("user", "root"), msg("assistant", "ans")]);
+        assert!(
+            append_refresh(&same, Runtime::Claude, "id", &proj, "t", "h", "n", 1, "codex", "claude", None)
+                .unwrap()
+                .is_none(),
+            "no growth must fall back"
+        );
+
+        // Role sequence diverges from the projection's prefix → fall back.
+        let diverged = sess(vec![
+            msg("assistant", "root"),
+            msg("user", "ans"),
+            msg("user", "new"),
+        ]);
+        assert!(
+            append_refresh(&diverged, Runtime::Claude, "id", &proj, "t", "h", "n", 1, "codex", "claude", None)
+                .unwrap()
+                .is_none(),
+            "a divergent prefix must fall back, never splice"
+        );
     }
 
     // --- redaction (M4 residual is accepted: over-redaction beats leakage) ---

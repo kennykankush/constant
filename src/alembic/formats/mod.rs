@@ -287,6 +287,18 @@ pub fn materialize(
     }
 }
 
+/// Append a delta session's events to an existing native projection, preserving
+/// the existing file's bytes (the return-switch append-refresh path). Only
+/// claude and codex support a clean append; callers gate everything else to a
+/// full rewrite, so the catch-all is a guard, not a path taken in practice.
+pub fn append(target: SessionFormat, existing: &Path, delta: &UniversalSession) -> Result<PathBuf> {
+    match target {
+        SessionFormat::Claude => claude::append(existing, delta),
+        SessionFormat::Codex => codex::append(existing, delta),
+        other => bail!("append-refresh is not supported for {other:?}"),
+    }
+}
+
 pub fn default_output_root(target: SessionFormat) -> Result<PathBuf> {
     match target {
         SessionFormat::Codex => codex_root(),
