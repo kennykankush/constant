@@ -497,7 +497,7 @@ fn run_carry(rest: &[String]) -> Result<()> {
     let reuse = reuse_owned
         .as_ref()
         .map(|(id, p)| (id.as_str(), p.as_path()));
-    let mode = if reuse_owned.is_some() {
+    let mut mode = if reuse_owned.is_some() {
         "refresh-existing"
     } else {
         "new-fork"
@@ -568,27 +568,65 @@ fn run_carry(rest: &[String]) -> Result<()> {
             }
         }
     });
-    if paged {
-        // The desk layout: the record above holds the FULL thread (the index's
-        // addresses point into it); the projection gets head + index + tail.
-        let anchor = alembic::render::git_anchor(
-            distilled.session.metadata.cwd.as_deref().map(Path::new),
-        );
-        let stats = alembic::render::render_paged(
-            &mut distilled.session,
-            &naming.handle,
-            &naming.name,
-            n,
-            from_rt.label(),
-            to.label(),
-            anchor.as_deref(),
-            tail_budget,
-        );
-        distilled.receipt.indexed = stats.indexed;
-        receipt_json["indexed"] = serde_json::json!(stats.indexed);
-    }
-    let (id, written, cwd) =
-        alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
+    // Append-refresh: on a return-switch to a runtime whose projection we already
+    // own, try to APPEND only the foreign segment (the turns added elsewhere while
+    // it was away) to that projection, keeping its OWN turns byte-for-byte —
+    // instead of rewriting it wholesale from the other runtime's thread (which
+    // re-distills its own turns and loses fidelity each round-trip). Attempted on
+    // the RAW distilled session, BEFORE the paged render mutates it; any miss
+    // returns None and we fall back to the wholesale path below (never-worse).
+    let appended = if new {
+        None
+    } else {
+        reuse_owned.as_ref().and_then(|(rid, rpath)| {
+            let anchor = alembic::render::git_anchor(
+                distilled.session.metadata.cwd.as_deref().map(Path::new),
+            );
+            match alembic::append_refresh(
+                &distilled.session,
+                to,
+                rid,
+                rpath,
+                &title,
+                &naming.handle,
+                &naming.name,
+                n,
+                from_rt.label(),
+                to.label(),
+                anchor.as_deref(),
+            ) {
+                Ok(Some(hit)) => Some(hit),
+                _ => None,
+            }
+        })
+    };
+
+    let (id, written, cwd) = if let Some((id, written)) = appended {
+        mode = "append-refresh";
+        let cwd = distilled.session.metadata.cwd.clone();
+        (id, written, cwd)
+    } else {
+        if paged {
+            // The desk layout: the record above holds the FULL thread (the index's
+            // addresses point into it); the projection gets head + index + tail.
+            let anchor = alembic::render::git_anchor(
+                distilled.session.metadata.cwd.as_deref().map(Path::new),
+            );
+            let stats = alembic::render::render_paged(
+                &mut distilled.session,
+                &naming.handle,
+                &naming.name,
+                n,
+                from_rt.label(),
+                to.label(),
+                anchor.as_deref(),
+                tail_budget,
+            );
+            distilled.receipt.indexed = stats.indexed;
+            receipt_json["indexed"] = serde_json::json!(stats.indexed);
+        }
+        alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?
+    };
     // Record the trail under the CONVERSATION's own cwd (carried from the source
     // session), not the directory `carry` happened to be invoked from — so
     // `constant trail` in that project shows its own threads. Fall back to the

@@ -179,18 +179,7 @@ pub fn render_paged(
     } else {
         "The whole conversation above is verbatim.\n".to_string()
     };
-    let arrival = format!(
-        "[constant: taking over]\n\
-         You are {to_label}, continuing the conversation \u{201c}{name}\u{201d} ({handle}), \
-         chapter {chapter}, taking over from {from_label}.\n\
-         {anchor_line}\
-         {index_note}\
-         Verify state before acting; the working tree is the source of truth.",
-        anchor_line = match anchor {
-            Some(a) => format!("REPO: {a}\n"),
-            None => String::new(),
-        },
-    );
+    let arrival = arrival_card(name, handle, chapter, from_label, to_label, anchor, &index_note);
 
     // The tail: every original event from the first kept turn onward (tool
     // events riding between kept turns stay interleaved, untouched).
@@ -217,6 +206,78 @@ pub fn render_paged(
     events.push(synthetic_user(&arrival));
     session.events = events;
     stats
+}
+
+/// The "[constant: taking over]" handover card the arriving mind reads. Shared
+/// by [`render_paged`] and [`render_delta`] so the two cards can never drift.
+#[allow(clippy::too_many_arguments)]
+fn arrival_card(
+    name: &str,
+    handle: &str,
+    chapter: u32,
+    from_label: &str,
+    to_label: &str,
+    anchor: Option<&str>,
+    index_note: &str,
+) -> String {
+    format!(
+        "[constant: taking over]\n\
+         You are {to_label}, continuing the conversation \u{201c}{name}\u{201d} ({handle}), \
+         chapter {chapter}, taking over from {from_label}.\n\
+         {anchor_line}\
+         {index_note}\
+         Verify state before acting; the working tree is the source of truth.",
+        anchor_line = match anchor {
+            Some(a) => format!("REPO: {a}\n"),
+            None => String::new(),
+        },
+    )
+}
+
+/// Build a session holding ONLY the foreign segment to APPEND to a runtime's
+/// existing projection on a return-switch: the turns at/after `already_present`
+/// (a 0-based turn count, in [`message_turns`] order) plus a fresh arrival card.
+///
+/// The returning mind's own earlier turns stay in its native projection,
+/// byte-for-byte — this is just what happened elsewhere while it was away, so
+/// the new turns are recent and kept VERBATIM (never indexed). Returns `None`
+/// when there is nothing new (`already_present` is at or past the last turn).
+#[allow(clippy::too_many_arguments)]
+pub fn render_delta(
+    source: &UniversalSession,
+    already_present: usize,
+    handle: &str,
+    name: &str,
+    chapter: u32,
+    from_label: &str,
+    to_label: &str,
+    anchor: Option<&str>,
+) -> Option<UniversalSession> {
+    let turns = message_turns(source);
+    if already_present >= turns.len() {
+        return None;
+    }
+    let new_count = turns.len() - already_present;
+
+    // Every original event from the first NEW turn onward (tool/reasoning events
+    // riding between kept turns stay interleaved, same rule as the paged tail).
+    let cut = nth_turn_event_index(source, already_present);
+    let mut events: Vec<SessionEvent> = source.events[cut..].to_vec();
+
+    let index_note = format!(
+        "The {new_count} turn{s} above {are} what happened in {from_label} while you \
+         were away \u{2014} verbatim and complete; everything before them is your own \
+         prior thread, untouched.\n",
+        s = if new_count == 1 { "" } else { "s" },
+        are = if new_count == 1 { "is" } else { "are" },
+    );
+    let card = arrival_card(name, handle, chapter, from_label, to_label, anchor, &index_note);
+    events.push(synthetic_user(&card));
+
+    let mut delta = UniversalSession::new(source.metadata.session_id.clone());
+    delta.metadata = source.metadata.clone();
+    delta.events = events;
+    Some(delta)
 }
 
 /// Event-list index where the (0-based) `turn_ix`-th conversational turn
@@ -376,5 +437,31 @@ mod tests {
         assert!(turns[2].2.starts_with("[constant: taking over]"));
         assert!(turns[0].2 == "hi", "originals must stay first and verbatim");
         assert!(!turns.iter().any(|(_, _, t)| t.contains("index of filed")));
+    }
+
+    #[test]
+    fn render_delta_returns_only_new_turns_plus_card() {
+        let s = session(&[
+            ("user", "one"),
+            ("assistant", "two"),
+            ("user", "three"),
+            ("assistant", "four"),
+        ]);
+        // 2 turns already in the projection → delta = turns 3 & 4 + arrival card.
+        let delta = render_delta(&s, 2, "ash-52", "thread", 3, "codex", "claude", None)
+            .expect("delta should exist");
+        let turns = message_turns(&delta);
+        assert_eq!(turns.len(), 3, "two new turns + the arrival card");
+        assert_eq!(turns[0].2, "three");
+        assert_eq!(turns[1].2, "four");
+        assert!(turns[2].2.starts_with("[constant: taking over]"), "no card: {}", turns[2].2);
+        // The card declares the new turns verbatim, never references recall.
+        assert!(turns[2].2.contains("while you"));
+        assert!(!turns[2].2.contains("constant recall"));
+        // Source is untouched (render_delta is non-mutating).
+        assert_eq!(message_turns(&s).len(), 4);
+        // Nothing new → None.
+        assert!(render_delta(&s, 4, "h", "n", 1, "codex", "claude", None).is_none());
+        assert!(render_delta(&s, 9, "h", "n", 1, "codex", "claude", None).is_none());
     }
 }

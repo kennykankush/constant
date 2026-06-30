@@ -747,6 +747,118 @@ fn recall_reads_the_ledgers_snapshot_not_the_reconstructed_path() {
     );
 }
 
+/// Simulate the runtime doing work between switches: append one native assistant
+/// turn to a Claude projection. Clones an existing assistant line (so the shape is
+/// guaranteed valid), re-chaining `parentUuid` and swapping in fresh text + uuid.
+fn append_native_assistant_turn(path: &Path, text: &str) -> String {
+    let body = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    // The final line may be a non-turn record (custom-title) with no uuid; chain
+    // from the last line that has one.
+    let parent = lines
+        .iter()
+        .rev()
+        .find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("uuid").and_then(|u| u.as_str()).map(String::from))
+        })
+        .unwrap();
+    let mut tmpl: serde_json::Value = lines
+        .iter()
+        .rev()
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            (v.get("type").and_then(|t| t.as_str()) == Some("assistant")).then_some(v)
+        })
+        .expect("no assistant line to clone");
+    let uuid = format!("native-uuid-{text}");
+    tmpl["uuid"] = serde_json::Value::String(uuid.clone());
+    tmpl["parentUuid"] = serde_json::Value::String(parent);
+    tmpl["message"]["content"] = serde_json::json!([{"type": "text", "text": text}]);
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    use std::io::Write;
+    writeln!(f, "{}", serde_json::to_string(&tmpl).unwrap()).unwrap();
+    uuid
+}
+
+#[test]
+fn append_refresh_keeps_prior_turns_on_return_switch() {
+    // Ping-pong: seed → codex, codex → claude, claude does native work, then back
+    // to codex. The return MUST append-refresh: keep codex's own turns
+    // byte-for-byte and append only the foreign (claude) turn — not rewrite the
+    // codex projection wholesale from claude's thread (which would re-distill
+    // codex's own turns and lose fidelity).
+    let dir = tmpdir();
+    let fix = dir.join("seed.json");
+    std::fs::write(
+        &fix,
+        r#"{
+  "ir_version": "transession/v1",
+  "metadata": { "session_id": "append-seed-0001", "source_format": "claude", "cwd": "/tmp/constant-cli-proj" },
+  "events": [
+    { "kind": "message", "role": "user", "blocks": [ { "kind": "text", "text": "append refresh subject line" } ] },
+    { "kind": "message", "role": "assistant", "blocks": [ { "kind": "text", "text": "seed answer" } ] }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    // 1) seed → codex (establishes the conversation + the codex projection).
+    let c1 = run(&dir, &["carry", "--to", "codex", "--session", fix.to_str().unwrap(), "--json"]);
+    assert!(c1.status.success(), "{}", err(&c1));
+    let j1: serde_json::Value = serde_json::from_str(&out(&c1)).unwrap();
+    let p_codex = PathBuf::from(j1["path"].as_str().unwrap());
+
+    // 2) codex → claude.
+    let c2 = run(&dir, &["carry", "--to", "claude", "--session", p_codex.to_str().unwrap(), "--json"]);
+    assert!(c2.status.success(), "{}", err(&c2));
+    let j2: serde_json::Value = serde_json::from_str(&out(&c2)).unwrap();
+    let p_claude = PathBuf::from(j2["path"].as_str().unwrap());
+
+    // 3) claude does native work — a turn codex has never seen.
+    append_native_assistant_turn(&p_claude, "CLAUDE_NATIVE_K1");
+
+    // Snapshot the codex projection's bytes before the return.
+    let codex_before = std::fs::read_to_string(&p_codex).unwrap();
+
+    // 4) claude → codex: must append-refresh.
+    let c4 = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", p_claude.to_str().unwrap(), "--json", "--debug"],
+    );
+    assert!(c4.status.success(), "{}", err(&c4));
+    let j4: serde_json::Value = serde_json::from_str(&out(&c4)).unwrap();
+    assert_eq!(
+        j4["debug"]["mode"], "append-refresh",
+        "the return switch did not append-refresh: {}",
+        out(&c4)
+    );
+    // The append must reuse the SAME codex projection (stable pair).
+    assert_eq!(j4["path"].as_str().unwrap(), p_codex.to_str().unwrap());
+
+    // Codex's own earlier turns survive byte-for-byte; the foreign turn is added.
+    let codex_after = std::fs::read_to_string(&p_codex).unwrap();
+    assert!(
+        codex_after.starts_with(&codex_before),
+        "append-refresh rewrote codex's existing turns instead of preserving them"
+    );
+    assert!(
+        codex_after.contains("CLAUDE_NATIVE_K1"),
+        "the foreign turn was not appended into the codex projection"
+    );
+    // The append GREW the file while leaving the prefix intact — together those
+    // prove the existing turns were not rewritten and the foreign turn was added,
+    // not the projection rebuilt. (Turn-level no-dup is asserted by the engine
+    // unit tests, where the IR is directly inspectable.)
+    assert!(codex_after.len() > codex_before.len(), "nothing was appended");
+    assert_eq!(
+        codex_before.matches("CLAUDE_NATIVE_K1").count(),
+        0,
+        "fixture sanity: the foreign turn must be new to the codex projection"
+    );
+}
+
 #[test]
 fn legacy_trail_rows_still_refresh_existing_projection() {
     let dir = tmpdir();

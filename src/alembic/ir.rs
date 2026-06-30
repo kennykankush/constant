@@ -39,7 +39,7 @@ impl SourceFormat {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalSession {
     pub ir_version: String,
     pub metadata: SessionMetadata,
@@ -58,7 +58,7 @@ impl UniversalSession {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SessionMetadata {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,7 +92,7 @@ impl SessionMetadata {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
     Message(MessageEvent),
@@ -112,7 +112,7 @@ impl SessionEvent {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -145,7 +145,7 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReasoningEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -158,7 +158,7 @@ pub struct ReasoningEvent {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCallEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -173,7 +173,7 @@ pub struct ToolCallEvent {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResultEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

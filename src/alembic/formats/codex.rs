@@ -442,9 +442,59 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         }),
     )?;
 
+    emit_events(&mut file, &session.events, &session.metadata, &cwd, updated_at)?;
+
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, &materialization.session_file).with_context(|| {
+        format!(
+            "failed to move session into place at {}",
+            materialization.session_file.display()
+        )
+    })?;
+    tmp_guard.keep();
+
+    let thread_name = exported_codex_thread_name(session, &session_id);
+
+    if let Some(session_index) = &materialization.session_index {
+        if let Some(parent) = session_index.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let mut index = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(session_index)
+            .with_context(|| format!("failed to open {}", session_index.display()))?;
+
+        write_json_line(
+            &mut index,
+            &json!({
+                "id": session_id,
+                "thread_name": thread_name.clone(),
+                "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            }),
+        )?;
+    }
+
+    Ok(materialization.session_file)
+}
+
+/// Emit the IR `events` as Codex rollout turn frames (no `session_meta` — that
+/// is the file head's, written once). Factored out of `write` so `append`
+/// reuses the exact same turn framing and can't drift from it.
+fn emit_events(
+    mut file: &mut File,
+    events: &[SessionEvent],
+    metadata: &SessionMetadata,
+    cwd: &Path,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
     let mut active_turn: Option<ActiveTurn> = None;
 
-    for event in &session.events {
+    for event in events {
         match event {
             SessionEvent::Message(message) => {
                 let timestamp = message.timestamp.unwrap_or(updated_at);
@@ -452,7 +502,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
 
                 if message.role == "user" {
                     close_turn(&mut file, &mut active_turn, updated_at)?;
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, metadata, cwd, timestamp)?);
                     write_message_response_item(&mut file, message, updated_at)?;
                     if let Some(text) = rendered_text {
                         write_json_line(
@@ -477,7 +527,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 }
 
                 if message.role != "developer" && active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, metadata, cwd, timestamp)?);
                 }
 
                 if message.role == "assistant"
@@ -508,7 +558,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::Reasoning(reasoning) => {
                 let timestamp = reasoning.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, metadata, cwd, timestamp)?);
                 }
 
                 let summary_text = render_reasoning_text(reasoning);
@@ -548,7 +598,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::ToolCall(call) => {
                 let timestamp = call.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, metadata, cwd, timestamp)?);
                 }
                 write_json_line(
                     &mut file,
@@ -571,7 +621,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::ToolResult(result) => {
                 let timestamp = result.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, metadata, cwd, timestamp)?);
                 }
                 write_json_line(
                     &mut file,
@@ -593,43 +643,55 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     }
 
     close_turn(&mut file, &mut active_turn, updated_at)?;
+    Ok(())
+}
 
+/// Append `delta`'s events to an existing Codex rollout, preserving every
+/// existing line byte-for-byte (the return-switch append-refresh path). Codex
+/// turns are self-framed (`task_started` … `task_complete`) and `write` already
+/// closes the last turn at EOF, so the delta's new turns concatenate cleanly.
+/// The existing session's metadata/cwd frame the new turns; `session_meta` is
+/// NOT re-emitted. Atomic (tmp + rename). The sqlite registry bump is the
+/// caller's job (`alembic::append_refresh`), matching the normal
+/// write→`distill_write` split where the codec writes the file and the
+/// orchestrator registers it.
+pub fn append(existing: &Path, delta: &UniversalSession) -> Result<PathBuf> {
+    let body = fs::read_to_string(existing)
+        .with_context(|| format!("failed to read Codex session {}", existing.display()))?;
+    let loaded = load(existing)
+        .with_context(|| format!("failed to parse Codex session {}", existing.display()))?;
+    let cwd = loaded
+        .metadata
+        .cwd
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let updated_at = delta
+        .events
+        .iter()
+        .filter_map(SessionEvent::timestamp)
+        .max()
+        .unwrap_or_else(Utc::now);
+
+    // Atomic append: copy the existing bytes verbatim, then frame the delta — the
+    // existing rollout is never truncated in place (same B1 law as `write`).
+    let tmp_path = super::tmp_sibling(existing);
+    let mut tmp_guard = super::TmpCleanup::new(&tmp_path);
+    let mut file = File::create(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    file.write_all(body.as_bytes())
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    if !body.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    emit_events(&mut file, &delta.events, &loaded.metadata, &cwd, updated_at)?;
     file.sync_all()
         .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
     drop(file);
-    fs::rename(&tmp_path, &materialization.session_file).with_context(|| {
-        format!(
-            "failed to move session into place at {}",
-            materialization.session_file.display()
-        )
+    fs::rename(&tmp_path, existing).with_context(|| {
+        format!("failed to move session into place at {}", existing.display())
     })?;
     tmp_guard.keep();
-
-    let thread_name = exported_codex_thread_name(session, &session_id);
-
-    if let Some(session_index) = &materialization.session_index {
-        if let Some(parent) = session_index.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let mut index = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(session_index)
-            .with_context(|| format!("failed to open {}", session_index.display()))?;
-
-        write_json_line(
-            &mut index,
-            &json!({
-                "id": session_id,
-                "thread_name": thread_name.clone(),
-                "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            }),
-        )?;
-    }
-
-    Ok(materialization.session_file)
+    Ok(existing.to_path_buf())
 }
 
 fn plan_output(session: &UniversalSession, output: &Path) -> CodexMaterialization {

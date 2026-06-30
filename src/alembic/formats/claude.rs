@@ -445,154 +445,17 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         }),
     )?;
 
+    let ctx = EmitCtx {
+        session_id: &session_id,
+        cwd: cwd.as_path(),
+        git_branch: &git_branch,
+        version: &version,
+        model: &model,
+    };
     let mut previous_uuid: Option<String> = None;
     let mut tool_call_to_uuid = BTreeMap::new();
-
     for event in &session.events {
-        match event {
-            SessionEvent::Message(message) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let (projected_role, projected_blocks) = project_message_for_claude(message);
-                let content = encode_message_blocks(&projected_blocks);
-                if content.is_null() {
-                    continue;
-                }
-
-                let line = if projected_role == "assistant" {
-                    let assistant_message = claude_assistant_message(&model, content, Value::Null);
-                    json!({
-                        "parentUuid": previous_uuid,
-                        "isSidechain": false,
-                        "userType": "external",
-                        "cwd": cwd,
-                        "sessionId": session_id,
-                        "version": version,
-                        "gitBranch": git_branch,
-                        "entrypoint": "cli",
-                        "requestId": format!("req_{}", Uuid::new_v4().simple()),
-                        "message": assistant_message,
-                        "type": "assistant",
-                        "uuid": event_uuid,
-                        "timestamp": event_timestamp(message.timestamp),
-                    })
-                } else {
-                    json!({
-                        "parentUuid": previous_uuid,
-                        "isSidechain": false,
-                        "userType": "external",
-                        "cwd": cwd,
-                        "sessionId": session_id,
-                        "version": version,
-                        "gitBranch": git_branch,
-                        "entrypoint": "cli",
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": user_text_content(&projected_blocks),
-                        },
-                        "uuid": event_uuid,
-                        "timestamp": event_timestamp(message.timestamp),
-                    })
-                };
-
-                write_json_line(&mut file, &line)?;
-                previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
-            }
-            SessionEvent::Reasoning(reasoning) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let content = reasoning
-                    .summary
-                    .iter()
-                    .map(|text| {
-                        json!({
-                            "type": "thinking",
-                            "thinking": text,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let assistant_message =
-                    claude_assistant_message(&model, Value::Array(content), Value::Null);
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "entrypoint": "cli",
-                    "requestId": format!("req_{}", Uuid::new_v4().simple()),
-                    "message": assistant_message,
-                    "type": "assistant",
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(reasoning.timestamp),
-                });
-                write_json_line(&mut file, &line)?;
-                previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
-            }
-            SessionEvent::ToolCall(call) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let assistant_message = claude_assistant_message(
-                    &model,
-                    json!([{
-                        "type": "tool_use",
-                        "id": call.call_id,
-                        "name": call.name,
-                        "input": call.arguments,
-                        "caller": { "type": "direct" },
-                    }]),
-                    Value::String("tool_use".to_string()),
-                );
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "entrypoint": "cli",
-                    "requestId": format!("req_{}", Uuid::new_v4().simple()),
-                    "message": assistant_message,
-                    "type": "assistant",
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(call.timestamp),
-                });
-                write_json_line(&mut file, &line)?;
-                tool_call_to_uuid.insert(call.call_id.clone(), event_uuid.clone());
-                previous_uuid = Some(event_uuid);
-            }
-            SessionEvent::ToolResult(result) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let source_uuid = tool_call_to_uuid.get(&result.call_id).cloned();
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "entrypoint": "cli",
-                    "type": "user",
-                    "message": {
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": result.call_id,
-                            "content": encode_tool_result_output(&result.output),
-                            "is_error": result.is_error,
-                        }]
-                    },
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(result.timestamp),
-                    "toolUseResult": tool_result_summary(&result.output, result.is_error),
-                    "sourceToolAssistantUUID": source_uuid,
-                });
-                write_json_line(&mut file, &line)?;
-                previous_uuid = Some(event_uuid);
-            }
-        }
+        emit_event_line(&mut file, event, &ctx, &mut previous_uuid, &mut tool_call_to_uuid)?;
     }
 
     file.sync_all()
@@ -632,6 +495,262 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     }
 
     Ok(materialization.session_file)
+}
+
+/// The per-session context every emitted line shares. Cheap (all borrowed),
+/// so both `write` (whole session) and `append` (a delta) hand the same value
+/// to [`emit_event_line`] and the line shape can't drift between them.
+#[derive(Clone, Copy)]
+struct EmitCtx<'a> {
+    session_id: &'a str,
+    cwd: &'a Path,
+    git_branch: &'a str,
+    version: &'a str,
+    model: &'a str,
+}
+
+/// Emit one IR event as a Claude JSONL line, chaining `parentUuid` from
+/// `previous_uuid` and advancing it. Factored out of `write` so `append` reuses
+/// the exact same chaining and line shape.
+fn emit_event_line(
+    file: &mut File,
+    event: &SessionEvent,
+    ctx: &EmitCtx,
+    previous_uuid: &mut Option<String>,
+    tool_call_to_uuid: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let EmitCtx {
+        session_id,
+        cwd,
+        git_branch,
+        version,
+        model,
+    } = *ctx;
+    let parent = previous_uuid.clone();
+    match event {
+        SessionEvent::Message(message) => {
+            let event_uuid = Uuid::new_v4().to_string();
+            let (projected_role, projected_blocks) = project_message_for_claude(message);
+            let content = encode_message_blocks(&projected_blocks);
+            if content.is_null() {
+                return Ok(());
+            }
+
+            let line = if projected_role == "assistant" {
+                let assistant_message = claude_assistant_message(model, content, Value::Null);
+                json!({
+                    "parentUuid": parent,
+                    "isSidechain": false,
+                    "userType": "external",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "version": version,
+                    "gitBranch": git_branch,
+                    "entrypoint": "cli",
+                    "requestId": format!("req_{}", Uuid::new_v4().simple()),
+                    "message": assistant_message,
+                    "type": "assistant",
+                    "uuid": event_uuid,
+                    "timestamp": event_timestamp(message.timestamp),
+                })
+            } else {
+                json!({
+                    "parentUuid": parent,
+                    "isSidechain": false,
+                    "userType": "external",
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                    "version": version,
+                    "gitBranch": git_branch,
+                    "entrypoint": "cli",
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": user_text_content(&projected_blocks),
+                    },
+                    "uuid": event_uuid,
+                    "timestamp": event_timestamp(message.timestamp),
+                })
+            };
+
+            write_json_line(file, &line)?;
+            *previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
+        }
+        SessionEvent::Reasoning(reasoning) => {
+            let event_uuid = Uuid::new_v4().to_string();
+            let content = reasoning
+                .summary
+                .iter()
+                .map(|text| {
+                    json!({
+                        "type": "thinking",
+                        "thinking": text,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let assistant_message =
+                claude_assistant_message(model, Value::Array(content), Value::Null);
+            let line = json!({
+                "parentUuid": parent,
+                "isSidechain": false,
+                "userType": "external",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "version": version,
+                "gitBranch": git_branch,
+                "entrypoint": "cli",
+                "requestId": format!("req_{}", Uuid::new_v4().simple()),
+                "message": assistant_message,
+                "type": "assistant",
+                "uuid": event_uuid,
+                "timestamp": event_timestamp(reasoning.timestamp),
+            });
+            write_json_line(file, &line)?;
+            *previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
+        }
+        SessionEvent::ToolCall(call) => {
+            let event_uuid = Uuid::new_v4().to_string();
+            let assistant_message = claude_assistant_message(
+                model,
+                json!([{
+                    "type": "tool_use",
+                    "id": call.call_id,
+                    "name": call.name,
+                    "input": call.arguments,
+                    "caller": { "type": "direct" },
+                }]),
+                Value::String("tool_use".to_string()),
+            );
+            let line = json!({
+                "parentUuid": parent,
+                "isSidechain": false,
+                "userType": "external",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "version": version,
+                "gitBranch": git_branch,
+                "entrypoint": "cli",
+                "requestId": format!("req_{}", Uuid::new_v4().simple()),
+                "message": assistant_message,
+                "type": "assistant",
+                "uuid": event_uuid,
+                "timestamp": event_timestamp(call.timestamp),
+            });
+            write_json_line(file, &line)?;
+            tool_call_to_uuid.insert(call.call_id.clone(), event_uuid.clone());
+            *previous_uuid = Some(event_uuid);
+        }
+        SessionEvent::ToolResult(result) => {
+            let event_uuid = Uuid::new_v4().to_string();
+            let source_uuid = tool_call_to_uuid.get(&result.call_id).cloned();
+            let line = json!({
+                "parentUuid": parent,
+                "isSidechain": false,
+                "userType": "external",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "version": version,
+                "gitBranch": git_branch,
+                "entrypoint": "cli",
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": encode_tool_result_output(&result.output),
+                        "is_error": result.is_error,
+                    }]
+                },
+                "uuid": event_uuid,
+                "timestamp": event_timestamp(result.timestamp),
+                "toolUseResult": tool_result_summary(&result.output, result.is_error),
+                "sourceToolAssistantUUID": source_uuid,
+            });
+            write_json_line(file, &line)?;
+            *previous_uuid = Some(event_uuid);
+        }
+    }
+    Ok(())
+}
+
+/// Append `delta`'s events to an existing Claude projection, preserving every
+/// existing line byte-for-byte (the return-switch append-refresh path). The
+/// existing file's `sessionId`/`cwd`/`version`/`gitBranch` are reused so
+/// `claude -r` still accepts the session, and the appended lines chain their
+/// `parentUuid` from the last existing line's `uuid`. Atomic (tmp + rename), so
+/// a torn append never replaces the good file.
+pub fn append(existing: &Path, delta: &UniversalSession) -> Result<PathBuf> {
+    let body = fs::read_to_string(existing)
+        .with_context(|| format!("failed to read Claude session {}", existing.display()))?;
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    // Recover the projection's own identity from its existing lines — never
+    // mint a fresh sessionId or borrow the source's.
+    let field = |key: &str| -> Option<String> {
+        lines.iter().rev().find_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get(key).and_then(Value::as_str).map(str::to_string))
+        })
+    };
+    let session_id = field("sessionId")
+        .with_context(|| format!("Claude session {} has no sessionId", existing.display()))?;
+    let cwd = PathBuf::from(field("cwd").unwrap_or_else(|| ".".to_string()));
+    let git_branch = field("gitBranch").unwrap_or_else(|| "HEAD".to_string());
+    let version = field("version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let model = lines
+        .iter()
+        .rev()
+        .find_map(|l| {
+            serde_json::from_str::<Value>(l).ok().and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "claude-opus-4-8".to_string());
+    // Chain from the last line that actually carries a uuid — a Claude
+    // projection's final line is often a non-turn record (the custom-title), and
+    // chaining `parentUuid` to it would orphan the appended turns.
+    let mut previous_uuid = lines.iter().rev().find_map(|l| {
+        serde_json::from_str::<Value>(l)
+            .ok()
+            .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_string))
+    });
+
+    let ctx = EmitCtx {
+        session_id: &session_id,
+        cwd: cwd.as_path(),
+        git_branch: &git_branch,
+        version: &version,
+        model: &model,
+    };
+
+    // Atomic append: copy the existing bytes verbatim, then emit the delta — the
+    // existing projection is never truncated in place (same B1 law as `write`).
+    let tmp_path = super::tmp_sibling(existing);
+    let mut tmp_guard = super::TmpCleanup::new(&tmp_path);
+    let mut file = File::create(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    file.write_all(body.as_bytes())
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    if !body.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    let mut tool_call_to_uuid = BTreeMap::new();
+    for event in &delta.events {
+        emit_event_line(&mut file, event, &ctx, &mut previous_uuid, &mut tool_call_to_uuid)?;
+    }
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+    drop(file);
+    fs::rename(&tmp_path, existing).with_context(|| {
+        format!("failed to move session into place at {}", existing.display())
+    })?;
+    tmp_guard.keep();
+    Ok(existing.to_path_buf())
 }
 
 fn plan_output(session: &UniversalSession, output: &Path) -> ClaudeMaterialization {
