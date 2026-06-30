@@ -1571,27 +1571,6 @@ pub fn run(
                                     }
                                 });
 
-                            if request.paged {
-                                // The desk layout: the record above holds the FULL
-                                // thread; the projection wakes the target on head
-                                // card + index + verbatim tail. Index addresses
-                                // resolve via `constant recall` into that record.
-                                let anchor = crate::alembic::render::git_anchor(
-                                    host_cwd.as_deref(),
-                                );
-                                let stats = crate::alembic::render::render_paged(
-                                    &mut distilled.session,
-                                    &nm.handle,
-                                    &nm.name,
-                                    n,
-                                    from.label(),
-                                    target.label(),
-                                    anchor.as_deref(),
-                                    crate::alembic::render::TAIL_BUDGET_CHARS,
-                                );
-                                distilled.receipt.indexed = stats.indexed;
-                            }
-
                             // Never write to the user's originals: reuse only our
                             // own projection for `target`, else mint a fresh one.
                             // A graph-cursor landing overrides the stable pair —
@@ -1610,13 +1589,79 @@ pub fn run(
                             let reuse = reuse_owned
                                 .as_ref()
                                 .map(|(id, p)| (id.as_str(), p.as_path()));
-                            match crate::alembic::distill_write(
-                                &mut distilled,
-                                &src_path,
-                                target,
-                                reuse,
-                                Some(&title),
-                            ) {
+
+                            // Append-refresh: on a return-switch to a runtime whose
+                            // projection we already own, append ONLY the foreign
+                            // segment to it (keeping its own turns byte-for-byte)
+                            // instead of rewriting it wholesale from the other
+                            // runtime's thread. Attempted on the RAW distilled
+                            // session BEFORE the paged render mutates it; any miss
+                            // returns None and falls back to the wholesale path
+                            // below (strictly never-worse-than-today).
+                            let appended = if request.new {
+                                None
+                            } else {
+                                reuse_owned.as_ref().and_then(|(rid, rpath)| {
+                                    let anchor = crate::alembic::render::git_anchor(
+                                        host_cwd.as_deref(),
+                                    );
+                                    match crate::alembic::append_refresh(
+                                        &distilled.session,
+                                        target,
+                                        rid,
+                                        rpath,
+                                        &title,
+                                        &nm.handle,
+                                        &nm.name,
+                                        n,
+                                        from.label(),
+                                        target.label(),
+                                        anchor.as_deref(),
+                                    ) {
+                                        Ok(Some(hit)) => Some(hit),
+                                        _ => None,
+                                    }
+                                })
+                            };
+
+                            let mut mode = if reuse_owned.is_some() {
+                                "refresh-existing"
+                            } else {
+                                "new-fork"
+                            };
+                            let outcome = if let Some((id, written)) = appended {
+                                mode = "append-refresh";
+                                Ok((id, written, distilled.session.metadata.cwd.clone()))
+                            } else {
+                                if request.paged {
+                                    // The desk layout: the record above holds the
+                                    // FULL thread; the projection wakes the target on
+                                    // head card + index + verbatim tail. Index
+                                    // addresses resolve via `constant recall`.
+                                    let anchor = crate::alembic::render::git_anchor(
+                                        host_cwd.as_deref(),
+                                    );
+                                    let stats = crate::alembic::render::render_paged(
+                                        &mut distilled.session,
+                                        &nm.handle,
+                                        &nm.name,
+                                        n,
+                                        from.label(),
+                                        target.label(),
+                                        anchor.as_deref(),
+                                        crate::alembic::render::TAIL_BUDGET_CHARS,
+                                    );
+                                    distilled.receipt.indexed = stats.indexed;
+                                }
+                                crate::alembic::distill_write(
+                                    &mut distilled,
+                                    &src_path,
+                                    target,
+                                    reuse,
+                                    Some(&title),
+                                )
+                            };
+                            match outcome {
                                 Ok((id, written, session_cwd)) => {
                                     if let Some(f) = dbg.as_mut() {
                                         let _ = writeln!(
@@ -1642,11 +1687,7 @@ pub fn run(
                                         id: &id,
                                         path: &written,
                                         title: &title,
-                                        mode: if reuse_owned.is_some() {
-                                            "refresh-existing"
-                                        } else {
-                                            "new-fork"
-                                        },
+                                        mode,
                                         snapshot: snapshot.as_deref(),
                                         handle: &nm.handle,
                                         name: &nm.name,
