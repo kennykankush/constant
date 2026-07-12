@@ -3,6 +3,26 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - Append-refresh
+
+### Added
+- **Append-refresh on return-switches.** When you switch the live runtime back
+  to one you already used — headless (`constant carry`) or live (`Ctrl-B`) —
+  Constant now keeps that runtime's existing projection **byte-for-byte** and
+  **appends only the foreign segment** (the turns added in the other runtime
+  while it was away), instead of rewriting it wholesale from the other runtime's
+  thread. The returning runtime's own turns stop losing fidelity each
+  round-trip. Fallback-guarded — a codec/boundary gate falls back to the
+  wholesale rewrite on any miss — and record-first, so it's strictly
+  never-worse-than-today. Claude and Codex append; OpenCode and Gemini always
+  fall back (their stores can't append in place). Surfaced as a new
+  `append-refresh` ledger mode in `route`/`audit`.
+
+### Validated
+- **Codex `0.142` → `0.144`.** The continue-eval drift matrix went 36/36
+  verbatim message-by-message identical across every source→target pair on live
+  codex 0.144.1 (claude 2.1.170, opencode 1.17.3).
+
 ## [0.5.1] - Recall opens the volume the ledger recorded
 
 ### Fixed
