@@ -1802,12 +1802,13 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 // show the installed version beside these, and a mismatch warns. Bump a pin
 // ONLY after a real validation pass on that version: a version that merely runs
 // is not validated (codex 0.139 bit precisely because it ran while carrying the
-// wrong thread). SUPPORTED_CODEX → 0.142: the continue-eval drift suite went
-// 36/36 green on live codex 0.142.3 (2026-06-29, verbatim message-by-message via
-// `constant export`, all six source→target pairs identical) — the prior 0.141
-// pass was 2026-06-18. SUPPORTED_OPENCODE → 1.17: the same suite went 36/36 green
-// on live opencode 1.17.3 (2026-06-19, all 12 opencode cells verbatim-identical).
-pub const SUPPORTED_CODEX: &str = "0.142";
+// wrong thread). SUPPORTED_CODEX → 0.144: the continue-eval drift suite went
+// 36/36 green on live codex 0.144.1 (2026-06-30, verbatim message-by-message via
+// `constant export`, all six source→target pairs identical); codex jumped
+// 0.142→0.144 between passes (0.142.3 was 2026-06-29, 0.141 was 2026-06-18).
+// SUPPORTED_OPENCODE → 1.17: the same suite went 36/36 green on live opencode
+// 1.17.3 (2026-06-19, all 12 opencode cells verbatim-identical).
+pub const SUPPORTED_CODEX: &str = "0.144";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.40";
 pub const SUPPORTED_OPENCODE: &str = "1.17";
