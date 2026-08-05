@@ -3,6 +3,24 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - Runtime revalidation
+
+Maintenance release: no code changes beyond the validation pins.
+
+### Validated
+- **Codex `0.144` → `0.145`.** The continue-eval drift matrix went 36/36
+  verbatim message-by-message identical across every source→target pair on live
+  codex 0.145.0 and claude 2.1.220 (opencode 1.17.3). Claude remains within its
+  validated `2.1` line, revalidated on 2.1.220.
+
+### Known
+- **Gemini 0.50 changed its store format** (named `tmp/` session dirs replacing
+  `sha256(cwd)` keying, plus a new `logs.json` schema) and Constant's reader
+  does not detect those sessions — carrying FROM a 0.50-era gemini session is
+  not possible until the codec is updated after a real format study.
+  `SUPPORTED_GEMINI` deliberately stays `0.40` and `doctor` warns. Sessions
+  written by gemini 0.40 and earlier still read fine.
+
 ## [0.6.0] - Append-refresh
 
 ### Added
