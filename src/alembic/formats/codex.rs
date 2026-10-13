@@ -95,11 +95,13 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .or_else(|| metadata.cwd.clone());
-    metadata.model = payload
-        .get("model_provider")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| metadata.model.clone());
+    // `model_provider` is the provider ("openai"), not the model — the model
+    // lives on each turn_context.
+    if let Some(provider) = payload.get("model_provider") {
+        metadata
+            .extra
+            .insert("codex_model_provider".to_string(), provider.clone());
+    }
     metadata.platform_version = payload
         .get("cli_version")
         .and_then(Value::as_str)
@@ -139,11 +141,9 @@ fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
         .map(PathBuf::from)
         .or_else(|| metadata.cwd.clone());
 
-    if metadata.model.is_none() {
-        metadata.model = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+    // Latest turn wins: the model can change mid-thread.
+    if let Some(model) = payload.get("model").and_then(Value::as_str) {
+        metadata.model = Some(model.to_string());
     }
 
     if let Some(personality) = payload.get("personality") {
@@ -187,8 +187,12 @@ fn import_response_item(events: &mut Vec<SessionEvent>, value: &Value) {
     match payload_type {
         "message" => import_message(events, payload, timestamp),
         "reasoning" => import_reasoning(events, payload, timestamp),
-        "function_call" => import_tool_call(events, payload, timestamp),
-        "function_call_output" => import_tool_result(events, payload, timestamp),
+        // `custom_tool_call` is codex's own freeform tool (the `exec` shell
+        // tool): same shape, raw-string `input`, array-of-text output.
+        "function_call" | "custom_tool_call" => import_tool_call(events, payload, timestamp),
+        "function_call_output" | "custom_tool_call_output" => {
+            import_tool_result(events, payload, timestamp)
+        }
         _ => {}
     }
 }
@@ -280,6 +284,7 @@ fn import_tool_call(
         .get("arguments")
         .and_then(Value::as_str)
         .map(parse_jsonish)
+        .or_else(|| payload_object.get("input").cloned())
         .unwrap_or(Value::Null);
 
     events.push(SessionEvent::ToolCall(ToolCallEvent {
@@ -313,10 +318,18 @@ fn import_tool_result(
         return;
     };
 
-    let output = payload_object
-        .get("output")
-        .cloned()
-        .unwrap_or(Value::String(String::new()));
+    // A custom tool's output is an array of `{type, text}` parts.
+    let output = match payload_object.get("output") {
+        Some(Value::Array(parts)) => Value::String(
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Some(other) => other.clone(),
+        None => Value::String(String::new()),
+    };
 
     events.push(SessionEvent::ToolResult(ToolResultEvent {
         id: None,
@@ -389,49 +402,28 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         Value::String(created_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
     );
     session_meta_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
-    session_meta_payload.insert(
-        "originator".to_string(),
-        extra_string(&session.metadata, "codex_originator")
-            .unwrap_or_else(|| "codex-tui".to_string())
-            .into(),
-    );
+    // A projection is resumed interactively: it is a TUI thread, whatever the
+    // source was (an `exec` source would contradict the registry's `cli`).
+    session_meta_payload.insert("originator".to_string(), "codex-tui".into());
     session_meta_payload.insert(
         "cli_version".to_string(),
         codex_cli_version(&session.metadata).into(),
     );
-    session_meta_payload.insert(
-        "source".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_source")
-            .cloned()
-            .unwrap_or_else(|| Value::String("cli".to_string())),
-    );
+    session_meta_payload.insert("source".to_string(), "cli".into());
+    // Constant writes codex's legacy event shape; say so explicitly rather than
+    // leaning on the default. (Paginated threads are never rewritten — see
+    // alembic::codex_projection_reusable.)
+    session_meta_payload.insert("history_mode".to_string(), "legacy".into());
     session_meta_payload.insert(
         "model_provider".to_string(),
         Value::String(exported_codex_model_provider()),
     );
-    session_meta_payload.insert(
-        "base_instructions".to_string(),
-        json!({
-            "text": extra_string(&session.metadata, "codex_base_instructions").unwrap_or_else(|| {
-                format!(
-                    "Imported by transession from {} session {}.",
-                    session
-                        .metadata
-                        .source_format
-                        .map(format_name)
-                        .unwrap_or("unknown"),
-                    session
-                        .metadata
-                        .original_session_id
-                        .clone()
-                        .unwrap_or_else(|| session.metadata.session_id.clone()),
-                )
-            })
-        }),
-    );
+    // Only a codex source has real base instructions to carry. Anything else
+    // gets none, so codex falls back to its own for the model — a placeholder
+    // here would be resumed as the system prompt.
+    if let Some(text) = extra_string(&session.metadata, "codex_base_instructions") {
+        session_meta_payload.insert("base_instructions".to_string(), json!({ "text": text }));
+    }
 
     write_json_line(
         &mut file,
@@ -857,11 +849,11 @@ fn local_timezone_name_or_offset() -> String {
     std::env::var("TZ").unwrap_or_else(|_| Local::now().offset().to_string())
 }
 
+/// The thread's display name in `session_index.jsonl` (what `codex resume
+/// <name>` matches): the carried title — the trail name when Constant stamps
+/// one — else the first real prompt, else the id.
 fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> String {
-    if session.metadata.source_format == Some(SessionFormat::Codex) {
-        return derive_title(session).unwrap_or_else(|| session_id.to_string());
-    }
-    session_id.to_string()
+    derive_title(session).unwrap_or_else(|| session_id.to_string())
 }
 
 fn exported_codex_model_provider() -> String {
@@ -1075,12 +1067,3 @@ fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
     }
 }
 
-fn format_name(format: SessionFormat) -> &'static str {
-    match format {
-        SessionFormat::Ir => "IR",
-        SessionFormat::Codex => "Codex",
-        SessionFormat::Claude => "Claude",
-        SessionFormat::Gemini => "Gemini",
-        SessionFormat::OpenCode => "OpenCode",
-    }
-}

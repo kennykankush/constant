@@ -1,4 +1,4 @@
-mod claude;
+pub(crate) mod claude;
 mod codex;
 pub(crate) mod gemini;
 pub(crate) mod opencode;
@@ -92,6 +92,12 @@ pub fn detect_format(path: &Path) -> Result<SessionFormat> {
         ) {
             return Ok(SessionFormat::Codex);
         }
+        // A gemini 0.39+ log opens with a header line carrying sessionId AND
+        // projectHash — checked before claude, whose records carry a bare
+        // sessionId but never a projectHash.
+        if value.get("sessionId").is_some() && value.get("projectHash").is_some() {
+            return Ok(SessionFormat::Gemini);
+        }
         if value.get("sessionId").is_some() {
             return Ok(SessionFormat::Claude);
         }
@@ -101,8 +107,8 @@ pub fn detect_format(path: &Path) -> Result<SessionFormat> {
     // whole-file document (IR, gemini, or an opencode export). Read it all.
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let end = text.rfind('}').map(|i| i + 1).unwrap_or(text.len());
-    if let Ok(value) = serde_json::from_str::<Value>(&text[..end])
+    if let Ok(json) = first_json_value(&text)
+        && let Ok(value) = serde_json::from_str::<Value>(json)
         && let Some(found) = classify_document(&value)
     {
         return Ok(found);
@@ -405,32 +411,58 @@ pub(crate) fn opencode_cache_path(id: &str) -> Result<PathBuf> {
 }
 
 /// Refresh the cache copy of an opencode session via `opencode export`
-/// (their supported read door; stdout carries a status line after the JSON).
+/// (their supported read door).
+///
+/// stdout goes to a FILE, never a pipe: opencode exits before draining a piped
+/// stdout, so any export larger than the pipe buffer arrives cut off mid-object
+/// (1.18.x: 128 KiB piped vs the full 4 MB redirected). The export may also
+/// carry a status line after the JSON, so exactly one complete JSON value is
+/// parsed off the front — a truncated export is a loud error, never a silently
+/// short conversation.
 pub(crate) fn export_opencode_to_cache(id: &str) -> Result<PathBuf> {
+    let path = opencode_cache_path(id)?;
+    let raw = path.with_file_name(format!(
+        ".{}.export.constant-tmp",
+        path.file_stem().and_then(|s| s.to_str()).unwrap_or("session")
+    ));
+    let raw_guard = TmpCleanup::new(&raw);
+    let sink = fs::File::create(&raw).with_context(|| format!("failed to create {}", raw.display()))?;
     let out = std::process::Command::new("opencode")
         .args(["export", id])
+        .stdout(sink)
         .output()
         .context("failed to run `opencode export` — is opencode on PATH?")?;
-    let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         bail!(
             "opencode export {id} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let end = text
-        .rfind('}')
-        .with_context(|| format!("opencode export {id} produced no JSON"))?
-        + 1;
+    let text = fs::read_to_string(&raw).with_context(|| format!("failed to read {}", raw.display()))?;
+    let json = first_json_value(&text)
+        .with_context(|| format!("opencode export {id} did not produce a complete session"))?;
+    drop(raw_guard);
 
-    let path = opencode_cache_path(id)?;
     let tmp = tmp_sibling(&path);
     let mut guard = TmpCleanup::new(&tmp);
-    fs::write(&tmp, &text[..end]).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
     fs::rename(&tmp, &path)
         .with_context(|| format!("failed to move {} into place", path.display()))?;
     guard.keep();
     Ok(path)
+}
+
+/// The first complete JSON object in `text`, ignoring anything around it
+/// (status lines). Errors when the object is cut off or malformed.
+pub(crate) fn first_json_value(text: &str) -> Result<&str> {
+    let start = text.find('{').context("no JSON object in the output")?;
+    let mut stream =
+        serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+    match stream.next() {
+        Some(Ok(_)) => Ok(&text[start..start + stream.byte_offset()]),
+        Some(Err(e)) => bail!("the JSON is incomplete or invalid ({e}) — the export was likely truncated"),
+        None => bail!("no JSON object in the output"),
+    }
 }
 
 /// Find a gemini session file by id: filename stem == id (session-dir layout)

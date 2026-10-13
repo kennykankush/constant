@@ -3,6 +3,76 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - Runtime catch-up
+
+Codex, Claude Code, OpenCode and Gemini all moved since 0.6.1 (codex 0.145 →
+0.162, claude 2.1.220 → 2.1.289, opencode 1.17 → 1.18, gemini 0.40 → 0.50).
+Every codec was re-studied against what each runtime writes today, and every
+target was re-validated by having the real runtime resume a carried session
+and answer from it.
+
+### Fixed
+- **Claude: the runtime's own turns were carried as yours.** Claude Code marks
+  what it writes on the user's side — `/model` and other local-command caveats
+  and output, skill bodies, hook feedback, background-task notices, compaction
+  summaries, peer messages — with `isMeta`, `isCompactSummary`, or a non-human
+  `origin`. Constant now drops those (and their older wrapper prefixes) and
+  counts them under `dropped_scaffold` in the receipt. A real session went from
+  32 carried "user" turns (most of them injected — the `/model` caveat became
+  the title) to exactly the 11 the user typed.
+- **Claude: prompts typed mid-turn were silently dropped.** They are filed as
+  `queued_command` attachments, not user records; they now carry (a repeat of
+  the same prompt is folded).
+- **Claude titles** follow Claude's own order: custom title, then its AI title,
+  then the first real prompt (a `<pasted_content>` wrapper is unwrapped).
+- **Claude project folders** use Claude's exact naming rule, including its
+  truncate-and-hash for paths over 200 characters and UTF-16 handling.
+- **Codex: its own shell tool was invisible.** `custom_tool_call` (codex's
+  `exec` tool) now maps to tool calls/results, so `--with-tools` carries them
+  and the receipt counts them. The model is read from `turn_context` (the
+  provider name was reported as the model).
+- **Codex: a switch back could wake the pre-carry thread.** Codex ≥ 0.156 runs
+  threads in a shared background daemon that keeps them in memory after their
+  client exits; hosted codex children and printed resume commands now use
+  `--no-daemon` (only where the installed codex supports it).
+- **Codex: threads codex now owns are never rewritten.** Codex promotes threads
+  to paginated history (indexed by byte offset and line ordinal), and a live
+  codex holds a writer lock on every thread it has open. A carry into a
+  projection in either state now mints a fresh projection instead of rewriting
+  or appending (the old one is left untouched), and the receipt says so.
+- **Codex registry rows** look like native interactive threads on newer schemas
+  (originator, thread source, display name, model) and refresh their recency,
+  so a refreshed projection rises in codex's own picker. The session-index name
+  is the trail name, so `codex resume <name>` finds it. Projections no longer
+  carry a placeholder `base_instructions` that codex could resume as the system
+  prompt.
+- **OpenCode: carrying out of any real-sized session failed.** `opencode
+  export` truncates when its stdout is a pipe; the export now goes to a file and
+  exactly one complete JSON value is parsed (a truncated export fails loudly).
+- **OpenCode: every refresh duplicated the conversation.** `opencode import`
+  only inserts, so re-importing into the same session added a second copy (a
+  939-turn thread held 1,774 messages). Each carry into opencode now mints a
+  fresh projection.
+- **OpenCode ordering:** messages get strictly increasing times and parts get
+  opencode-style ascending ids, so the imported thread reads back in order.
+  Tool parts use the exact shapes import validates; imports run from the
+  conversation's own directory; subagent and archived sessions are no longer
+  picked up as "the active session"; failed tools keep their error text and
+  opencode's synthetic text parts are skipped.
+- **Gemini 0.50 sessions read as empty.** The `.jsonl` session log (0.39+) was
+  detected as a Claude file and exported 0 messages. The reader now folds the
+  log the way gemini does (in-place updates, `$set` patches, `$rewindTo`),
+  skips gemini's injected preamble and subagent sessions, and recovers the cwd
+  from `.project_root`. When gemini compresses a chat and rebuilds its history,
+  turns already read are kept rather than shredded.
+- **`constant ps` over-counted.** A codex launcher and its native binary were
+  two rows, and codex daemons and the ChatGPT app's embedded codex were listed
+  as conversations.
+
+### Validated
+- Codex `0.145` → `0.162`, OpenCode `1.17` → `1.18`, Gemini `0.40` → `0.50`;
+  Claude stays `2.1` (2.1.289). See `SUPPORTED_*` in `src/alembic/mod.rs`.
+
 ## [0.6.1] - Runtime revalidation
 
 Maintenance release: no code changes beyond the validation pins.

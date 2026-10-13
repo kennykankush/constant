@@ -412,12 +412,9 @@ fn runtime_rank(runtime: &str) -> u8 {
 }
 
 fn resume_cmd(runtime: &str, id: &str) -> String {
-    match runtime {
-        "codex" => format!("codex resume {id}"),
-        "claude" => format!("claude -r {id}"),
-        "gemini" => format!("gemini --resume {id}"),
-        "opencode" => format!("opencode -s {id}"),
-        _ => format!("{runtime} resume {id}"),
+    match Runtime::parse(runtime) {
+        Ok(rt) => rt.resume_hint(id),
+        Err(_) => format!("{runtime} resume {id}"),
     }
 }
 
