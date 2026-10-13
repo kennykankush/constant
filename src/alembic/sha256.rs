@@ -29,10 +29,13 @@ pub fn hex(input: &str) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    // The padding above makes `msg` an exact multiple of 64 bytes.
+    let (blocks, _) = msg.as_chunks::<64>();
+    for chunk in blocks {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = chunk.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
