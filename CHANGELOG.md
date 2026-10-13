@@ -3,7 +3,7 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] - Runtime catch-up
+## [0.7.0] - Runtime catch-up
 
 Codex, Claude Code, OpenCode and Gemini all moved since 0.6.1 (codex 0.145 →
 0.162, claude 2.1.220 → 2.1.289, opencode 1.17 → 1.18, gemini 0.40 → 0.50).
