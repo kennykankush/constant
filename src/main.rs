@@ -625,7 +625,14 @@ fn run_carry(rest: &[String]) -> Result<()> {
             distilled.receipt.indexed = stats.indexed;
             receipt_json["indexed"] = serde_json::json!(stats.indexed);
         }
-        alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?
+        let written = alembic::distill_write(&mut distilled, &src_path, to, reuse, Some(&title))?;
+        // The target may refuse an in-place refresh (a live writer, codex's
+        // paginated history, opencode's insert-only import) — then a fresh
+        // projection was minted, and the receipt must say so.
+        if reuse.is_some_and(|(rid, _)| rid != written.0) {
+            mode = "new-fork";
+        }
+        written
     };
     // Record the trail under the CONVERSATION's own cwd (carried from the source
     // session), not the directory `carry` happened to be invoked from — so
@@ -1899,12 +1906,7 @@ fn restore_session(source: &Path, to_override: Option<Runtime>) -> Result<Restor
 }
 
 fn native_resume_cmd(rt: Runtime, id: &str) -> String {
-    match rt {
-        Runtime::Claude => format!("claude -r {id}"),
-        Runtime::Codex => format!("codex resume {id}"),
-        Runtime::Gemini => format!("gemini --resume {id}"),
-        Runtime::OpenCode => format!("opencode -s {id}"),
-    }
+    rt.resume_hint(id)
 }
 
 /// `constant restore <snapshot> [--to codex|claude]`.

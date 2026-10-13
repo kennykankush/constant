@@ -31,10 +31,11 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
     parse_export(&text).with_context(|| format!("invalid OpenCode export in {}", path.display()))
 }
 
-/// Parse export-shaped JSON (tolerating a trailing status line).
+/// Parse export-shaped JSON (tolerating a trailing status line; a cut-off
+/// export is an error, never a silently shorter conversation).
 pub fn parse_export(text: &str) -> Result<UniversalSession> {
-    let end = text.rfind('}').map(|i| i + 1).unwrap_or(text.len());
-    let v: Value = serde_json::from_str(&text[..end]).context("failed to parse export JSON")?;
+    let json = super::first_json_value(text).context("failed to parse export JSON")?;
+    let v: Value = serde_json::from_str(json).context("failed to parse export JSON")?;
     let info = v.get("info").context("export missing `info`")?;
 
     let session_id = info
@@ -113,7 +114,12 @@ fn import_message(session: &mut UniversalSession, m: &Value) {
         .unwrap_or(&[])
     {
         match p.get("type").and_then(Value::as_str) {
-            Some("text") => {
+            // `synthetic` / `ignored` text is opencode's own injection (file
+            // attachments rendered as text, notices) — not the conversation.
+            Some("text")
+                if p.get("synthetic").and_then(Value::as_bool) != Some(true)
+                    && p.get("ignored").and_then(Value::as_bool) != Some(true) =>
+            {
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
                     text_blocks.push(ContentBlock::text("text", t));
                 }
@@ -156,7 +162,12 @@ fn import_message(session: &mut UniversalSession, m: &Value) {
                     parent_id: msg_id.clone(),
                     call_id,
                     timestamp,
-                    output: state.get("output").cloned().unwrap_or(Value::Null),
+                    // A failed tool has `error` and no `output`.
+                    output: state
+                        .get("output")
+                        .or_else(|| state.get("error"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
                     is_error: state.get("status").and_then(Value::as_str) != Some("completed"),
                     metadata: BTreeMap::new(),
                 }));
@@ -236,6 +247,13 @@ fn build_export(session: &UniversalSession) -> Value {
         .unwrap_or_else(|| "carried".to_string());
 
     let mut messages: Vec<Value> = Vec::new();
+    // opencode orders messages by (created time, id) and parts by id: every
+    // message gets a strictly increasing time in conversation order (an
+    // untimed or out-of-order one would otherwise sort to the end), and ids
+    // are minted ascending from that time, the way opencode mints its own.
+    let mut clock = created - 1;
+    let mut ids = IdClock::default();
+    let mut current_ts = created;
     // Tool calls buffer until their result arrives, then ride as one tool part
     // on the surrounding assistant message (opencode's shape).
     let mut pending_calls: BTreeMap<String, (String, Value)> = BTreeMap::new();
@@ -258,8 +276,11 @@ fn build_export(session: &UniversalSession) -> Value {
                 let ts = msg
                     .timestamp
                     .map(|t| t.timestamp_millis())
-                    .unwrap_or(updated);
-                let msg_id = mint_id("msg");
+                    .unwrap_or(clock)
+                    .max(clock + 1);
+                clock = ts;
+                current_ts = ts;
+                let msg_id = ids.next("msg", ts);
                 let is_assistant = msg.role == "assistant";
                 let parent = last_msg_id.clone().unwrap_or_else(|| msg_id.clone());
                 let info = if is_assistant {
@@ -289,6 +310,7 @@ fn build_export(session: &UniversalSession) -> Value {
                 };
                 let part = part_json(
                     "text",
+                    ids.next("prt", ts),
                     &session.metadata.session_id,
                     &msg_id,
                     json!({"text": text}),
@@ -311,20 +333,39 @@ fn build_export(session: &UniversalSession) -> Value {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let state = json!({
-                    "status": if result.is_error { "error" } else { "completed" },
-                    "input": input,
-                    "output": output,
-                    "title": name,
-                    "metadata": {},
-                    "time": {"start": updated, "end": updated},
-                });
+                // The exact state shapes `opencode import` validates: `input`
+                // is always an object; a failure carries `error`, not `output`.
+                let input = match input {
+                    Value::Object(_) => input,
+                    Value::Null => json!({}),
+                    other => json!({ "input": other }),
+                };
+                let state = if result.is_error {
+                    json!({
+                        "status": "error",
+                        "input": input,
+                        "error": output,
+                        "metadata": {},
+                        "time": {"start": current_ts, "end": current_ts},
+                    })
+                } else {
+                    json!({
+                        "status": "completed",
+                        "input": input,
+                        "output": output,
+                        "title": name,
+                        "metadata": {},
+                        "time": {"start": current_ts, "end": current_ts},
+                    })
+                };
                 // Tool parts belong to an assistant message; open one if the
                 // conversation hasn't produced it yet.
                 let idx = match current_assistant {
                     Some(i) => i,
                     None => {
-                        let msg_id = mint_id("msg");
+                        clock += 1;
+                        current_ts = clock;
+                        let msg_id = ids.next("msg", clock);
                         let parent = last_msg_id.clone().unwrap_or_else(|| msg_id.clone());
                         last_msg_id = Some(msg_id.clone());
                         messages.push(json!({
@@ -332,7 +373,7 @@ fn build_export(session: &UniversalSession) -> Value {
                                 "role": "assistant",
                                 "sessionID": session.metadata.session_id,
                                 "parentID": parent,
-                                "time": {"created": updated, "completed": updated},
+                                "time": {"created": clock, "completed": clock},
                                 "modelID": model_id,
                                 "providerID": "constant",
                                 "mode": "build",
@@ -354,6 +395,7 @@ fn build_export(session: &UniversalSession) -> Value {
                     .to_string();
                 let part = part_json(
                     "tool",
+                    ids.next("prt", current_ts),
                     &session.metadata.session_id,
                     &msg_id,
                     json!({"tool": name, "callID": result.call_id, "state": state}),
@@ -381,16 +423,16 @@ fn build_export(session: &UniversalSession) -> Value {
                 .clone()
                 .unwrap_or_else(|| "1.14.48".to_string()),
             "summary": {"additions": 0, "deletions": 0, "files": 0},
-            "time": {"created": created, "updated": updated},
+            "time": {"created": created, "updated": updated.max(clock)},
         },
         "messages": messages,
     })
 }
 
-fn part_json(kind: &str, session_id: &str, message_id: &str, body: Value) -> Value {
+fn part_json(kind: &str, id: String, session_id: &str, message_id: &str, body: Value) -> Value {
     let mut obj = Map::new();
     obj.insert("type".to_string(), Value::String(kind.to_string()));
-    obj.insert("id".to_string(), Value::String(mint_id("prt")));
+    obj.insert("id".to_string(), Value::String(id));
     obj.insert("sessionID".to_string(), Value::String(session_id.to_string()));
     obj.insert("messageID".to_string(), Value::String(message_id.to_string()));
     if let Value::Object(extra) = body {
@@ -405,8 +447,37 @@ fn merge_id(info: Value, id: &str) -> Value {
     Value::Object(obj)
 }
 
-/// Mint an opencode-shaped id (`msg_…` / `prt_…` / `ses_…`): their ids are a
-/// prefix + ~26 alphanumerics; hex from a UUID fits the alphabet.
+/// opencode's ascending identifier (its `Identifier.ascending`): prefix + 12
+/// hex digits of the low 48 bits of `ms * 4096 + counter` (the counter resets
+/// when the millisecond moves) + 14 random base62 — ids sort by creation time.
+#[derive(Default)]
+struct IdClock {
+    last_ms: i64,
+    counter: u64,
+}
+
+impl IdClock {
+    fn next(&mut self, prefix: &str, ms: i64) -> String {
+        if ms != self.last_ms {
+            self.last_ms = ms;
+            self.counter = 0;
+        }
+        self.counter += 1;
+        let stamp = (ms.max(0) as u64)
+            .wrapping_mul(0x1000)
+            .wrapping_add(self.counter)
+            & 0xFFFF_FFFF_FFFF;
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let tail: String = Uuid::new_v4().as_bytes()[..14]
+            .iter()
+            .map(|b| BASE62[(*b as usize) % 62] as char)
+            .collect();
+        format!("{prefix}_{stamp:012x}{tail}")
+    }
+}
+
+/// Mint an opencode-shaped id (`ses_…`): a prefix + ~26 alphanumerics; hex
+/// from a UUID fits the alphabet. (Messages and parts use [`IdClock`].)
 pub fn mint_id(prefix: &str) -> String {
     let hex = Uuid::new_v4().simple().to_string();
     format!("{prefix}_{}", &hex[..26])
@@ -438,7 +509,6 @@ fn ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
 /// Read just the session id from an export-shaped file.
 pub(crate) fn session_id(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
-    let end = text.rfind('}').map(|i| i + 1)?;
-    let v: Value = serde_json::from_str(&text[..end]).ok()?;
+    let v: Value = serde_json::from_str(super::first_json_value(&text).ok()?).ok()?;
     v.get("info")?.get("id")?.as_str().map(str::to_string)
 }

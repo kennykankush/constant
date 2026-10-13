@@ -214,6 +214,16 @@ pub(crate) fn claude_quick_title(path: &Path) -> Option<String> {
             return Some(out.trim().to_string());
         }
     }
+    // No rename: Claude's own AI title (latest wins), as its picker shows.
+    if let Some(ix) = tail.rfind("\"aiTitle\":\"") {
+        let rest = &tail[ix + "\"aiTitle\":\"".len()..];
+        if let Some(end) = rest.find('"') {
+            let title: String = rest[..end].chars().take(80).collect();
+            if !title.trim().is_empty() {
+                return Some(title.trim().to_string());
+            }
+        }
+    }
 
     // Head: first real user message as an auto-title.
     let f = fs::File::open(path).ok()?;
@@ -224,6 +234,16 @@ pub(crate) fn claude_quick_title(path: &Path) -> Option<String> {
             continue;
         };
         if v.get("type").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let injected = ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"]
+            .iter()
+            .any(|k| v.get(*k).and_then(serde_json::Value::as_bool) == Some(true))
+            || v.get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "human");
+        if injected {
             continue;
         }
         let Some(text) = v
@@ -265,7 +285,11 @@ fn codex_registry_titles_in(root: &Path) -> std::collections::HashMap<String, St
     ) else {
         return map;
     };
-    let Ok(mut stmt) = conn.prepare("SELECT id, COALESCE(title, '') FROM threads") else {
+    // Newer codex keeps its display name (in-codex renames) in `name`.
+    let Ok(mut stmt) = conn
+        .prepare("SELECT id, COALESCE(NULLIF(name, ''), title, '') FROM threads")
+        .or_else(|_| conn.prepare("SELECT id, COALESCE(title, '') FROM threads"))
+    else {
         return map;
     };
     if let Ok(rows) = stmt.query_map([], |r| {
@@ -362,16 +386,27 @@ fn opencode_newest_session(host_cwd: Option<&Path>, since: Option<SystemTime>) -
     let cwd_canon = host_cwd
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string());
-    conn.query_row(
-        "SELECT s.id FROM session s
-         WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
-           AND s.time_updated >= ?3
-           AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
-         ORDER BY s.time_updated DESC LIMIT 1",
-        rusqlite::params![cwd, cwd_canon, fence_ms],
-        |r| r.get(0),
-    )
-    .ok()
+    let query = |extra: &str| {
+        conn.query_row(
+            &format!(
+                "SELECT s.id FROM session s
+                 WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
+                   AND s.time_updated >= ?3 {extra}
+                   AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
+                 ORDER BY s.time_updated DESC LIMIT 1"
+            ),
+            rusqlite::params![cwd, cwd_canon, fence_ms],
+            |r| r.get(0),
+        )
+    };
+    // A subagent's session shares its parent's directory and is newer than it;
+    // an archived one is put away. Neither is the conversation in front of the
+    // user. (Older opencode schemas lack both columns — then plain newest.)
+    match query("AND s.parent_id IS NULL AND s.time_archived IS NULL") {
+        Ok(id) => Some(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(_) => query("").ok(),
+    }
 }
 
 /// Resolve a session the harness POSITIVELY knows the child owns — by its
@@ -529,6 +564,7 @@ pub fn distill_write(
             to.label()
         );
     }
+    let reuse = reuse.filter(|(id, _)| projection_reusable(to, id));
 
     let id = match reuse {
         Some((id, _)) => id.to_string(),
@@ -549,8 +585,9 @@ pub fn distill_write(
         Runtime::OpenCode => detect_opencode_version().unwrap_or_else(|| "1.14.48".to_string()),
         Runtime::Gemini => detect_gemini_version().unwrap_or_else(|| "0.40.0".to_string()),
     });
-    // OpenCode shows info.title in its picker — stamp the trail name there.
-    if to_fmt == SessionFormat::OpenCode
+    // OpenCode shows info.title in its picker, codex names the thread in its
+    // session index — stamp the trail name in both.
+    if matches!(to_fmt, SessionFormat::OpenCode | SessionFormat::Codex)
         && let Some(t) = title
     {
         session.metadata.title = Some(t.to_string());
@@ -605,7 +642,7 @@ pub fn distill_write(
         // Like codex's sqlite row, this is REQUIRED for resume: failure fails
         // the carry loudly (callers fall back to fresh).
         SessionFormat::OpenCode => {
-            import_opencode(&written, &id)
+            import_opencode(&written, &id, session.metadata.cwd.as_deref())
                 .context("failed to register the opencode session (import)")?;
         }
         SessionFormat::Gemini | SessionFormat::Ir => {}
@@ -643,8 +680,12 @@ pub fn append_refresh(
     anchor: Option<&str>,
 ) -> Result<Option<(String, PathBuf)>> {
     // Gate 1 — codec: only claude/codex can append; everything else falls back.
+    // A projection the target no longer lets us touch (a live writer, codex's
+    // paginated history) falls back too — and the wholesale path then mints.
     let fmt = session_format(target);
-    if !matches!(fmt, SessionFormat::Claude | SessionFormat::Codex) {
+    if !matches!(fmt, SessionFormat::Claude | SessionFormat::Codex)
+        || !projection_reusable(target, reuse_id)
+    {
         return Ok(None);
     }
 
@@ -726,13 +767,25 @@ pub fn append_refresh(
 
 /// Run `opencode import` on a materialized export file and verify it landed
 /// under the id we wrote (import preserves ids — verified live).
-fn import_opencode(file: &Path, expected: &str) -> Result<()> {
-    let out = std::process::Command::new("opencode")
-        .arg("import")
-        .arg(file)
+/// `opencode import` files the session under the IMPORTING process's working
+/// directory (its project + directory columns), not the export's own
+/// `info.directory` — so it runs from the conversation's cwd when that exists.
+fn import_opencode(file: &Path, expected: &str, cwd: Option<&Path>) -> Result<()> {
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.arg("import").arg(file);
+    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
+    let out = cmd
         .output()
         .context("failed to run `opencode import` — is opencode on PATH?")?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The confirmation line has moved between stdout and stderr across
+    // releases; read both.
+    let stdout = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     if !out.status.success() {
         bail!(
             "opencode import failed: {} {}",
@@ -806,6 +859,8 @@ fn retitle_codex(id: &str, title: &str) -> Result<()> {
         "UPDATE threads SET title = ?2, preview = ?2 WHERE id = ?1",
         params![id, title],
     )?;
+    // Newer codex shows `name` (absent on older schemas — then nothing to do).
+    let _ = conn.execute("UPDATE threads SET name = ?2 WHERE id = ?1", params![id, title]);
     Ok(())
 }
 
@@ -828,10 +883,11 @@ fn first_user_text(session: &UniversalSession) -> Option<String> {
             .blocks
             .iter()
             .filter_map(|b| b.text.as_deref())
+            .map(unwrap_paste)
             .collect::<Vec<_>>()
             .join(" ");
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if text.is_empty() {
+        if text.is_empty() || is_scaffold(&text) {
             None
         } else {
             Some(text.chars().take(80).collect())
@@ -861,6 +917,59 @@ fn detect_codex_version() -> Option<String> {
                 .map(str::to_string)
         })
         .clone()
+}
+
+/// Whether a target's existing Constant projection may be rewritten or
+/// appended to in place. When it may not, the carry mints a fresh projection
+/// instead and the old one is left exactly as it is (never deleted).
+pub(crate) fn projection_reusable(to: Runtime, id: &str) -> bool {
+    match to {
+        // `opencode import` only ever inserts: re-importing a session keeps the
+        // old rows and adds the new ones beside them — a duplicated
+        // conversation, not a refresh.
+        Runtime::OpenCode => false,
+        Runtime::Codex => codex_projection_reusable(id),
+        Runtime::Claude | Runtime::Gemini => true,
+    }
+}
+
+/// A codex thread is ours to rewrite only while codex itself isn't writing it
+/// and still reads it the legacy way:
+/// - a live codex holds `thread-writer-locks/<id>.lock` (an flock) for every
+///   thread it has open — writing underneath a live writer races it;
+/// - codex promotes threads to `paginated` history (one-way), after which it
+///   indexes the rollout by byte offset and line ordinal: a rewrite desyncs
+///   that index and a legacy-shaped append is skipped as ordinal-less.
+fn codex_projection_reusable(id: &str) -> bool {
+    let Ok(root) = formats::default_output_root(SessionFormat::Codex) else {
+        return true;
+    };
+    if let Ok(lock) = fs::File::open(root.join("thread-writer-locks").join(format!("{id}.lock")))
+        && lock.try_lock_shared().is_err()
+    {
+        return false;
+    }
+    codex_history_mode(&root, id).as_deref() != Some("paginated")
+}
+
+/// A codex thread's `history_mode` (absent on codex builds that predate it).
+fn codex_history_mode(root: &Path, id: &str) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn =
+        Connection::open_with_flags(root.join("state_5.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT history_mode FROM threads WHERE id = ?1",
+        [id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Whether the installed codex accepts `--no-daemon` (added in 0.156.0, when
+/// the shared background app-server started caching threads in memory).
+pub fn codex_supports_no_daemon() -> bool {
+    detect_codex_version().is_some_and(|v| !version_newer("0.156.0", &v))
 }
 
 /// Upsert a codex `threads` row so a synthetic session looks native and appears
@@ -959,6 +1068,54 @@ fn upsert_codex_thread(
             first_msg
         ],
     )?;
+
+    // Columns newer codex builds read — set only where the installed schema has
+    // them. Recency drives codex's picker order (an INSERT trigger fills it, but
+    // nothing moves it on refresh); `name` is its display name; originator and
+    // thread_source mark an interactive user thread. `history_mode` is left
+    // alone: its insert default is 'legacy', and codex's promotion to
+    // 'paginated' is one-way — never downgrade it.
+    let columns: std::collections::HashSet<String> = conn
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .collect();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(now * 1000);
+    let optional: [(&str, rusqlite::types::Value); 7] = [
+        ("recency_at", now.into()),
+        ("recency_at_ms", now_ms.into()),
+        ("updated_at_ms", now_ms.into()),
+        ("name", title.to_string().into()),
+        ("originator", "codex-tui".to_string().into()),
+        ("thread_source", "user".to_string().into()),
+        (
+            "model",
+            session
+                .metadata
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .map_or(rusqlite::types::Value::Null, Into::into),
+        ),
+    ];
+    let present: Vec<&(&str, rusqlite::types::Value)> = optional
+        .iter()
+        .filter(|(col, value)| columns.contains(*col) && *value != rusqlite::types::Value::Null)
+        .collect();
+    if !present.is_empty() {
+        let assignments: Vec<String> = present
+            .iter()
+            .enumerate()
+            .map(|(i, (col, _))| format!("{col} = ?{}", i + 2))
+            .collect();
+        let sql = format!("UPDATE threads SET {} WHERE id = ?1", assignments.join(", "));
+        let mut values: Vec<rusqlite::types::Value> = vec![id.to_string().into()];
+        values.extend(present.iter().map(|(_, v)| v.clone()));
+        conn.execute(&sql, rusqlite::params_from_iter(values))?;
+    }
     Ok(())
 }
 
@@ -1099,8 +1256,11 @@ fn sanitize(session: &mut UniversalSession, keep_tools: bool) -> CarryReceipt {
             }
         };
         let mut message = message;
-        // Drop developer/system scaffold messages outright.
-        if message.role != "user" && message.role != "assistant" {
+        // Drop developer/system scaffold messages outright, and turns the
+        // runtime itself injected on the user's side (counted, not silent).
+        if (message.role != "user" && message.role != "assistant")
+            || message.metadata.contains_key(RUNTIME_INJECTED)
+        {
             receipt.dropped_scaffold += 1;
             continue;
         }
@@ -1186,6 +1346,28 @@ fn truncate_tool_output(output: &mut serde_json::Value) {
     ));
 }
 
+/// Message-metadata key a loader sets on a turn the RUNTIME wrote into the
+/// user's side of the transcript (claude `isMeta` & co.). `sanitize` drops and
+/// counts these as scaffold before per-message metadata is cleared.
+pub(crate) const RUNTIME_INJECTED: &str = "runtime_injected";
+
+/// The inner text of a `<pasted_content …>…</pasted_content>` wrapper (claude
+/// 2.1.2xx wraps large pastes) — a real paste, kept, but titled by its words.
+pub(crate) fn unwrap_paste(text: &str) -> &str {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("<pasted_content") else {
+        return text;
+    };
+    let Some(open_end) = rest.find('>') else {
+        return text;
+    };
+    let inner = &rest[open_end + 1..];
+    inner
+        .strip_suffix("</pasted_content>")
+        .unwrap_or(inner)
+        .trim()
+}
+
 pub(crate) fn is_scaffold(text: &str) -> bool {
     let t = text.trim_start();
     const MARKERS: &[&str] = &[
@@ -1200,7 +1382,25 @@ pub(crate) fn is_scaffold(text: &str) -> bool {
         "<system-reminder>",
         "<command-name>",
         "<command-message>",
+        "<command-args>",
         "Caveat: The messages below",
+        // Claude Code 2.1.2xx wrappers around local commands, shell escapes,
+        // background-task notices, interrupts, skills, hooks and compaction.
+        // (Flagged turns are also caught by RUNTIME_INJECTED; these prefixes
+        // cover sessions written before the flags existed.) NOT
+        // `<pasted_content` — that wraps a real paste.
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<task-notification>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "[Request interrupted by user",
+        "Base directory for this skill",
+        "Stop hook feedback",
+        "Continue from where you left off",
+        "This session is being continued from a previous conversation",
         "# AGENTS.md",
         "[constant:",
         "# CLAUDE.md",
@@ -1496,28 +1696,14 @@ fn has_conversation(path: &Path, from: SessionFormat) -> bool {
             }
         })
         || match from {
-            // Whole-document formats need a document parse, not a line scan.
-            SessionFormat::Gemini => fs::read_to_string(path)
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| {
-                    v.get("messages").and_then(|m| {
-                        m.as_array().map(|a| {
-                            a.iter().any(|msg| {
-                                matches!(
-                                    msg.get("type").and_then(serde_json::Value::as_str),
-                                    Some("user") | Some("gemini")
-                                )
-                            })
-                        })
-                    })
-                })
-                .unwrap_or(false),
+            // Gemini needs its log folded (re-appended ids, `$set` rebuilds,
+            // rewinds) and subagent sessions excluded — the codec owns that.
+            SessionFormat::Gemini => formats::gemini::has_conversation(path),
             SessionFormat::OpenCode => fs::read_to_string(path)
                 .ok()
                 .and_then(|t| {
-                    let end = t.rfind('}').map(|i| i + 1)?;
-                    serde_json::from_str::<serde_json::Value>(&t[..end]).ok()
+                    let json = formats::first_json_value(&t).ok()?;
+                    serde_json::from_str::<serde_json::Value>(json).ok()
                 })
                 .and_then(|v| v.get("messages").and_then(|m| m.as_array().map(|a| !a.is_empty())))
                 .unwrap_or(false),
@@ -1550,23 +1736,10 @@ pub(crate) fn codex_session_cwd(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Encode a path the way Claude names its `projects/<slug>` directory: every
-/// non-alphanumeric character becomes `-`, with a leading `-`.
+/// The `projects/<slug>` directory Claude files `path` under (one rule, owned
+/// by the claude codec).
 fn cwd_slug(path: &Path) -> String {
-    let rendered = path.to_string_lossy();
-    let mut slug = String::with_capacity(rendered.len());
-    for ch in rendered.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-        } else {
-            slug.push('-');
-        }
-    }
-    if slug.starts_with('-') {
-        slug
-    } else {
-        format!("-{slug}")
-    }
+    formats::claude::path_to_claude_slug(path)
 }
 
 // ---- Programmatic / headless surface ----------------------------------------
@@ -1802,19 +1975,25 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 // show the installed version beside these, and a mismatch warns. Bump a pin
 // ONLY after a real validation pass on that version: a version that merely runs
 // is not validated (codex 0.139 bit precisely because it ran while carrying the
-// wrong thread). SUPPORTED_CODEX → 0.145: the continue-eval drift suite went
-// 36/36 green on live codex 0.145.0 + claude 2.1.220 (2026-08-05, verbatim
-// message-by-message via `constant export`, all six source→target pairs
-// identical); prior passes 0.144.1 (2026-06-30), 0.142.3 (2026-06-29).
-// SUPPORTED_OPENCODE → 1.17: 36/36 on live opencode 1.17.3 (2026-06-19).
-// SUPPORTED_GEMINI stays 0.40: gemini 0.50 CHANGED its store format (named
-// tmp/ dirs instead of sha256(cwd); new logs.json schema) and the reader does
-// not detect it — 0.50-era sessions are NOT carry-able until the codec is
-// updated after a real format study. Old 0.40-era sessions still read.
-pub const SUPPORTED_CODEX: &str = "0.145";
+// wrong thread), and Constant reading back its own writes is not validation
+// either — the TARGET runtime must resume the projection and answer from it.
+//
+// 2026-10-13 pass (each a live run, not a fixture):
+// - SUPPORTED_CODEX → 0.162: a planted fact carried claude-format → codex, then
+//   `codex exec resume` on 0.162.1 answered it; after a claude → codex return
+//   carry refreshed the same thread in place, it still did.
+// - SUPPORTED_CLAUDE stays 2.1, revalidated on 2.1.289: the codex thread above
+//   (with codex's own turns) carried → claude, `claude -p -r --fork-session`
+//   answered the planted fact.
+// - SUPPORTED_OPENCODE → 1.18: carries into an isolated store through the real
+//   `opencode import` (1.18.31) — order preserved, one copy per projection,
+//   tool parts accepted; the reader exports real 4–6 MB sessions.
+// - SUPPORTED_GEMINI → 0.50: the reader folds real 0.50 `.jsonl` session logs
+//   (was: detected as claude, 0 messages). Gemini stays a carry SOURCE.
+pub const SUPPORTED_CODEX: &str = "0.162";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
-pub const SUPPORTED_GEMINI: &str = "0.40";
-pub const SUPPORTED_OPENCODE: &str = "1.17";
+pub const SUPPORTED_GEMINI: &str = "0.50";
+pub const SUPPORTED_OPENCODE: &str = "1.18";
 
 /// Is this installed version one the codec was validated against?
 /// (Prefix match on the validated release line: "0.137" accepts "0.137.4".)
@@ -2351,6 +2530,18 @@ mod tests {
     }
 
     #[test]
+    fn cwd_slug_follows_claudes_long_path_and_utf16_rules() {
+        // Over 200 chars: cut to 200 + "-" + base36(|32-bit hash|) — the value
+        // below comes from an independent simulation of Claude's JS rule.
+        let long = format!("/Users/x/{}project", "deeply-nested-folder/".repeat(12));
+        let slug = cwd_slug(Path::new(&long));
+        assert_eq!(slug.len(), 207);
+        assert!(slug.ends_with("-de-hbs0qc"), "{slug}");
+        // A character outside the BMP is two UTF-16 units → two dashes.
+        assert_eq!(cwd_slug(Path::new("/tmp/\u{1F600}x")), "-tmp---x");
+    }
+
+    #[test]
     fn same_dir_tolerates_trailing_slash() {
         let here = std::env::temp_dir();
         let with_slash = format!("{}/", here.display());
@@ -2552,6 +2743,117 @@ mod tests {
     }
 
     // --- gemini loader: messages, thoughts, tool calls map to the IR ---
+
+    #[test]
+    fn claude_runtime_injected_turns_are_dropped_and_counted_and_queued_prompts_carry() {
+        // Claude Code 2.1.2xx writes its own turns onto the user's side: the
+        // /model caveat + command + stdout triple, skill bodies, background-task
+        // notices, compaction summaries. None of it is the user talking — and
+        // the caveat must never become the title. Prompts typed mid-turn arrive
+        // as `queued_command` attachments and ARE the user talking.
+        let dir = unique_tmp();
+        let path = dir.join("4d1c0a5e-0000-4000-8000-000000000001.jsonl");
+        let sid = "4d1c0a5e-0000-4000-8000-000000000001";
+        let rec = |extra: &str| format!(r#"{{"sessionId":"{sid}","cwd":"/tmp/p","timestamp":"2026-09-30T01:00:00.000Z",{extra}}}"#);
+        let lines = [
+            rec(r#""type":"permission-mode","permissionMode":"default""#),
+            rec(r#""type":"user","isMeta":true,"uuid":"u1","message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"}"#),
+            rec(r#""type":"user","uuid":"u2","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>"}"#),
+            rec(r#""type":"user","uuid":"u3","message":{"role":"user","content":"<local-command-stdout>Set model to Opus</local-command-stdout>"}"#),
+            rec(r#""type":"user","uuid":"u4","origin":{"kind":"human"},"message":{"role":"user","content":"real first question"}"#),
+            rec(r#""type":"assistant","uuid":"a1","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"an answer"}]}"#),
+            rec(r#""type":"user","uuid":"u5","origin":{"kind":"human"},"message":{"role":"user","content":"second question"}"#),
+            rec(r#""type":"user","isMeta":true,"uuid":"u6","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x"}]}"#),
+            rec(r#""type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"second question","commandMode":"prompt","humanTurn":true,"origin":{"kind":"human"}}"#),
+            rec(r#""type":"attachment","uuid":"q2","attachment":{"type":"queued_command","prompt":"third thought","commandMode":"prompt","humanTurn":true,"origin":{"kind":"human"}}"#),
+            rec(r#""type":"attachment","uuid":"q3","attachment":{"type":"queued_command","prompt":"<task-notification>done</task-notification>","commandMode":"task-notification"}"#),
+            rec(r#""type":"user","uuid":"u7","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>agent finished</task-notification>"}"#),
+            rec(r#""type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"uuid":"u8","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}"#),
+            rec(r#""type":"user","uuid":"u9","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}"#),
+            rec(r#""type":"ai-title","aiTitle":"Model routing chat""#),
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let d = distill_source(&path, false).expect("claude load");
+        let users: Vec<String> = d
+            .session
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Message(m) if m.role == "user" => Some(
+                    m.blocks.iter().filter_map(|b| b.text.clone()).collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec!["real first question", "second question", "third thought"],
+            "only the user's own words, the queued repeat folded away"
+        );
+        assert_eq!(d.receipt.turns, 4, "{:?}", d.receipt);
+        assert_eq!(d.receipt.dropped_scaffold, 7, "every injected turn is declared: {:?}", d.receipt);
+        assert_eq!(d.session.metadata.title.as_deref(), Some("Model routing chat"));
+        assert!(unwrap_paste(r#"<pasted_content id="p1">the words</pasted_content>"#) == "the words");
+    }
+
+    #[test]
+    fn gemini_log_folds_like_gemini_but_never_shreds_filed_turns() {
+        // The 0.39+ `.jsonl` log: header line, then records. Re-appended ids
+        // update in place; `$set.messages` (a history rebuild) does NOT delete
+        // turns already read; `$rewindTo` (the user undoing) does; gemini's
+        // injected preamble and slash commands are not conversation.
+        let dir = unique_tmp();
+        let path = dir.join("session-2026-09-16T17-43-2629e105.jsonl");
+        let lines = [
+            r#"{"sessionId":"2629e105-0000-0000-0000-000000000001","projectHash":"deadbeef","startTime":"2026-09-16T17:43:00.000Z","lastUpdated":"2026-09-16T17:43:00.000Z","kind":"main"}"#,
+            r#"{"$set":{"messages":[{"id":"ctx","timestamp":"2026-09-16T17:43:00.000Z","type":"user","content":[{"text":"<session_context>\nOS: darwin"}]}]}}"#,
+            r#"{"id":"m1","timestamp":"2026-09-16T17:43:01.000Z","type":"user","content":[{"text":"draft"}]}"#,
+            r#"{"id":"m2","timestamp":"2026-09-16T17:43:05.000Z","type":"gemini","content":"the reply","toolCalls":[{"id":"t1","name":"shell","args":{"command":"ls"},"status":"error","result":[{"functionResponse":{"response":{"error":"denied"}}}]}],"model":"gemini-3-pro"}"#,
+            r#"{"id":"m1","timestamp":"2026-09-16T17:43:01.000Z","type":"user","content":[{"text":"first question"}]}"#,
+            r#"{"$set":{"messages":[{"id":"s1","timestamp":"2026-09-16T17:50:00.000Z","type":"user","content":[{"text":"summary of earlier work"}]}],"lastUpdated":"2026-09-16T17:50:00.000Z"}}"#,
+            r#"{"id":"m3","timestamp":"2026-09-16T17:51:00.000Z","type":"user","content":[{"text":"later question"},{"text":"hidden","thought":true}]}"#,
+            r#"{"id":"m4","timestamp":"2026-09-16T17:51:10.000Z","type":"user","content":[{"text":"/stats"}]}"#,
+            r#"{"id":"m5","timestamp":"2026-09-16T17:52:00.000Z","type":"user","content":[{"text":"taken back"}]}"#,
+            r#"{"$rewindTo":"m5"}"#,
+            r#"{"id":"m6","timestamp":"2026-09-16T17:53:"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        assert_eq!(
+            formats::detect_format(&path).unwrap(),
+            SessionFormat::Gemini,
+            "a gemini log header must not be mistaken for claude"
+        );
+        assert!(formats::gemini::has_conversation(&path));
+        let d = distill_source(&path, true).expect("gemini log load");
+        let users: Vec<String> = d
+            .session
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Message(m) if m.role == "user" => Some(
+                    m.blocks.iter().filter_map(|b| b.text.clone()).collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec!["first question", "summary of earlier work", "later question"],
+            "updated in place, rebuild kept filed turns, preamble/slash/rewound dropped"
+        );
+        assert_eq!(d.receipt.turns, 4, "{:?}", d.receipt);
+        let errored = d.session.events.iter().any(|e| {
+            matches!(e, SessionEvent::ToolResult(r) if r.is_error)
+        });
+        assert!(errored, "status=error must mark the tool result as an error");
+        assert_eq!(
+            d.session.metadata.updated_at.map(|t| t.to_rfc3339()),
+            Some("2026-09-16T17:50:00+00:00".to_string()),
+            "$set.lastUpdated patches the header"
+        );
+    }
 
     #[test]
     fn gemini_loader_maps_the_full_shape() {

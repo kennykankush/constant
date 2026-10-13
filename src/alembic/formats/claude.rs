@@ -18,6 +18,9 @@ pub struct ClaudeMaterialization {
     pub history_file: Option<PathBuf>,
 }
 
+/// Scratch key for the latest `aiTitle` while loading (never leaves `load`).
+const AI_TITLE: &str = "claude_ai_title";
+
 pub fn load(path: &Path) -> Result<UniversalSession> {
     let file = File::open(path)
         .with_context(|| format!("failed to open Claude session {}", path.display()))?;
@@ -54,13 +57,20 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
         match value.get("type").and_then(Value::as_str) {
             Some("user") => import_user_entry(&mut session.events, &value),
             Some("assistant") => import_assistant_entry(&mut session.events, &value),
+            Some("attachment") => import_queued_prompt(&mut session.events, &value),
             _ => {}
         }
     }
 
     if session.metadata.title.is_none() {
-        session.metadata.title = derive_title(&session);
+        session.metadata.title = session
+            .metadata
+            .extra
+            .remove(AI_TITLE)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .or_else(|| derive_title(&session));
     }
+    session.metadata.extra.remove(AI_TITLE);
 
     Ok(session)
 }
@@ -87,6 +97,15 @@ fn import_metadata(metadata: &mut SessionMetadata, value: &Value) {
     {
         metadata.title = Some(custom.trim().to_string());
     }
+    // Unrenamed sessions get an `ai-title` record (re-appended as the
+    // conversation evolves) — Claude's own picker name after a custom title.
+    if let Some(ai) = value.get("aiTitle").and_then(Value::as_str)
+        && !ai.trim().is_empty()
+    {
+        metadata
+            .extra
+            .insert(AI_TITLE.to_string(), Value::String(ai.trim().to_string()));
+    }
     let timestamp = value
         .get("timestamp")
         .and_then(Value::as_str)
@@ -111,6 +130,7 @@ fn import_user_entry(events: &mut Vec<SessionEvent>, value: &Value) {
     let Some(message) = value.get("message") else {
         return;
     };
+    let metadata = injected_metadata(value);
 
     let content = message.get("content").cloned().unwrap_or(Value::Null);
     match content {
@@ -124,7 +144,7 @@ fn import_user_entry(events: &mut Vec<SessionEvent>, value: &Value) {
                 role: "user".to_string(),
                 timestamp,
                 blocks: vec![ContentBlock::text("text", text)],
-                metadata: BTreeMap::new(),
+                metadata,
             }));
         }
         Value::Array(items) => {
@@ -140,7 +160,7 @@ fn import_user_entry(events: &mut Vec<SessionEvent>, value: &Value) {
                                 role: "user".to_string(),
                                 timestamp,
                                 blocks: std::mem::take(&mut message_blocks),
-                                metadata: BTreeMap::new(),
+                                metadata: metadata.clone(),
                             }));
                         }
 
@@ -163,12 +183,100 @@ fn import_user_entry(events: &mut Vec<SessionEvent>, value: &Value) {
                     role: "user".to_string(),
                     timestamp,
                     blocks: message_blocks,
-                    metadata: BTreeMap::new(),
+                    metadata,
                 }));
             }
         }
         _ => {}
     }
+}
+
+/// Claude Code marks the user turns IT wrote — command caveats and output,
+/// skill bodies, hook feedback, compaction summaries, task notifications, peer
+/// messages, auto-continuations — with `isMeta`, `isCompactSummary`,
+/// `isVisibleInTranscriptOnly`, or a non-human `origin.kind`. Tag them so
+/// `sanitize` drops AND counts them (invariant 5: declared, never silent).
+/// Typed prompts carry `origin: {kind: "human"}` (2.1.2xx) or no origin at all
+/// (≤ 2.1.170).
+fn injected_metadata(value: &Value) -> BTreeMap<String, Value> {
+    let flag = |k: &str| value.get(k).and_then(Value::as_bool) == Some(true);
+    let foreign_origin = value
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "human");
+    let mut metadata = BTreeMap::new();
+    if flag("isMeta") || flag("isCompactSummary") || flag("isVisibleInTranscriptOnly") || foreign_origin
+    {
+        metadata.insert(crate::alembic::RUNTIME_INJECTED.to_string(), Value::Bool(true));
+    }
+    metadata
+}
+
+/// A prompt the user typed while the agent was mid-turn: Claude Code files it
+/// as an `attachment` record (`queued_command`, `commandMode: "prompt"`, from a
+/// human) instead of a user record. It is the user's own words — carry it.
+/// Background-task notices ride the same channel and are not. Claude sometimes
+/// also files the same text as a regular user turn; the repeat is skipped.
+fn import_queued_prompt(events: &mut Vec<SessionEvent>, value: &Value) {
+    let Some(att) = value.get("attachment") else {
+        return;
+    };
+    let human = att.get("humanTurn").and_then(Value::as_bool) == Some(true)
+        || att
+            .get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(Value::as_str)
+            == Some("human");
+    if att.get("type").and_then(Value::as_str) != Some("queued_command")
+        || att.get("commandMode").and_then(Value::as_str) != Some("prompt")
+        || !human
+    {
+        return;
+    }
+    let Some(prompt) = att.get("prompt").and_then(Value::as_str) else {
+        return;
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return;
+    }
+    // The last turn the USER wrote — runtime-injected turns (a skill body the
+    // agent loaded in between, say) don't count.
+    let repeats_last_user_turn = events.iter().rev().find_map(|e| match e {
+        SessionEvent::Message(m)
+            if m.role == "user" && !m.metadata.contains_key(crate::alembic::RUNTIME_INJECTED) =>
+        {
+            Some(
+            m.blocks
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<String>()
+                .trim()
+                    == prompt,
+            )
+        }
+        _ => None,
+    });
+    if repeats_last_user_turn == Some(true) {
+        return;
+    }
+    let timestamp = att
+        .get("timestamp")
+        .or_else(|| value.get("timestamp"))
+        .and_then(Value::as_str)
+        .and_then(parse_datetime);
+    events.push(SessionEvent::Message(MessageEvent {
+        id: value.get("uuid").and_then(Value::as_str).map(str::to_string),
+        parent_id: value
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        role: "user".to_string(),
+        timestamp,
+        blocks: vec![ContentBlock::text("text", prompt)],
+        metadata: BTreeMap::new(),
+    }));
 }
 
 fn import_assistant_entry(events: &mut Vec<SessionEvent>, value: &Value) {
@@ -777,21 +885,50 @@ fn plan_output(session: &UniversalSession, output: &Path) -> ClaudeMaterializati
     }
 }
 
-fn path_to_claude_slug(path: &Path) -> String {
+/// The `projects/<name>` directory Claude Code files a cwd under — Claude's
+/// own rule (2.1.2xx, read from the binary): every UTF-16 unit that is not
+/// `[A-Za-z0-9]` becomes `-`; a name longer than 200 is cut to 200 and suffixed
+/// with `-` + base36(|h|), `h` being the 32-bit `(h << 5) - h + unit` hash of
+/// the raw path. (A character outside the BMP is two UTF-16 units, so two
+/// dashes — not one.)
+pub(crate) fn path_to_claude_slug(path: &Path) -> String {
+    const MAX: usize = 200;
     let rendered = path.to_string_lossy();
-    let mut slug = String::with_capacity(rendered.len());
-    for ch in rendered.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-        } else {
-            slug.push('-');
-        }
+    let units: Vec<u16> = rendered.encode_utf16().collect();
+    let mut slug: String = units
+        .iter()
+        .map(|&u| {
+            if u < 128 && (u as u8).is_ascii_alphanumeric() {
+                u as u8 as char
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if !slug.starts_with('-') {
+        slug.insert(0, '-');
     }
-    if slug.starts_with('-') {
-        slug
-    } else {
-        format!("-{slug}")
+    if slug.len() <= MAX {
+        return slug;
     }
+    let hash = units.iter().fold(0i32, |h, &u| {
+        h.wrapping_shl(5).wrapping_sub(h).wrapping_add(i32::from(u))
+    });
+    format!("{}-{}", &slug[..MAX], base36(hash.unsigned_abs()))
+}
+
+fn base36(mut n: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
@@ -953,14 +1090,15 @@ fn derive_title(session: &UniversalSession) -> Option<String> {
         let SessionEvent::Message(message) = event else {
             return None;
         };
-        if message.role != "user" {
+        if message.role != "user" || message.metadata.contains_key(crate::alembic::RUNTIME_INJECTED) {
             return None;
         }
         message
             .blocks
             .iter()
             .filter_map(|block| block.text.as_deref())
-            .map(collapse_whitespace)
+            .filter(|text| !crate::alembic::is_scaffold(text))
+            .map(|text| collapse_whitespace(crate::alembic::unwrap_paste(text)))
             .find(|text| !text.is_empty())
     })
 }

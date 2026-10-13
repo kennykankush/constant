@@ -1663,6 +1663,18 @@ pub fn run(
                             };
                             match outcome {
                                 Ok((id, written, session_cwd)) => {
+                                    // The target refused an in-place refresh
+                                    // (live writer, paginated history, opencode's
+                                    // insert-only import): a fresh projection
+                                    // was minted — record it as one.
+                                    let mode = if reuse_owned
+                                        .as_ref()
+                                        .is_some_and(|(rid, _)| *rid != id)
+                                    {
+                                        "new-fork"
+                                    } else {
+                                        mode
+                                    };
                                     if let Some(f) = dbg.as_mut() {
                                         let _ = writeln!(
                                             f,

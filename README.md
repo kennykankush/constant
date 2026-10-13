@@ -474,17 +474,20 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume) — validated against `0.141.x`
-- Claude Code: full — validated against `2.1.x`
-- OpenCode: full — validated against `1.17.x`; reads via `opencode export`,
+- Codex CLI: full (host, carry in/out, resume) — validated against `0.162.x`
+- Claude Code: full — validated against `2.1.x` (last checked on 2.1.289)
+- OpenCode: full — validated against `1.18.x`; reads via `opencode export`,
   writes via `opencode import`, resumes via `opencode -s <id>`
-- Gemini CLI: carry **source** — validated against `0.40.x`; existing gemini
-  conversations load, list, and carry into the other runtimes
+- Gemini CLI: carry **source** — validated against `0.50.x` (and older
+  single-file sessions); gemini conversations load, list, and carry into the
+  other runtimes
 
-The session formats are private and can change between runtime releases. Constant
-has round-trip tests for the current known shapes, but a runtime update can still
-require a codec refresh — and if one ever rejects Constant's sessions, the
-conversation reprints from its record snapshot.
+"Validated" means the target runtime itself resumed a Constant-written session
+and answered from the carried conversation — not just that Constant can read
+back what it wrote. The session formats are private and can change between
+runtime releases; a runtime update can still require a codec refresh — and if
+one ever rejects Constant's sessions, the conversation reprints from its record
+snapshot.
 
 Planned: carrying into Gemini; Aider.
 

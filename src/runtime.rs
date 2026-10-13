@@ -48,6 +48,7 @@ impl Runtime {
             (Runtime::Claude, Some(id)) => vec!["--session-id", id],
             _ => vec![],
         };
+        args.extend(self.isolation_flags());
         if yolo && let Some(flag) = self.yolo_flag() {
             args.push(flag);
         }
@@ -63,10 +64,40 @@ impl Runtime {
             Runtime::Gemini => vec!["--resume", session_id],
             Runtime::OpenCode => vec!["-s", session_id],
         };
+        args.extend(self.isolation_flags());
         if yolo && let Some(flag) = self.yolo_flag() {
             args.push(flag);
         }
         self.command(&args)
+    }
+
+    /// The resume command a human types to reopen a native session — the same
+    /// isolation flags the harness itself passes, so a printed hint never
+    /// resumes a stale daemon-held copy of a thread Constant just rewrote.
+    pub fn resume_hint(self, session_id: &str) -> String {
+        let base = match self {
+            Runtime::Codex => format!("codex resume {session_id}"),
+            Runtime::Claude => format!("claude -r {session_id}"),
+            Runtime::Gemini => format!("gemini --resume {session_id}"),
+            Runtime::OpenCode => format!("opencode -s {session_id}"),
+        };
+        self.isolation_flags()
+            .iter()
+            .fold(base, |cmd, flag| format!("{cmd} {flag}"))
+    }
+
+    /// Flags that keep a Constant-hosted child reading its session from disk.
+    /// Codex ≥ 0.156 runs threads in a shared background app-server that keeps
+    /// a thread in memory ~60 s after its last client, and `codex resume`
+    /// attaches to that in-memory copy instead of re-reading the rollout. A
+    /// carry rewrites or appends the rollout on disk, so a daemon-held copy
+    /// would wake the pre-carry thread. `--no-daemon` only where the installed
+    /// codex knows it — older releases reject unknown flags.
+    fn isolation_flags(self) -> &'static [&'static str] {
+        match self {
+            Runtime::Codex if crate::alembic::codex_supports_no_daemon() => &["--no-daemon"],
+            _ => &[],
+        }
     }
 
     /// The runtime's "run without sandbox / approval prompts" flag, injected

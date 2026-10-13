@@ -1830,7 +1830,11 @@ fn carry_into_opencode_round_trips_through_import() {
         "round trip lost the conversation: {text}"
     );
 
-    // Refresh (stable pair): same id again, upserted through their door.
+    // Refresh: `opencode import` only ever INSERTS (rows it already has are
+    // skipped, never updated or deleted), so re-importing into the same session
+    // keeps the old copy and adds a second one beside it — verified against
+    // opencode 1.18: a 939-turn thread carried twice held 1774 messages. A
+    // refresh therefore mints a fresh projection; each holds the thread once.
     let again = run(
         &dir,
         &[
@@ -1844,7 +1848,26 @@ fn carry_into_opencode_round_trips_through_import() {
     );
     assert!(again.status.success(), "{}", err(&again));
     let av: serde_json::Value = serde_json::from_str(&out(&again)).unwrap();
-    assert_eq!(av["id"].as_str(), Some(id), "stable pair broke");
+    let id2 = av["id"].as_str().expect("no id");
+    assert_ne!(id2, id, "an opencode refresh must not re-import into the same session");
+    let messages_in = |sid: &str| -> usize {
+        let export = std::process::Command::new("opencode")
+            .args(["export", sid])
+            .env("XDG_DATA_HOME", dir.join("xdg"))
+            .output()
+            .expect("run opencode export");
+        let text = String::from_utf8_lossy(&export.stdout).to_string();
+        let start = text.find('{').expect("no JSON in export");
+        let v: serde_json::Value = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("empty export")
+            .expect("invalid export JSON");
+        v["messages"].as_array().map_or(0, Vec::len)
+    };
+    let (first, second) = (messages_in(id), messages_in(id2));
+    assert!(first > 0, "first projection is empty");
+    assert_eq!(first, second, "each projection holds the conversation exactly once");
     assert_eq!(av["debug"].get("mode"), None); // not in non-debug json
 }
 
