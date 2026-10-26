@@ -427,8 +427,15 @@ pub(crate) fn export_opencode_to_cache(id: &str) -> Result<PathBuf> {
     ));
     let raw_guard = TmpCleanup::new(&raw);
     let sink = fs::File::create(&raw).with_context(|| format!("failed to create {}", raw.display()))?;
+    // 2.x: `session export`, on a private server over this environment's
+    // store (see `import_opencode` for why not the shared service).
+    let args: &[&str] = if crate::alembic::opencode_v2() {
+        &["session", "export", "--standalone", id]
+    } else {
+        &["export", id]
+    };
     let out = std::process::Command::new("opencode")
-        .args(["export", id])
+        .args(args)
         .stdout(sink)
         .output()
         .context("failed to run `opencode export` — is opencode on PATH?")?;

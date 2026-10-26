@@ -68,6 +68,9 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
         .env("CONSTANT_NO_UPDATE_CHECK", "1")
         .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
         .env_remove("TRANSESSION_CODEX_HOME")
         .env_remove("TRANSESSION_CLAUDE_HOME")
         .env_remove("CONSTANT_GEMINI_HOME")
@@ -86,11 +89,66 @@ fn run_in(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
         .env("CONSTANT_NO_UPDATE_CHECK", "1")
         .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
         .env_remove("TRANSESSION_CODEX_HOME")
         .env_remove("TRANSESSION_CLAUDE_HOME")
         .env_remove("CONSTANT_GEMINI_HOME")
         .output()
         .expect("failed to run constant")
+}
+
+/// `opencode --version`, run against a throwaway store: even `--version`
+/// writes a log line under the data dir, and tests never touch the real one.
+fn opencode_version() -> Option<Output> {
+    let scratch = std::env::temp_dir().join("constant-test-opencode-probe");
+    std::process::Command::new("opencode")
+        .arg("--version")
+        .env("HOME", &scratch)
+        .env("XDG_DATA_HOME", scratch.join("xdg"))
+        .env("XDG_CONFIG_HOME", scratch.join("xdg-config"))
+        .env("XDG_STATE_HOME", scratch.join("xdg-state"))
+        .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+}
+
+/// Whether the installed opencode is 2.x (`opencode v2.0.28`; 1.x prints a
+/// bare `1.18.31`).
+fn opencode_v2_installed() -> bool {
+    opencode_version()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.split_whitespace()
+                .map(|t| t.trim_start_matches('v').to_string())
+                .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
+/// `opencode export <id>` against the test's isolated store. 2.x routes
+/// session commands through a shared background service that uses whatever
+/// store IT was started on — the real one, if the user's service is up — so
+/// `--standalone` and a fully isolated environment are required.
+fn opencode_export_isolated(dir: &Path, id: &str) -> Output {
+    let mut cmd = std::process::Command::new("opencode");
+    if opencode_v2_installed() {
+        cmd.args(["session", "export", "--standalone", id]);
+    } else {
+        cmd.args(["export", id]);
+    }
+    cmd.env("HOME", dir)
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run opencode export")
 }
 
 /// Find the claude projection file for a session id in the isolated store.
@@ -1785,12 +1843,7 @@ fn opencode_export_file_carries_into_codex() {
 /// back out via `opencode export`. Skips when opencode isn't installed (CI).
 #[test]
 fn carry_into_opencode_round_trips_through_import() {
-    if std::process::Command::new("opencode")
-        .arg("--version")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
+    if opencode_version().is_none() {
         eprintln!("skipping: opencode binary not available");
         return;
     }
@@ -1818,12 +1871,8 @@ fn carry_into_opencode_round_trips_through_import() {
     );
 
     // The isolated opencode store (XDG_DATA_HOME) must now hold the session.
-    let export = std::process::Command::new("opencode")
-        .args(["export", id])
-        .env("XDG_DATA_HOME", dir.join("xdg"))
-        .output()
-        .expect("run opencode export");
-    assert!(export.status.success(), "export-back failed");
+    let export = opencode_export_isolated(&dir, id);
+    assert!(export.status.success(), "export-back failed: {}", err(&export));
     let text = String::from_utf8_lossy(&export.stdout).to_string();
     assert!(
         text.contains("hello from the fixture"),
@@ -1851,11 +1900,7 @@ fn carry_into_opencode_round_trips_through_import() {
     let id2 = av["id"].as_str().expect("no id");
     assert_ne!(id2, id, "an opencode refresh must not re-import into the same session");
     let messages_in = |sid: &str| -> usize {
-        let export = std::process::Command::new("opencode")
-            .args(["export", sid])
-            .env("XDG_DATA_HOME", dir.join("xdg"))
-            .output()
-            .expect("run opencode export");
+        let export = opencode_export_isolated(&dir, sid);
         let text = String::from_utf8_lossy(&export.stdout).to_string();
         let start = text.find('{').expect("no JSON in export");
         let v: serde_json::Value = serde_json::Deserializer::from_str(&text[start..])
@@ -2240,8 +2285,14 @@ fn codex_tool_violations(text: &str) -> Vec<String> {
 fn carry_with_tools_matrix_satisfies_each_target_api() {
     let dir = tmpdir();
     let mut failures = Vec::new();
+    // opencode validates its import schema itself: a carry into it only
+    // succeeds if the real binary accepted the document.
+    let mut targets = vec!["claude", "codex"];
+    if opencode_version().is_some() {
+        targets.push("opencode");
+    }
     for (source, path, tool_events) in tool_matrix_seeds(&dir) {
-        for target in ["claude", "codex"] {
+        for &target in &targets {
             if source == target {
                 continue;
             }
@@ -2280,7 +2331,8 @@ fn carry_with_tools_matrix_satisfies_each_target_api() {
             let text = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
             let bad = match target {
                 "claude" => claude_tool_violations(&text),
-                _ => codex_tool_violations(&text),
+                "codex" => codex_tool_violations(&text),
+                _ => Vec::new(),
             };
             failures.extend(bad.into_iter().map(|b| format!("{cell}: {b}")));
         }

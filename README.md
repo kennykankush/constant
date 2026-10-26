@@ -346,8 +346,9 @@ Constant currently writes:
 - `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`
 - `~/.codex/session_index.jsonl`
 - `~/.codex/state_5.sqlite`
-- the OpenCode store, via `opencode import` only (its own supported,
-  validating entry point — Constant never writes OpenCode's sqlite directly)
+- the OpenCode store, via its import command only (`opencode session import`
+  on 2.x, `opencode import` on 1.x — its own supported, validating entry
+  point; Constant never writes OpenCode's sqlite directly)
 - `~/.constant/trail.jsonl`, `~/.constant/snapshots/`, `~/.constant/cache/`
 
 Gemini support is currently **read-only**: Constant loads gemini sessions as
@@ -476,8 +477,12 @@ Current support:
 
 - Codex CLI: full (host, carry in/out, resume) — validated against `0.162.x`
 - Claude Code: full — validated against `2.1.x` (last checked on 2.1.289)
-- OpenCode: full — validated against `1.18.x`; reads via `opencode export`,
-  writes via `opencode import`, resumes via `opencode -s <id>`
+- OpenCode: full — validated against `2.0.x` (2.0.28); reads via `opencode
+  session export`, writes via `opencode session import`, resumes via `opencode
+  -s <id>`. Both run `--standalone`, on the store your environment names
+  rather than whichever store a running background service was started on.
+  OpenCode 1.x (`1.18.x`) still works through its own export shape and
+  `opencode import`/`export`
 - Gemini CLI: carry **source** — validated against `0.50.x` (and older
   single-file sessions); gemini conversations load, list, and carry into the
   other runtimes

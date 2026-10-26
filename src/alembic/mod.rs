@@ -364,6 +364,29 @@ fn codex_newest_thread_in(
         .find(|p| p.exists() && has_conversation(p, SessionFormat::Codex))
 }
 
+/// opencode's session + message tables: 2.x moved them to `session_v2` /
+/// `session_message` (same columns Constant reads) and keeps the 1.x tables
+/// as a frozen pre-migration copy — so the 2.x tables win when present.
+fn opencode_tables(conn: &rusqlite::Connection) -> (&'static str, &'static str) {
+    let v2 = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if v2 {
+        ("session_v2", "session_message")
+    } else {
+        ("session", "message")
+    }
+}
+
+/// Whether the installed opencode takes the 2.x commands and session shape.
+pub(crate) fn opencode_v2() -> bool {
+    formats::opencode::is_v2(detect_opencode_version().as_deref())
+}
+
 /// Newest opencode session for a directory (read-only sqlite), respecting the
 /// spawn-time fence and requiring at least one real message.
 fn opencode_newest_session(host_cwd: Option<&Path>, since: Option<SystemTime>) -> Option<String> {
@@ -386,13 +409,14 @@ fn opencode_newest_session(host_cwd: Option<&Path>, since: Option<SystemTime>) -
     let cwd_canon = host_cwd
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string());
+    let (sessions, messages) = opencode_tables(&conn);
     let query = |extra: &str| {
         conn.query_row(
             &format!(
-                "SELECT s.id FROM session s
+                "SELECT s.id FROM {sessions} s
                  WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
                    AND s.time_updated >= ?3 {extra}
-                   AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
+                   AND EXISTS (SELECT 1 FROM {messages} m WHERE m.session_id = s.id)
                  ORDER BY s.time_updated DESC LIMIT 1"
             ),
             rusqlite::params![cwd, cwd_canon, fence_ms],
@@ -770,10 +794,25 @@ pub fn append_refresh(
 /// `opencode import` files the session under the IMPORTING process's working
 /// directory (its project + directory columns), not the export's own
 /// `info.directory` — so it runs from the conversation's cwd when that exists.
+///
+/// 2.x moved it to `opencode session import` and routes it through a shared
+/// background service by default, which writes whatever store THAT service
+/// was started on. `--standalone` runs a private server on the store this
+/// process's environment names, so the import lands exactly where resume
+/// (and an isolated test) will look.
 fn import_opencode(file: &Path, expected: &str, cwd: Option<&Path>) -> Result<()> {
     let mut cmd = std::process::Command::new("opencode");
-    cmd.arg("import").arg(file);
-    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+    let dir = cwd.filter(|d| d.is_dir());
+    if opencode_v2() {
+        cmd.args(["session", "import", "--standalone"]);
+        if let Some(dir) = dir {
+            cmd.arg("--directory").arg(dir);
+        }
+    } else {
+        cmd.arg("import");
+    }
+    cmd.arg(file);
+    if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
     let out = cmd
@@ -1582,12 +1621,17 @@ fn detect_opencode_version() -> Option<String> {
                 .arg("--version")
                 .output()
                 .ok()?;
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.split_whitespace()
-                .find(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
-                .map(str::to_string)
+            parse_opencode_version(&String::from_utf8_lossy(&output.stdout))
         })
         .clone()
+}
+
+/// 1.x prints `1.18.31`, 2.x `opencode v2.0.28`.
+fn parse_opencode_version(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|t| t.trim_start_matches('v'))
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(str::to_string)
 }
 
 /// Find the session this harness is hosting: newest `*.jsonl` under the runtime
@@ -1979,13 +2023,14 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
     let cwd_c = cwd
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string());
-    let Ok(mut stmt) = conn.prepare(
+    let (sessions, messages) = opencode_tables(&conn);
+    let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT s.id, s.directory, s.title, s.time_updated,
-                EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
-         FROM session s
+                EXISTS (SELECT 1 FROM {messages} m WHERE m.session_id = s.id)
+         FROM {sessions} s
          WHERE (?1 IS NULL OR s.directory = ?1 OR s.directory = ?2)
-         ORDER BY s.time_updated DESC",
-    ) else {
+         ORDER BY s.time_updated DESC"
+    )) else {
         return Vec::new();
     };
     let rows = stmt.query_map(rusqlite::params![cwd_s, cwd_c], |r| {
@@ -2032,10 +2077,19 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 //   tool parts accepted; the reader exports real 4–6 MB sessions.
 // - SUPPORTED_GEMINI → 0.50: the reader folds real 0.50 `.jsonl` session logs
 //   (was: detected as claude, 0 messages). Gemini stays a carry SOURCE.
+//
+// 2026-10-27 pass:
+// - SUPPORTED_OPENCODE → 2.0 (2.0.28 rewrote the session shape, commands and
+//   tables; the 1.x codec stays behind the version gate). In an isolated store:
+//   a claude seed with tools (one failed) carried in through the real `session
+//   import --standalone`; deepseek, resumed through opencode's own background
+//   service, answered the planted fact, the tool output and the failure. A real
+//   2.0 session (reasoning + tools) carried OUT → claude; `claude -p -r
+//   --fork-session` answered its planted fact and file contents.
 pub const SUPPORTED_CODEX: &str = "0.162";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.50";
-pub const SUPPORTED_OPENCODE: &str = "1.18";
+pub const SUPPORTED_OPENCODE: &str = "2.0";
 
 /// Is this installed version one the codec was validated against?
 /// (Prefix match on the validated release line: "0.137" accepts "0.137.4".)
@@ -3006,6 +3060,167 @@ mod tests {
     }
 
     // --- opencode export parser: tolerates the trailing status line ---
+
+    // --- opencode 2.x: the session shape, commands and tables changed ---
+
+    #[test]
+    fn opencode_version_parses_both_lines_and_gates_v2() {
+        assert_eq!(parse_opencode_version("1.18.31\n").as_deref(), Some("1.18.31"));
+        assert_eq!(parse_opencode_version("opencode v2.0.28\n").as_deref(), Some("2.0.28"));
+        assert!(!formats::opencode::is_v2(Some("1.18.31")));
+        assert!(formats::opencode::is_v2(Some("2.0.28")));
+        assert!(formats::opencode::is_v2(Some("10.1.0")));
+        assert!(!formats::opencode::is_v2(None));
+    }
+
+    #[test]
+    fn opencode_tables_prefer_the_2x_tables_when_present() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session (id TEXT); CREATE TABLE message (id TEXT);")
+            .unwrap();
+        assert_eq!(opencode_tables(&conn), ("session", "message"));
+        // 2.x keeps the 1.x tables as a frozen pre-migration copy.
+        conn.execute_batch("CREATE TABLE session_v2 (id TEXT); CREATE TABLE session_message (id TEXT);")
+            .unwrap();
+        assert_eq!(opencode_tables(&conn), ("session_v2", "session_message"));
+    }
+
+    /// Trimmed from a real `opencode session export` (2.0.28).
+    const OPENCODE_V2_EXPORT: &str = r#"{
+  "info": {"id": "ses_e86620576ffehaJ8ApjmnJ2H74", "projectID": "46f1e74d",
+    "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode", "variant": "default"},
+    "cost": 0, "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    "outcome": "succeeded",
+    "time": {"created": 1793041758961, "updated": 1793041766142, "idle": 1793041766143},
+    "title": "codec probe", "location": {"directory": "/tmp/oc2/proj"}},
+  "messages": [
+    {"id": "msg_1", "time": {"created": 1793041759010}, "text": "Remember PELICAN-12. Run cat notes.txt.", "files": [], "type": "user"},
+    {"id": "msg_2", "time": {"created": 1793041759021}, "type": "assistant", "agent": "build",
+     "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode", "variant": "default"},
+     "content": [
+       {"type": "reasoning", "text": "Let me read it.", "state": {"reasoningField": "reasoning_content"}},
+       {"type": "tool", "id": "call_00_a", "name": "shell", "executed": false,
+        "state": {"status": "completed", "input": {"command": "cat notes.txt"},
+                  "content": [{"type": "text", "text": "alpha\n"}],
+                  "metadata": {"status": "completed", "truncated": false, "exit": 0}},
+        "time": {"created": 1793041761232}}
+     ], "finish": "tool-calls"},
+    {"id": "msg_3", "time": {"created": 1793041761521}, "type": "assistant", "agent": "build",
+     "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"},
+     "content": [
+       {"type": "tool", "id": "call_00_b", "name": "shell",
+        "state": {"status": "error", "input": {"command": "false"},
+                  "error": {"type": "tool", "message": "exit 1"}},
+        "time": {"created": 1793041763853}},
+       {"type": "tool", "id": "call_00_c", "name": "shell",
+        "state": {"status": "running", "input": {"command": "sleep 9"}, "metadata": {}},
+        "time": {"created": 1793041763900}}
+     ]},
+    {"id": "msg_4", "time": {"created": 1793041764246}, "type": "assistant", "agent": "build",
+     "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"},
+     "content": [{"type": "text", "text": "The file says alpha."}], "finish": "stop"},
+    {"id": "msg_5", "time": {"created": 1793041766143}, "type": "idle", "outcome": "succeeded"}
+  ]
+}
+"#;
+
+    #[test]
+    fn opencode_v2_export_loads() {
+        let session = formats::opencode::parse_export(OPENCODE_V2_EXPORT).expect("parse v2");
+        assert_eq!(session.metadata.cwd, Some(PathBuf::from("/tmp/oc2/proj")));
+        assert_eq!(session.metadata.model.as_deref(), Some("deepseek-v4.1-flash-free"));
+        let kinds: Vec<String> = session
+            .events
+            .iter()
+            .map(|e| match e {
+                SessionEvent::Message(m) => format!("msg:{}", m.role),
+                SessionEvent::ToolCall(c) => format!("call:{}", c.call_id),
+                SessionEvent::ToolResult(r) => format!("result:{}:{}", r.call_id, r.is_error),
+                SessionEvent::Reasoning(_) => "reasoning".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "msg:user",
+                "reasoning",
+                "call:call_00_a",
+                "result:call_00_a:false",
+                "call:call_00_b",
+                "result:call_00_b:true",
+                // Still running at export time: a call with no result yet.
+                "call:call_00_c",
+                "msg:assistant",
+            ]
+        );
+        let output = session.events.iter().find_map(|e| match e {
+            SessionEvent::ToolResult(r) if r.call_id == "call_00_a" => Some(r.output.clone()),
+            _ => None,
+        });
+        assert_eq!(output, Some(serde_json::json!("alpha\n")));
+    }
+
+    #[test]
+    fn opencode_v2_writer_emits_the_2x_shape_and_round_trips() {
+        let mut session = UniversalSession::new("ses_0123456789abcdef01234567".to_string());
+        session.metadata.cwd = Some(PathBuf::from("/tmp/constant-oc2"));
+        session.metadata.platform_version = Some("2.0.28".to_string());
+        session.events = vec![
+            msg("user", "list the files"),
+            SessionEvent::ToolCall(ir::ToolCallEvent {
+                id: None,
+                parent_id: None,
+                call_id: "call_free".to_string(),
+                name: "exec".to_string(),
+                timestamp: None,
+                arguments: serde_json::json!("ls -la"),
+                metadata: BTreeMap::new(),
+            }),
+            SessionEvent::ToolResult(ir::ToolResultEvent {
+                id: None,
+                parent_id: None,
+                call_id: "call_free".to_string(),
+                timestamp: None,
+                output: serde_json::json!("permission denied"),
+                is_error: true,
+                metadata: BTreeMap::new(),
+            }),
+            msg("assistant", "could not list them"),
+        ];
+        let out = unique_tmp().join("ses_0123456789abcdef01234567.json");
+        let written = formats::materialize(&session, SessionFormat::OpenCode, &out).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&written).unwrap()).unwrap();
+
+        let info = &doc["info"];
+        assert_eq!(info["location"]["directory"], "/tmp/constant-oc2");
+        assert!(info["cost"].is_number() && info["tokens"]["cache"].is_object(), "{info}");
+        let types: Vec<&str> = doc["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["user", "assistant", "assistant"]);
+        let tool = &doc["messages"][1]["content"][0];
+        assert_eq!(tool["type"], "tool");
+        assert_eq!(tool["state"]["status"], "error");
+        assert_eq!(tool["state"]["input"], serde_json::json!({"input": "ls -la"}));
+        assert_eq!(tool["state"]["error"]["message"], "permission denied");
+
+        let back = formats::load_session(&written, SourceFormat::Auto).unwrap();
+        let turns = back
+            .events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Message(_)))
+            .count();
+        let tools = back
+            .events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolCall(_) | SessionEvent::ToolResult(_)))
+            .count();
+        assert_eq!((turns, tools), (2, 2));
+    }
 
     #[test]
     fn opencode_parse_export_tolerates_status_trailer() {

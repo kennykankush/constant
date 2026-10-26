@@ -3,6 +3,32 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **OpenCode 2.x.** OpenCode 2.0 replaced its session format, its commands
+  and its tables, so carries into and out of it failed on 2.0. Constant now
+  reads and writes the 2.x shape (typed messages; tool output as a content
+  list; failures as a structured error), runs `opencode session
+  import|export --standalone`, and reads the `session_v2` /
+  `session_message` tables. OpenCode 1.x keeps working through the old path,
+  chosen by the installed version. Validated on 2.0.28: carries in both
+  directions, resumed by the real runtimes.
+
+### Fixed
+- **Carrying Codex tools into Claude broke the resume.** Codex's freeform
+  tools (`custom_tool_call`) store their input as a plain string, and Claude
+  rejects any tool input that is not an object (`API Error 400 ...
+  tool_use.input: Input should be an object`). Non-object input is now
+  wrapped as `{"input": ...}`.
+- **Carried tool history is valid for every target.** Each tool result now
+  follows its call directly (Codex logs parallel calls as call, call, output,
+  output), and a call that never got a result, such as a switch while a tool
+  was still running, is dropped and counted under `dropped_tools` instead of
+  being sent unanswered.
+- **OpenCode 2.x's version was not detected** (`opencode v2.0.28`), so
+  `constant doctor` and the version warning saw no OpenCode at all.
+
 ## [0.7.0] - Runtime catch-up
 
 Codex, Claude Code, OpenCode and Gemini all moved since 0.6.1 (codex 0.145 →
