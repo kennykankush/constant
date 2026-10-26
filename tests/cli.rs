@@ -1978,6 +1978,65 @@ fn carry_with_tools_keeps_redacted_tool_history() {
     );
 }
 
+#[test]
+fn carry_with_tools_codex_freeform_input_becomes_claude_object() {
+    // Codex freeform tools (`custom_tool_call`) store `input` as a raw string,
+    // and `function_call.arguments` can be non-JSON. Claude's API rejects any
+    // `tool_use.input` that is not an object, so every one must be wrapped.
+    let dir = tmpdir();
+    let id = "01970000-0000-7000-8000-0000000000f1";
+    let src = dir.join(format!("rollout-2026-06-01T10-00-00-{id}.jsonl"));
+    let lines = [
+        format!(
+            r#"{{"timestamp":"2026-06-01T10:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-06-01T10:00:00.000Z","cwd":"/tmp/constant-cli-proj","originator":"codex-tui","cli_version":"0.162.1","source":"cli"}}}}"#
+        ),
+        r#"{"timestamp":"2026-06-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list the files"}]}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_free","name":"exec","input":"ls -la"}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_free","output":"a.txt"}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:04.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call_raw","name":"shell","arguments":"not json"}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_raw","output":"ok"}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"one file: a.txt"}]}}"#.to_string(),
+    ];
+    std::fs::write(&src, lines.join("\n") + "\n").unwrap();
+
+    let c = run(
+        &dir,
+        &[
+            "carry",
+            "--to",
+            "claude",
+            "--session",
+            src.to_str().unwrap(),
+            "--json",
+            "--new",
+            "--with-tools",
+        ],
+    );
+    assert!(c.status.success(), "{}", err(&c));
+    let v: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+    assert_eq!(v["receipt"]["tools"].as_u64(), Some(4), "{v}");
+
+    let path = find_claude_projection(&dir, v["id"].as_str().unwrap()).expect("projection");
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut inputs = Vec::new();
+    for line in text.lines() {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(blocks) = rec["message"]["content"].as_array() {
+            for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                assert!(b["input"].is_object(), "tool_use.input not an object: {line}");
+                inputs.push(b["input"].clone());
+            }
+        }
+    }
+    assert_eq!(
+        inputs,
+        vec![
+            serde_json::json!({ "input": "ls -la" }),
+            serde_json::json!({ "input": "not json" }),
+        ]
+    );
+}
+
 // --- constant resume: the ledger as the front door ---
 
 #[test]
