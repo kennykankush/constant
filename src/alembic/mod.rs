@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
 use crate::runtime::Runtime;
-use ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
+use ir::{SessionEvent, SessionFormat, SourceFormat, ToolResultEvent, UniversalSession};
 
 /// Identify a session file: which runtime it belongs to and its native id.
 /// Used by the headless `carry` to label the trail correctly for any source.
@@ -1303,8 +1303,50 @@ fn sanitize(session: &mut UniversalSession, keep_tools: bool) -> CarryReceipt {
         receipt.turns += 1;
         kept.push(SessionEvent::Message(message));
     }
-    session.events = kept;
+    session.events = pair_tool_events(kept, &mut receipt);
     receipt
+}
+
+/// Make carried tool history valid for every target API, not just the ones
+/// that repair it on resume: each result sits right after its call (codex
+/// logs parallel calls as call, call, output, output), and a call that never
+/// got a result (a switch while a tool was still running) or a result with no
+/// call is dropped and counted, never sent.
+fn pair_tool_events(events: Vec<SessionEvent>, receipt: &mut CarryReceipt) -> Vec<SessionEvent> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut results: HashMap<String, VecDeque<ToolResultEvent>> = HashMap::new();
+    let mut rest = Vec::with_capacity(events.len());
+    let mut unpaired = 0;
+    for event in events {
+        match event {
+            SessionEvent::ToolResult(result) if !result.call_id.is_empty() => results
+                .entry(result.call_id.clone())
+                .or_default()
+                .push_back(result),
+            SessionEvent::ToolResult(_) => unpaired += 1,
+            other => rest.push(other),
+        }
+    }
+    let mut paired = Vec::with_capacity(rest.len());
+    for event in rest {
+        match event {
+            SessionEvent::ToolCall(call) => {
+                match results.get_mut(&call.call_id).and_then(VecDeque::pop_front) {
+                    Some(result) => {
+                        paired.push(SessionEvent::ToolCall(call));
+                        paired.push(SessionEvent::ToolResult(result));
+                    }
+                    None => unpaired += 1,
+                }
+            }
+            other => paired.push(other),
+        }
+    }
+    unpaired += results.values().map(VecDeque::len).sum::<usize>();
+    receipt.tools -= unpaired;
+    receipt.dropped_tools += unpaired;
+    paired
 }
 
 /// Redact every string anywhere inside a JSON value (tool arguments/outputs
@@ -2484,6 +2526,67 @@ mod tests {
         assert!(json.contains("tool_result"), "tool result lost: {json}");
         assert!(!json.contains("sk-ARGLEAK"), "argument secret leaked: {json}");
         assert!(!json.contains("sk-OUTLEAK"), "output secret leaked: {json}");
+    }
+
+    #[test]
+    fn sanitize_pairs_parallel_calls_and_counts_unanswered_ones() {
+        let call = |id: &str| {
+            SessionEvent::ToolCall(ir::ToolCallEvent {
+                id: None,
+                parent_id: None,
+                call_id: id.to_string(),
+                name: "read".to_string(),
+                timestamp: None,
+                arguments: serde_json::json!({}),
+                metadata: BTreeMap::new(),
+            })
+        };
+        let result = |id: &str| {
+            SessionEvent::ToolResult(ir::ToolResultEvent {
+                id: None,
+                parent_id: None,
+                call_id: id.to_string(),
+                timestamp: None,
+                output: serde_json::json!("ok"),
+                is_error: false,
+                metadata: BTreeMap::new(),
+            })
+        };
+        let mut session = UniversalSession::new("t-0002".to_string());
+        session.events = vec![
+            msg("user", "read a and b"),
+            call("a"),
+            call("b"),
+            result("a"),
+            result("b"),
+            result("stray"),
+            msg("assistant", "done"),
+            call("tail"),
+        ];
+        let receipt = sanitize(&mut session, true);
+        assert_eq!(receipt.tools, 4, "{receipt:?}");
+        assert_eq!(receipt.dropped_tools, 2, "{receipt:?}");
+        let order: Vec<String> = session
+            .events
+            .iter()
+            .map(|e| match e {
+                SessionEvent::ToolCall(c) => format!("call:{}", c.call_id),
+                SessionEvent::ToolResult(r) => format!("result:{}", r.call_id),
+                SessionEvent::Message(m) => format!("msg:{}", m.role),
+                SessionEvent::Reasoning(_) => "reasoning".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "msg:user",
+                "call:a",
+                "result:a",
+                "call:b",
+                "result:b",
+                "msg:assistant"
+            ]
+        );
     }
 
     #[test]

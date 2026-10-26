@@ -2037,6 +2037,257 @@ fn carry_with_tools_codex_freeform_input_becomes_claude_object() {
     );
 }
 
+// --- with-tools matrix: every source x {claude, codex}, checked against the
+//     target API's tool rules (what resume will actually send), not just the
+//     presence of tool records. Seeds are REAL source formats and include the
+//     shapes that break carries: freeform string input, parallel calls, and a
+//     call with no result (a live switch while a tool is still running). ---
+
+/// Write one seed per source format. Returns (source label, path, number of
+/// tool events the source loader yields — calls + results).
+fn tool_matrix_seeds(dir: &Path) -> Vec<(&'static str, PathBuf, u64)> {
+    let cwd = "/tmp/constant-cli-proj";
+    let mut seeds = Vec::new();
+
+    let codex_id = "01970000-0000-7000-8000-0000000000e1";
+    let codex = dir.join(format!("rollout-2026-06-01T10-00-00-{codex_id}.jsonl"));
+    let item = |t: u32, payload: &str| {
+        format!(
+            r#"{{"timestamp":"2026-06-01T10:00:{t:02}.000Z","type":"response_item","payload":{payload}}}"#
+        )
+    };
+    let lines = [
+        format!(
+            r#"{{"timestamp":"2026-06-01T10:00:00.000Z","type":"session_meta","payload":{{"id":"{codex_id}","timestamp":"2026-06-01T10:00:00.000Z","cwd":"{cwd}","originator":"codex-tui","cli_version":"0.162.1","source":"cli"}}}}"#
+        ),
+        item(1, r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect a and b"}]}"#),
+        item(2, r#"{"type":"custom_tool_call","call_id":"call_free","name":"exec","input":"ls -la"}"#),
+        item(3, r#"{"type":"custom_tool_call_output","call_id":"call_free","output":"a b"}"#),
+        item(4, r#"{"type":"function_call","call_id":"call_a","name":"read","arguments":"{\"path\":\"a\"}"}"#),
+        item(5, r#"{"type":"function_call","call_id":"call_b","name":"read","arguments":"{\"path\":\"b\"}"}"#),
+        item(6, r#"{"type":"function_call_output","call_id":"call_a","output":"A"}"#),
+        item(7, r#"{"type":"function_call_output","call_id":"call_b","output":"B"}"#),
+        item(8, r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a says A, b says B"}]}"#),
+        item(9, r#"{"type":"function_call","call_id":"call_tail","name":"shell","arguments":"{\"cmd\":\"make\"}"}"#),
+    ];
+    std::fs::write(&codex, lines.join("\n") + "\n").unwrap();
+    seeds.push(("codex", codex, 7));
+
+    let claude = dir.join("11111111-2222-4333-8444-555555555555.jsonl");
+    let sid = "11111111-2222-4333-8444-555555555555";
+    let line = |uuid: &str, parent: Option<&str>, kind: &str, t: u32, message: &str| {
+        let parent = parent.map_or("null".to_string(), |p| format!("\"{p}\""));
+        format!(
+            r#"{{"parentUuid":{parent},"isSidechain":false,"userType":"external","cwd":"{cwd}","sessionId":"{sid}","version":"2.1.289","type":"{kind}","message":{message},"uuid":"{uuid}","timestamp":"2026-06-01T10:00:{t:02}.000Z"}}"#
+        )
+    };
+    let lines = [
+        line("u1", None, "user", 1, r#"{"role":"user","content":"read the config"}"#),
+        line("a1", Some("u1"), "assistant", 2, r#"{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"reading"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/tmp/c"}}]}"#),
+        line("u2", Some("a1"), "user", 3, r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"k=v"}]}"#),
+        line("a2", Some("u2"), "assistant", 4, r#"{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"make"}}]}"#),
+    ];
+    std::fs::write(&claude, lines.join("\n") + "\n").unwrap();
+    seeds.push(("claude", claude, 3));
+
+    let opencode = dir.join("opencode-tools-export.json");
+    let body = format!(
+        r#"{{
+  "info": {{ "id": "ses_0123456789abcdefTOOLS001", "slug": "tools", "projectID": "global",
+            "directory": "{cwd}", "title": "tools", "version": "1.18.31",
+            "time": {{"created": 1778707096618, "updated": 1778707193869}} }},
+  "messages": [
+    {{ "info": {{ "id": "msg_a", "role": "user", "time": {{"created": 1778707096634}} }},
+      "parts": [ {{ "type": "text", "text": "build it" }} ] }},
+    {{ "info": {{ "id": "msg_b", "role": "assistant", "time": {{"created": 1778707097000}} }},
+      "parts": [
+        {{ "type": "tool", "tool": "bash", "callID": "call_ok", "id": "prt_1",
+           "state": {{"status": "completed", "input": {{"command": "ls"}}, "output": "a b"}} }},
+        {{ "type": "tool", "tool": "bash", "callID": "call_run", "id": "prt_2",
+           "state": {{"status": "running", "input": {{"command": "make"}}}} }},
+        {{ "type": "text", "text": "building", "id": "prt_3" }}
+      ] }}
+  ]
+}}"#
+    );
+    std::fs::write(&opencode, body).unwrap();
+    seeds.push(("opencode", opencode, 4));
+
+    let gemini = dir.join("gemini-tools.json");
+    let body = r#"{
+  "sessionId": "abc12345-0000-0000-0000-0000000000e2",
+  "projectHash": "deadbeef", "startTime": "2026-06-01T10:00:00.000Z",
+  "lastUpdated": "2026-06-01T10:05:00.000Z", "kind": "main",
+  "messages": [
+    {"id":"m1","timestamp":"2026-06-01T10:00:01.000Z","type":"user","content":[{"text":"list then build"}]},
+    {"id":"m2","timestamp":"2026-06-01T10:00:05.000Z","type":"gemini","content":"on it",
+     "toolCalls":[
+       {"id":"run_shell_command-1-a","name":"run_shell_command","args":{"command":"ls"},"result":[{"ok":true}],"status":"success"},
+       {"id":"run_shell_command-2-b","name":"run_shell_command","args":{"command":"make"},"status":"executing"}
+     ],
+     "model":"gemini-3-pro"}
+  ]
+}"#;
+    std::fs::write(&gemini, body).unwrap();
+    seeds.push(("gemini", gemini, 3));
+
+    seeds
+}
+
+/// The Claude API's tool rules, applied to a written projection the way
+/// Claude Code will send it: consecutive user records merge into one message;
+/// assistant records are checked one by one (the strict reading).
+fn claude_tool_violations(text: &str) -> Vec<String> {
+    let id_ok = |id: &str| {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    // (role, tool_use ids, tool_result ids)
+    let mut msgs: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    let mut bad = Vec::new();
+    for line in text.lines() {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        let role = rec["message"]["role"].as_str().unwrap_or_default().to_string();
+        if role.is_empty() {
+            continue;
+        }
+        let (mut uses, mut results) = (Vec::new(), Vec::new());
+        for b in rec["message"]["content"].as_array().into_iter().flatten() {
+            match b["type"].as_str() {
+                Some("tool_use") => {
+                    let id = b["id"].as_str().unwrap_or_default().to_string();
+                    if !b["input"].is_object() {
+                        bad.push(format!("tool_use {id}: input not an object"));
+                    }
+                    if !id_ok(&id) {
+                        bad.push(format!("tool_use id {id:?} fails ^[a-zA-Z0-9_-]+$"));
+                    }
+                    uses.push(id);
+                }
+                Some("tool_result") => {
+                    results.push(b["tool_use_id"].as_str().unwrap_or_default().to_string())
+                }
+                _ => {}
+            }
+        }
+        match msgs.last_mut() {
+            Some(last) if role == "user" && last.0 == "user" => {
+                last.1.extend(uses);
+                last.2.extend(results);
+            }
+            _ => msgs.push((role, uses, results)),
+        }
+    }
+    for (i, (role, uses, results)) in msgs.iter().enumerate() {
+        if role == "assistant" && !uses.is_empty() {
+            let next = msgs.get(i + 1).filter(|m| m.0 == "user");
+            for id in uses {
+                if !next.is_some_and(|m| m.2.contains(id)) {
+                    bad.push(format!("tool_use {id}: no tool_result in the next message"));
+                }
+            }
+        }
+        if role == "user" {
+            let prev = i.checked_sub(1).map(|j| &msgs[j]).filter(|m| m.0 == "assistant");
+            for id in results {
+                if !prev.is_some_and(|m| m.1.contains(id)) {
+                    bad.push(format!("tool_result {id}: no tool_use in the previous message"));
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// The Responses API's tool rules for a written codex rollout: every call has
+/// a call_id and string arguments, every call is answered, every output
+/// answers an earlier call.
+fn codex_tool_violations(text: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        let p = &rec["payload"];
+        let id = p["call_id"].as_str().unwrap_or_default().to_string();
+        match p["type"].as_str() {
+            Some("function_call") | Some("custom_tool_call") => {
+                if id.is_empty() {
+                    bad.push("call with empty call_id".to_string());
+                }
+                if p["type"] == "function_call" && !p["arguments"].is_string() {
+                    bad.push(format!("function_call {id}: arguments not a string"));
+                }
+                open.push(id.clone());
+                seen.push(id);
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                if !seen.contains(&id) {
+                    bad.push(format!("output {id}: no earlier call"));
+                }
+                open.retain(|o| o != &id);
+            }
+            _ => {}
+        }
+    }
+    bad.extend(open.into_iter().map(|id| format!("call {id}: never answered")));
+    bad
+}
+
+#[test]
+fn carry_with_tools_matrix_satisfies_each_target_api() {
+    let dir = tmpdir();
+    let mut failures = Vec::new();
+    for (source, path, tool_events) in tool_matrix_seeds(&dir) {
+        for target in ["claude", "codex"] {
+            if source == target {
+                continue;
+            }
+            let cell = format!("{source} -> {target}");
+            let c = run(
+                &dir,
+                &[
+                    "carry",
+                    "--to",
+                    target,
+                    "--session",
+                    path.to_str().unwrap(),
+                    "--json",
+                    "--new",
+                    "--with-tools",
+                ],
+            );
+            if !c.status.success() {
+                failures.push(format!("{cell}: carry failed: {}", err(&c)));
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+            assert_eq!(v["from"].as_str(), Some(source), "{cell}: {v}");
+            // Lossiness is declared: every source tool event is kept or counted.
+            let kept = v["receipt"]["tools"].as_u64().unwrap_or(0);
+            let dropped = v["receipt"]["dropped_tools"].as_u64().unwrap_or(0);
+            if kept + dropped != tool_events {
+                failures.push(format!(
+                    "{cell}: receipt accounts for {} of {tool_events} tool events",
+                    kept + dropped
+                ));
+            }
+            if kept == 0 {
+                failures.push(format!("{cell}: no tools carried"));
+            }
+            let text = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+            let bad = match target {
+                "claude" => claude_tool_violations(&text),
+                _ => codex_tool_violations(&text),
+            };
+            failures.extend(bad.into_iter().map(|b| format!("{cell}: {b}")));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 // --- constant resume: the ledger as the front door ---
 
 #[test]
