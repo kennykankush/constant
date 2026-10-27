@@ -718,13 +718,20 @@ fn emit_event_line(
         }
         SessionEvent::ToolCall(call) => {
             let event_uuid = Uuid::new_v4().to_string();
+            // The API rejects a non-object `tool_use.input` on resume; codex
+            // freeform tools carry a raw string, so wrap anything else.
+            let input = match &call.arguments {
+                Value::Object(_) => call.arguments.clone(),
+                Value::Null => json!({}),
+                other => json!({ "input": other }),
+            };
             let assistant_message = claude_assistant_message(
                 model,
                 json!([{
                     "type": "tool_use",
                     "id": call.call_id,
                     "name": call.name,
-                    "input": call.arguments,
+                    "input": input,
                     "caller": { "type": "direct" },
                 }]),
                 Value::String("tool_use".to_string()),

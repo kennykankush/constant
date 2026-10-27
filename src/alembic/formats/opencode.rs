@@ -10,6 +10,14 @@
 //! Loader tolerance: `opencode export` appends a status line AFTER the JSON on
 //! stdout; files captured from it may carry that trailer — slice to the last
 //! closing brace before parsing.
+//!
+//! OpenCode 2.x (`opencode session export|import`) replaced the shape: session
+//! `info` carries `location.directory`, `cost` and `tokens`, and `messages` is
+//! a flat tagged union (`{type: "user", text}`, `{type: "assistant", content:
+//! [text | reasoning | tool]}`, plus runtime-only kinds like `idle`). A tool's
+//! output is a `content` array, a failure a structured `error`. The reader
+//! accepts both shapes; the writer emits the one the target's version takes
+//! (read from `platform_version`, which alembic stamps from `--version`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -38,6 +46,16 @@ pub fn parse_export(text: &str) -> Result<UniversalSession> {
     let v: Value = serde_json::from_str(json).context("failed to parse export JSON")?;
     let info = v.get("info").context("export missing `info`")?;
 
+    let messages = v
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let v2 = info.get("location").is_some()
+        || messages
+            .iter()
+            .any(|m| m.get("info").is_none() && m.get("type").is_some());
+
     let session_id = info
         .get("id")
         .and_then(Value::as_str)
@@ -51,7 +69,9 @@ pub fn parse_export(text: &str) -> Result<UniversalSession> {
         .and_then(Value::as_str)
         .map(str::to_string);
     session.metadata.cwd = info
-        .get("directory")
+        .get("location")
+        .and_then(|l| l.get("directory"))
+        .or_else(|| info.get("directory"))
         .and_then(Value::as_str)
         .map(PathBuf::from);
     session.metadata.platform_version = info
@@ -69,16 +89,164 @@ pub fn parse_export(text: &str) -> Result<UniversalSession> {
         .and_then(Value::as_i64)
         .and_then(ms_to_datetime);
 
-    for m in v
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|a| a.as_slice())
-        .unwrap_or(&[])
-    {
-        import_message(&mut session, m);
+    for m in messages {
+        if v2 {
+            import_message_v2(&mut session, m);
+        } else {
+            import_message(&mut session, m);
+        }
     }
 
     Ok(session)
+}
+
+/// One 2.x message. Only `user` and `assistant` are conversation; the other
+/// kinds (`synthetic`, `system`, `idle`, `compaction`, `shell`, selections…)
+/// are opencode's own bookkeeping and injections, like 1.x synthetic parts.
+fn import_message_v2(session: &mut UniversalSession, m: &Value) {
+    let timestamp = m
+        .get("time")
+        .and_then(|t| t.get("created"))
+        .and_then(Value::as_i64)
+        .and_then(ms_to_datetime);
+    let msg_id = m.get("id").and_then(Value::as_str).map(str::to_string);
+    let message = |role: &str, blocks: Vec<ContentBlock>, metadata| {
+        SessionEvent::Message(MessageEvent {
+            id: msg_id.clone(),
+            parent_id: None,
+            role: role.to_string(),
+            timestamp,
+            blocks,
+            metadata,
+        })
+    };
+
+    match m.get("type").and_then(Value::as_str) {
+        Some("user") => {
+            if let Some(t) = m.get("text").and_then(Value::as_str)
+                && !t.trim().is_empty()
+            {
+                let event = message("user", vec![ContentBlock::text("text", t)], BTreeMap::new());
+                session.events.push(event);
+            }
+        }
+        Some("assistant") => {
+            let model = m.get("model").and_then(|x| x.get("id")).cloned();
+            if session.metadata.model.is_none()
+                && let Some(Value::String(id)) = &model
+            {
+                session.metadata.model = Some(id.clone());
+            }
+            let mut metadata = BTreeMap::new();
+            if let Some(model) = model {
+                metadata.insert("model".to_string(), model);
+            }
+            // Text runs flush before a tool, so the carried order is the
+            // order the assistant actually produced them in.
+            let mut text_blocks: Vec<ContentBlock> = Vec::new();
+            for c in m
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
+                match c.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = c.get("text").and_then(Value::as_str) {
+                            text_blocks.push(ContentBlock::text("text", t));
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(t) = c.get("text").and_then(Value::as_str)
+                            && !t.trim().is_empty()
+                        {
+                            session.events.push(SessionEvent::Reasoning(ReasoningEvent {
+                                id: None,
+                                parent_id: msg_id.clone(),
+                                timestamp,
+                                summary: vec![t.to_string()],
+                                metadata: BTreeMap::new(),
+                            }));
+                        }
+                    }
+                    Some("tool") => {
+                        if !text_blocks.is_empty() {
+                            let blocks = std::mem::take(&mut text_blocks);
+                            session.events.push(message("assistant", blocks, metadata.clone()));
+                        }
+                        import_tool_v2(session, c, msg_id.clone(), timestamp);
+                    }
+                    _ => {}
+                }
+            }
+            if !text_blocks.is_empty() {
+                session.events.push(message("assistant", text_blocks, metadata));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A 2.x tool: the call always; the result only once the tool settled
+/// (`completed` / `error`) — a `running` or `streaming` tool has none yet.
+fn import_tool_v2(
+    session: &mut UniversalSession,
+    c: &Value,
+    msg_id: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let call_id = c
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let state = c.get("state").cloned().unwrap_or(Value::Null);
+    session.events.push(SessionEvent::ToolCall(ToolCallEvent {
+        id: None,
+        parent_id: msg_id.clone(),
+        call_id: call_id.clone(),
+        name: c
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        timestamp,
+        arguments: state.get("input").cloned().unwrap_or(Value::Null),
+        metadata: BTreeMap::new(),
+    }));
+    let status = state.get("status").and_then(Value::as_str);
+    if !matches!(status, Some("completed") | Some("error")) {
+        return;
+    }
+    // Output is a content array; carry its text (the model-visible part).
+    let text = |content: &Value| -> Option<Value> {
+        let items = content.as_array()?;
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i.get("text").and_then(Value::as_str))
+            .collect();
+        Some(if texts.is_empty() {
+            content.clone()
+        } else {
+            Value::String(texts.join("\n"))
+        })
+    };
+    let output = match status {
+        Some("error") => state
+            .get("error")
+            .and_then(|e| e.get("message").cloned().or_else(|| Some(e.clone())))
+            .unwrap_or(Value::Null),
+        _ => state.get("content").and_then(text).unwrap_or(Value::Null),
+    };
+    session.events.push(SessionEvent::ToolResult(ToolResultEvent {
+        id: None,
+        parent_id: msg_id,
+        call_id,
+        timestamp,
+        output,
+        is_error: status == Some("error"),
+        metadata: BTreeMap::new(),
+    }));
 }
 
 fn import_message(session: &mut UniversalSession, m: &Value) {
@@ -198,7 +366,11 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let doc = build_export(session);
+    let doc = if is_v2(session.metadata.platform_version.as_deref()) {
+        build_export_v2(session)
+    } else {
+        build_export(session)
+    };
     let text = serde_json::to_string_pretty(&doc).context("failed to encode OpenCode export")?;
 
     // Atomic, like every materialization.
@@ -424,6 +596,168 @@ fn build_export(session: &UniversalSession) -> Value {
                 .unwrap_or_else(|| "1.14.48".to_string()),
             "summary": {"additions": 0, "deletions": 0, "files": 0},
             "time": {"created": created, "updated": updated.max(clock)},
+        },
+        "messages": messages,
+    })
+}
+
+/// Whether an opencode version takes the 2.x session shape.
+pub(crate) fn is_v2(version: Option<&str>) -> bool {
+    version
+        .and_then(|v| v.trim_start_matches('v').split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
+/// The 2.x import document (`SessionTransfer.Data`): session info + a flat
+/// list of typed messages. Same ordering rules as 1.x — strictly increasing
+/// times, ascending ids — and tool calls still wait for their result, then
+/// ride on the surrounding assistant message as one `tool` content item.
+fn build_export_v2(session: &UniversalSession) -> Value {
+    let created = session
+        .metadata
+        .created_at
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let updated = session
+        .metadata
+        .updated_at
+        .map(|t| t.timestamp_millis())
+        .unwrap_or(created);
+    let directory = session
+        .metadata
+        .cwd
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let title = session
+        .metadata
+        .title
+        .clone()
+        .unwrap_or_else(|| "carried conversation".to_string());
+    let model = json!({
+        "id": session.metadata.model.clone().unwrap_or_else(|| "carried".to_string()),
+        "providerID": "constant",
+    });
+    let assistant = |id: String, ts: i64, content: Vec<Value>| {
+        json!({
+            "id": id,
+            "time": {"created": ts, "completed": ts},
+            "type": "assistant",
+            "agent": "build",
+            "model": model,
+            "content": content,
+        })
+    };
+
+    let mut messages: Vec<Value> = Vec::new();
+    let mut clock = created - 1;
+    let mut ids = IdClock::default();
+    let mut current_ts = created;
+    let mut pending_calls: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    let mut current_assistant: Option<usize> = None;
+
+    for event in &session.events {
+        match event {
+            SessionEvent::Message(msg) => {
+                let text = msg
+                    .blocks
+                    .iter()
+                    .filter_map(|b| b.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let ts = msg
+                    .timestamp
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(clock)
+                    .max(clock + 1);
+                clock = ts;
+                current_ts = ts;
+                let id = ids.next("msg", ts);
+                if msg.role == "assistant" {
+                    messages.push(assistant(id, ts, vec![json!({"type": "text", "text": text})]));
+                    current_assistant = Some(messages.len() - 1);
+                } else {
+                    messages.push(json!({
+                        "id": id,
+                        "time": {"created": ts},
+                        "text": text,
+                        "files": [],
+                        "type": "user",
+                    }));
+                    current_assistant = None;
+                }
+            }
+            SessionEvent::ToolCall(call) => {
+                pending_calls.insert(
+                    call.call_id.clone(),
+                    (call.name.clone(), call.arguments.clone()),
+                );
+            }
+            SessionEvent::ToolResult(result) => {
+                let (name, input) = pending_calls
+                    .remove(&result.call_id)
+                    .unwrap_or_else(|| ("unknown".to_string(), Value::Null));
+                let output = match &result.output {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let input = match input {
+                    Value::Object(_) => input,
+                    Value::Null => json!({}),
+                    other => json!({ "input": other }),
+                };
+                let state = if result.is_error {
+                    json!({
+                        "status": "error",
+                        "input": input,
+                        "error": {"type": "tool", "message": output},
+                    })
+                } else {
+                    json!({
+                        "status": "completed",
+                        "input": input,
+                        "content": [{"type": "text", "text": output}],
+                    })
+                };
+                let idx = match current_assistant {
+                    Some(i) => i,
+                    None => {
+                        clock += 1;
+                        current_ts = clock;
+                        messages.push(assistant(ids.next("msg", clock), clock, Vec::new()));
+                        current_assistant = Some(messages.len() - 1);
+                        messages.len() - 1
+                    }
+                };
+                messages[idx]["content"]
+                    .as_array_mut()
+                    .expect("content array")
+                    .push(json!({
+                        "type": "tool",
+                        "id": result.call_id,
+                        "name": name,
+                        "state": state,
+                        "time": {"created": current_ts, "completed": current_ts},
+                    }));
+            }
+            // Reasoning never crosses runtimes.
+            SessionEvent::Reasoning(_) => {}
+        }
+    }
+
+    json!({
+        "info": {
+            "id": session.metadata.session_id,
+            "projectID": "global",
+            "title": title,
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}},
+            "time": {"created": created, "updated": updated.max(clock)},
+            "location": {"directory": directory},
         },
         "messages": messages,
     })
