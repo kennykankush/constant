@@ -3,7 +3,7 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] - OpenCode 2.x and tool-history fixes
 
 ### Added
 - **OpenCode 2.x.** OpenCode 2.0 replaced its session format, its commands
