@@ -49,6 +49,8 @@ impl Runtime {
             _ => vec![],
         };
         args.extend(self.isolation_flags());
+        let model = self.model_flags();
+        args.extend(model.iter().map(String::as_str));
         if yolo && let Some(flag) = self.yolo_flag() {
             args.push(flag);
         }
@@ -65,6 +67,8 @@ impl Runtime {
             Runtime::OpenCode => vec!["-s", session_id],
         };
         args.extend(self.isolation_flags());
+        let model = self.model_flags();
+        args.extend(model.iter().map(String::as_str));
         if yolo && let Some(flag) = self.yolo_flag() {
             args.push(flag);
         }
@@ -81,9 +85,24 @@ impl Runtime {
             Runtime::Gemini => format!("gemini --resume {session_id}"),
             Runtime::OpenCode => format!("opencode -s {session_id}"),
         };
+        let model = self.model_flags();
         self.isolation_flags()
             .iter()
+            .copied()
+            .chain(model.iter().map(String::as_str))
             .fold(base, |cmd, flag| format!("{cmd} {flag}"))
+    }
+
+    /// `--model <m>` for claude when `CONSTANT_CLAUDE_MODEL` pins one (an alias
+    /// like `sonnet` or a full id). Unset, claude resumes a carried session on
+    /// the user's own default model (see the claude writer's CARRIED_MODEL).
+    fn model_flags(self) -> Vec<String> {
+        match self {
+            Runtime::Claude => claude_model_pin(std::env::var("CONSTANT_CLAUDE_MODEL").ok())
+                .map(|m| vec!["--model".to_string(), m])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// Flags that keep a Constant-hosted child reading its session from disk.
@@ -127,6 +146,12 @@ impl Runtime {
     }
 }
 
+/// A usable `CONSTANT_CLAUDE_MODEL` value: trimmed, non-empty, one word.
+fn claude_model_pin(raw: Option<String>) -> Option<String> {
+    let m = raw?.trim().to_string();
+    (!m.is_empty() && !m.contains(char::is_whitespace)).then_some(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +161,18 @@ mod tests {
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn claude_model_pin_accepts_one_word_and_ignores_blank() {
+        assert_eq!(claude_model_pin(Some(" sonnet ".into())), Some("sonnet".into()));
+        assert_eq!(
+            claude_model_pin(Some("claude-opus-5-5".into())),
+            Some("claude-opus-5-5".into())
+        );
+        assert_eq!(claude_model_pin(Some("  ".into())), None);
+        assert_eq!(claude_model_pin(Some("opus; rm".into())), None);
+        assert_eq!(claude_model_pin(None), None);
     }
 
     #[test]

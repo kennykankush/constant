@@ -21,6 +21,17 @@ pub struct ClaudeMaterialization {
 /// Scratch key for the latest `aiTitle` while loading (never leaves `load`).
 const AI_TITLE: &str = "claude_ai_title";
 
+/// The `model` stamped on every assistant record Constant writes. Claude Code
+/// resumes on the model named by the session's last assistant record when it
+/// is a full model id, and otherwise on the user's own default (settings or
+/// `/model`). A carried turn was not produced by this Claude call, so it gets
+/// Claude Code's own marker for that, and the resume follows the user's
+/// current default instead of a model pinned at carry time. Verified on
+/// 2.1.289: a full id is honored; `<synthetic>`, an alias, or no model falls
+/// back to the default, with the carried turns still in context. To pin a
+/// model, `CONSTANT_CLAUDE_MODEL` adds `--model` at launch.
+const CARRIED_MODEL: &str = "<synthetic>";
+
 pub fn load(path: &Path) -> Result<UniversalSession> {
     let file = File::open(path)
         .with_context(|| format!("failed to open Claude session {}", path.display()))?;
@@ -518,17 +529,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         .platform_version
         .clone()
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    // Synthetic assistant records carry the source conversation's real claude
-    // model when known (alembic hoists it into `claude_model` before sanitize
-    // clears per-message metadata) instead of claiming a model that never
-    // produced them.
-    let model = session
-        .metadata
-        .extra
-        .get("claude_model")
-        .and_then(Value::as_str)
-        .unwrap_or("claude-opus-4-8")
-        .to_string();
+    let model = CARRIED_MODEL;
 
     // Atomic materialization (B1): the projection may be the only copy of the
     // conversation's newest turns, so never truncate it in place. Write a
@@ -558,7 +559,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         cwd: cwd.as_path(),
         git_branch: &git_branch,
         version: &version,
-        model: &model,
+        model,
     };
     let mut previous_uuid: Option<String> = None;
     let mut tool_call_to_uuid = BTreeMap::new();
@@ -814,18 +815,7 @@ pub fn append(existing: &Path, delta: &UniversalSession) -> Result<PathBuf> {
     let cwd = PathBuf::from(field("cwd").unwrap_or_else(|| ".".to_string()));
     let git_branch = field("gitBranch").unwrap_or_else(|| "HEAD".to_string());
     let version = field("version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let model = lines
-        .iter()
-        .rev()
-        .find_map(|l| {
-            serde_json::from_str::<Value>(l).ok().and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.get("model"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "claude-opus-4-8".to_string());
+    let model = CARRIED_MODEL;
     // Chain from the last line that actually carries a uuid — a Claude
     // projection's final line is often a non-turn record (the custom-title), and
     // chaining `parentUuid` to it would orphan the appended turns.
@@ -840,7 +830,7 @@ pub fn append(existing: &Path, delta: &UniversalSession) -> Result<PathBuf> {
         cwd: cwd.as_path(),
         git_branch: &git_branch,
         version: &version,
-        model: &model,
+        model,
     };
 
     // Atomic append: copy the existing bytes verbatim, then emit the delta — the
