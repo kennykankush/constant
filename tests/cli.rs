@@ -2085,6 +2085,18 @@ fn carry_with_tools_codex_freeform_input_becomes_claude_object() {
 }
 
 #[test]
+fn skill_prints_the_built_in_agent_guide() {
+    let dir = tmpdir();
+    let c = run(&dir, &["--skill"]);
+    assert!(c.status.success(), "{}", err(&c));
+    let text = out(&c);
+    assert!(text.starts_with("---\nname: constant\n"), "{text}");
+    assert!(text.contains("CLAUDE_CODE_SESSION_ID") && text.contains("CODEX_THREAD_ID"));
+    let help = run(&dir, &["--help"]);
+    assert!(out(&help).contains("constant --skill"));
+}
+
+#[test]
 fn carried_claude_session_resumes_on_the_users_model_not_a_stamped_one() {
     // Claude Code resumes on the model named by the last assistant record when
     // it is a full id. A codex thread has no claude model, and a hardcoded one

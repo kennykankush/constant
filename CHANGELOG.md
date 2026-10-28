@@ -3,6 +3,16 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **A built-in guide for agents.** `constant --skill` prints a skill file
+  that teaches an agent CLI to use Constant itself: carry its own thread with
+  `$CLAUDE_CODE_SESSION_ID` or `$CODEX_THREAD_ID`, read the JSON result and
+  receipt, fork with `--new`, find and recall earlier conversations, and the
+  rules to follow. It is built into the binary, so it matches the installed
+  version; the same file is in the repo at `skills/constant/SKILL.md`.
+
 ## [0.8.1] - Claude model follows your default; Codex 0.165
 
 ### Fixed

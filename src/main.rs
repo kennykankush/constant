@@ -45,6 +45,12 @@ fn main() -> Result<()> {
             println!("constant {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        // Agent-facing guide, built into the binary so it always matches the
+        // installed version (`constant --skill > .../constant/SKILL.md`).
+        Some("--skill") => {
+            print!("{}", include_str!("../skills/constant/SKILL.md"));
+            Ok(())
+        }
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -2549,6 +2555,9 @@ fn print_help() {
   {bold}prefix again{reset} {dim}send a literal prefix key to the child{reset}
 
   {dim}({gemini} is a carry source \u{2014} its conversations carry IN; hosting it lands later){reset}
+
+{dim}AGENTS{reset}
+  {dim}An agent using Constant should read the built-in guide first:{reset} constant --skill
 "
     );
 }
