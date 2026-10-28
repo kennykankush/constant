@@ -3,7 +3,7 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.2] - A built-in guide for agents
 
 ### Added
 - **A built-in guide for agents.** `constant --skill` prints a skill file
