@@ -2085,6 +2085,51 @@ fn carry_with_tools_codex_freeform_input_becomes_claude_object() {
 }
 
 #[test]
+fn integration_installs_the_guide_per_runtime_and_never_touches_other_skills() {
+    let dir = tmpdir();
+    let guide = out(&run(&dir, &["--skill"]));
+    let claude = dir.join("claude/skills/constant/SKILL.md");
+    let codex = dir.join("codex/skills/constant/SKILL.md");
+    let opencode = dir.join("xdg-config/opencode/skills/constant/SKILL.md");
+
+    // Someone else's skill named constant in the codex folder: never touched.
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::write(&codex, "# my own constant notes\n").unwrap();
+    // A guide from an older Constant in the opencode folder: refreshed.
+    std::fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+    std::fs::write(&opencode, "---\nname: constant\ndescription: old\n---\n").unwrap();
+
+    let c = run(&dir, &["integration", "install", "all", "--json"]);
+    assert!(c.status.success(), "{}", err(&c));
+    let rows: serde_json::Value = serde_json::from_str(&out(&c)).unwrap();
+    let state = |rt: &str| {
+        rows.as_array().unwrap().iter().find(|r| r["runtime"] == rt).unwrap()["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(state("claude"), "installed");
+    assert_eq!(state("opencode"), "installed");
+    assert!(state("codex").starts_with("skipped"), "{rows}");
+    assert_eq!(std::fs::read_to_string(&claude).unwrap(), guide);
+    assert_eq!(std::fs::read_to_string(&opencode).unwrap(), guide);
+    assert_eq!(std::fs::read_to_string(&codex).unwrap(), "# my own constant notes\n");
+
+    let again = out(&run(&dir, &["integration", "install", "claude"]));
+    assert!(again.contains("already current"), "{again}");
+    let status = out(&run(&dir, &["integration"]));
+    assert!(status.contains("claude") && status.contains("installed"), "{status}");
+
+    let c = run(&dir, &["integration", "uninstall", "all"]);
+    assert!(c.status.success(), "{}", err(&c));
+    assert!(!claude.exists() && !claude.parent().unwrap().exists());
+    assert!(!opencode.exists());
+    assert_eq!(std::fs::read_to_string(&codex).unwrap(), "# my own constant notes\n");
+
+    assert!(!run(&dir, &["integration", "install", "gemini"]).status.success());
+}
+
+#[test]
 fn skill_prints_the_built_in_agent_guide() {
     let dir = tmpdir();
     let c = run(&dir, &["--skill"]);

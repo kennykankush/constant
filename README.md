@@ -381,13 +381,19 @@ constant carry --session "$CLAUDE_CODE_SESSION_ID" --to codex --json
 ```
 
 The binary carries its own agent guide, so it always matches the installed
-version. Print it, or install it as a skill:
+version. Install it as a skill in each runtime with one command:
 
 ```bash
-constant --skill
-mkdir -p ~/.claude/skills/constant && constant --skill > ~/.claude/skills/constant/SKILL.md
-mkdir -p ~/.codex/skills/constant && constant --skill > ~/.codex/skills/constant/SKILL.md
+constant integration install all        # or claude, codex, opencode
+constant integration                    # what is installed where
+constant --skill                        # print the guide
 ```
+
+It lands in each runtime's own skills folder (`~/.claude/skills`,
+`~/.codex/skills`, `~/.config/opencode/skills`, following `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, and `XDG_CONFIG_HOME`). After upgrading Constant, run install
+again to refresh it. Constant only ever replaces or removes its own guide; a
+different skill named `constant` is left alone.
 
 The same file lives in this repo at
 [`skills/constant/SKILL.md`](skills/constant/SKILL.md). (`AGENTS.md` at the
@@ -521,6 +527,7 @@ constant trail [--all] [--plain] [--full] [--events]
 constant route [--all] [--json] [--session <path-or-id>]
 constant --version
 constant --skill
+constant integration [install|uninstall] [claude|codex|opencode|all] [--json]
 ```
 
 Debug and inspection commands:

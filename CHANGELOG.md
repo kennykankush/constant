@@ -3,6 +3,19 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **`constant integration install claude|codex|opencode|all`.** Installs the
+  agent guide as a skill in each runtime's own skills folder, so an agent
+  running there knows how to use Constant without being told. `constant
+  integration` shows what is installed where and flags a guide left over from
+  an older Constant; `uninstall` removes it. Only Constant's own guide is ever
+  replaced or removed. Verified: Claude Code 2.1.289, Codex 0.165 and
+  OpenCode 2.0.28 each list the installed skill.
+- `--help` now ends with a short section for agents, pointing them to
+  `constant --skill` only when their task involves Constant.
+
 ## [0.8.2] - A built-in guide for agents
 
 ### Added

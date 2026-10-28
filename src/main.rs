@@ -7,6 +7,7 @@
 mod alembic;
 mod explorer;
 mod host;
+mod integration;
 mod live;
 mod picker;
 mod runtime;
@@ -40,6 +41,7 @@ fn main() -> Result<()> {
         Some("unpack") => run_unpack(&args[1..]),
         Some("restore") => run_restore(&args[1..]),
         Some("route") | Some("routes") => run_route(&args[1..]),
+        Some("integration") | Some("integrations") => integration::run(&args[1..]),
         Some("keys") => host::debug_keys(),
         Some("-V") | Some("--version") => {
             println!("constant {}", env!("CARGO_PKG_VERSION"));
@@ -48,7 +50,7 @@ fn main() -> Result<()> {
         // Agent-facing guide, built into the binary so it always matches the
         // installed version (`constant --skill > .../constant/SKILL.md`).
         Some("--skill") => {
-            print!("{}", include_str!("../skills/constant/SKILL.md"));
+            print!("{}", integration::SKILL);
             Ok(())
         }
         Some("-h") | Some("--help") | None => {
@@ -2557,7 +2559,13 @@ fn print_help() {
   {dim}({gemini} is a carry source \u{2014} its conversations carry IN; hosting it lands later){reset}
 
 {dim}AGENTS{reset}
-  {dim}An agent using Constant should read the built-in guide first:{reset} constant --skill
+  constant integration install claude|codex|opencode|all
+        {dim}Install the agent guide as a skill in each runtime, so agents there
+        know how to carry their own thread. No argument: what is installed.{reset}
+
+  {dim}Are you an AI? Use these only if your task involves Constant:{reset}
+    {dim}How to use Constant (carry, fork, recall):{reset} constant --skill
+    {dim}SKIP that if a Constant skill is already in your context.{reset}
 "
     );
 }

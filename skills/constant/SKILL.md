@@ -22,7 +22,8 @@ constant --version
 constant doctor --json      # installed runtimes, versions, and whether each is validated
 ```
 
-`constant` with an unknown command prints the full command reference.
+`constant --help` prints the full command reference. `constant integration`
+shows which runtimes have this guide installed as a skill.
 
 Use `--json` (or `--plain`) on every read command. Several commands open an
 interactive picker or explorer when they run in a terminal with no arguments
