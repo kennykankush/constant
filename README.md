@@ -17,6 +17,7 @@
   <a href="#quickstart">Quickstart</a> ·
   <a href="#the-record">The Record</a> ·
   <a href="#headless-cli">Headless CLI</a> ·
+  <a href="#for-agents">For Agents</a> ·
   <a href="#trust-boundary">Trust Boundary</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="#development">Development</a>
@@ -366,6 +367,32 @@ constant export --session <path-or-session-id>
 `export` writes to `--out` when provided, otherwise it prints JSON to stdout. It
 refuses to overwrite the source session.
 
+## For Agents
+
+Constant is built to be driven by the agents themselves, not only by you. An
+agent can carry its own thread to another runtime, fork it, find earlier
+conversations, and read filed turns back. The read commands take `--json`,
+and both Claude Code (`$CLAUDE_CODE_SESSION_ID`) and Codex (`$CODEX_THREAD_ID`)
+tell the agent its own session id:
+
+```bash
+constant carry --session "$CLAUDE_CODE_SESSION_ID" --to codex --json
+# {"id": "...", "resume": "codex resume ...", "handle": "cobalt-37", "receipt": {...}}
+```
+
+The binary carries its own agent guide, so it always matches the installed
+version. Print it, or install it as a skill:
+
+```bash
+constant --skill
+mkdir -p ~/.claude/skills/constant && constant --skill > ~/.claude/skills/constant/SKILL.md
+mkdir -p ~/.codex/skills/constant && constant --skill > ~/.codex/skills/constant/SKILL.md
+```
+
+The same file lives in this repo at
+[`skills/constant/SKILL.md`](skills/constant/SKILL.md). (`AGENTS.md` at the
+repo root is different: it is for agents working on Constant's own code.)
+
 ## Trust Boundary
 
 Constant does not claim shared native memory between agent CLIs. It reads the
@@ -493,6 +520,7 @@ constant status [--all]
 constant trail [--all] [--plain] [--full] [--events]
 constant route [--all] [--json] [--session <path-or-id>]
 constant --version
+constant --skill
 ```
 
 Debug and inspection commands:
