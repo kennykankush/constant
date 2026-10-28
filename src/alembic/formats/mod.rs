@@ -351,11 +351,11 @@ pub(crate) fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
     })
 }
 
-fn codex_root() -> Result<PathBuf> {
+pub(crate) fn codex_root() -> Result<PathBuf> {
     discover_root("TRANSESSION_CODEX_HOME", &["CODEX_HOME"], ".codex")
 }
 
-fn claude_root() -> Result<PathBuf> {
+pub(crate) fn claude_root() -> Result<PathBuf> {
     discover_root(
         "TRANSESSION_CLAUDE_HOME",
         &["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"],
