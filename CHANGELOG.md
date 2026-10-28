@@ -3,6 +3,18 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Codex 0.164 validated.** Its new session records are runtime scaffold
+  (`world_state`, `additional_tools`) or messages between subagents
+  (`agent_message`), and none of them belong to the conversation, so the
+  codec needed no change. Validated on 0.164.0: a carried session with tools
+  (one failed) resumed and answered; a return carry with a changed fact
+  refreshed the same thread and was answered; Codex's own turns carried back
+  out in order; a real 0.164 session with freeform tools carried into Claude
+  and was answered.
+
 ## [0.8.0] - OpenCode 2.x and tool-history fixes
 
 ### Added
@@ -39,13 +51,13 @@ and answer from it.
 
 ### Fixed
 - **Claude: the runtime's own turns were carried as yours.** Claude Code marks
-  what it writes on the user's side — `/model` and other local-command caveats
-  and output, skill bodies, hook feedback, background-task notices, compaction
-  summaries, peer messages — with `isMeta`, `isCompactSummary`, or a non-human
-  `origin`. Constant now drops those (and their older wrapper prefixes) and
-  counts them under `dropped_scaffold` in the receipt. A real session went from
-  32 carried "user" turns (most of them injected — the `/model` caveat became
-  the title) to exactly the 11 the user typed.
+  what it writes on the user's side with `isMeta`, `isCompactSummary`, or a
+  non-human `origin`: `/model` and other local-command caveats and output,
+  skill bodies, hook feedback, background-task notices, compaction summaries,
+  peer messages. Constant now drops those (and their older wrapper prefixes)
+  and counts them under `dropped_scaffold` in the receipt. A real session went
+  from 32 carried "user" turns (most of them injected; the `/model` caveat
+  became the title) to exactly the 11 the user typed.
 - **Claude: prompts typed mid-turn were silently dropped.** They are filed as
   `queued_command` attachments, not user records; they now carry (a repeat of
   the same prompt is folded).

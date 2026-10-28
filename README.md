@@ -65,7 +65,7 @@ Ctrl-B x  ->  Codex takes it back
 The switch is not a pasted summary. Constant reads the source runtime's local
 session, distills it to the conversation, records a snapshot, writes a
 target-native session, and starts the target runtime with its own resume
-command. Every carry prints a receipt of exactly what moved:
+command. Every carry prints a receipt of what moved:
 
 ```text
 cobalt-37 · fix-the-bug · ch02 codex → claude · continue ·
@@ -174,9 +174,9 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
 
 A status bar on the bottom row shows the hosted runtime, the thread position
-(`ch04·fix-the-bug`), and the prefix keys. The child is simply told the terminal
-is one row shorter; Constant stays a pass-through proxy, not a compositor.
-Disable it with `--no-bar`.
+(`ch04·fix-the-bug`), and the prefix keys. The child is told the terminal is one
+row shorter, and its output passes through untouched. Disable the bar with
+`--no-bar`.
 
 If you are already inside tmux, pick another prefix:
 
@@ -258,10 +258,10 @@ constant resume cobalt-37                # wakes from the record, same handle
 ## The Record
 
 Every carry writes the distilled conversation to
-`~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json`: atomically,
-owner-only, post-redaction, BEFORE the native copy is materialized. The neutral
-snapshot is the durable record; native sessions are reprintable projections of
-it.
+`~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json` before it
+materializes the native copy. The write is atomic and owner-only, and happens
+after redaction. The neutral snapshot is the durable record; native sessions
+are reprintable projections of it.
 
 ```bash
 constant snapshots            # list record volumes for this directory
@@ -358,9 +358,9 @@ refuses to overwrite the source session.
 
 ## Trust Boundary
 
-Constant does not claim shared native memory between agent CLIs. It reads visible
-local session evidence and authors a new session that the target runtime can
-resume.
+Constant does not claim shared native memory between agent CLIs. It reads the
+session files each runtime keeps on disk and writes a new session that the
+target runtime can resume.
 
 Constant currently writes:
 
@@ -369,31 +369,31 @@ Constant currently writes:
 - `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`
 - `~/.codex/session_index.jsonl`
 - `~/.codex/state_5.sqlite`
-- the OpenCode store, via its import command only (`opencode session import`
-  on 2.x, `opencode import` on 1.x, its own supported, validating entry
-  point; Constant never writes OpenCode's sqlite directly)
+- the OpenCode store, only through OpenCode's own import command
+  (`opencode session import` on 2.x, `opencode import` on 1.x), which
+  validates what it imports. Constant never writes OpenCode's sqlite directly
 - `~/.constant/trail.jsonl`, `~/.constant/snapshots/`, `~/.constant/cache/`
 
 Gemini support is currently **read-only**: Constant loads gemini sessions as
-carry sources and never writes into `~/.gemini` (carrying INTO gemini is gated
-until its current session-storage behavior is verified; gemini's own store
+carry sources and never writes into `~/.gemini`. Carrying into gemini is gated
+until its current session-storage behavior is verified. Gemini's own store
 migration has been observed deleting legacy-format chats, so Constant refuses
-to guess).
+to guess.
 
 All writes are atomic (temp file + rename): a crash mid-switch cannot leave a
 torn session, and the previous projection always survives a failed write.
 
 Original source sessions are read as seeds and are not overwritten. Constant
-maintains its own runtime projections for the carried thread, then keeps those
-projections in sync as you switch back and forth.
+writes its own runtime projections for the carried thread and keeps them in
+sync as you switch back and forth.
 
 Constant redacts common secrets from carried text and strips runtime scaffold, but
 it still moves conversation content across a trust boundary. Do not use it on a
 session if you are not comfortable with the target runtime reading that thread.
 
-F1 invariant: original runtime sessions are seeds, not targets. `host` and
-`carry` write or update Constant-owned projection sessions, then resume those
-projections. They do not overwrite the original source session.
+Both `host` and `carry` treat original sessions as seeds: they write or update
+Constant-owned projection sessions, then resume those projections. They do not
+overwrite the original source session.
 
 Command write behavior:
 
@@ -432,8 +432,8 @@ Not carried:
 - hidden provider state
 - approvals, sandbox state, prompt cache state, or private runtime internals
 
-Every carry prints a receipt of what was kept, dropped, and redacted. The
-lossiness is declared, never silent.
+Every carry prints a receipt of what was kept, dropped, and redacted, so
+nothing is dropped silently.
 
 ## How It Works
 
@@ -455,9 +455,9 @@ on switch:
       -> target runtime resume
 ```
 
-The distillation layer is named `alembic`. It is the part that knows how to load
-each runtime's session format, strip it down to the portable conversation, and
-materialize the target runtime's native session shape. Runtimes plug in as
+The distillation layer is named `alembic`. It loads each runtime's session
+format, strips it down to the portable conversation, and writes the target
+runtime's native session shape. Runtimes plug in as
 codecs around the neutral model: N runtimes mean N codecs, not N² translators.
 
 ## Commands
@@ -500,7 +500,7 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume), validated against `0.162.x`
+- Codex CLI: full (host, carry in/out, resume), validated against `0.164.x`
 - Claude Code: full, validated against `2.1.x` (last checked on 2.1.289)
 - OpenCode: full, validated against `2.0.x` (2.0.28); reads via `opencode
   session export`, writes via `opencode session import`, resumes via `opencode
