@@ -3,7 +3,7 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.3] - constant integration install
 
 ### Added
 - **`constant integration install claude|codex|opencode|all`.** Installs the
