@@ -398,8 +398,16 @@ again to refresh it. Constant only ever replaces or removes its own guide; a
 different skill named `constant` is left alone.
 
 The same file lives in this repo at
-[`skills/constant/SKILL.md`](skills/constant/SKILL.md). (`AGENTS.md` at the
-repo root is different: it is for agents working on Constant's own code.)
+[`skills/constant/SKILL.md`](skills/constant/SKILL.md), so skill installers
+that read GitHub repos can fetch it too:
+
+```bash
+npx skills add kennykankush/constant
+```
+
+That copy follows this repo rather than your installed binary, so prefer
+`constant integration install` once Constant is installed. (`AGENTS.md` at
+the repo root is different: it is for agents working on Constant's own code.)
 
 ## Trust Boundary
 
