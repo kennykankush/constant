@@ -1,6 +1,7 @@
 ---
 name: constant
 description: "Carry a conversation between agent CLIs (Codex, Claude Code, OpenCode; Gemini as a source) with Constant. Use when the user asks to move, hand off, fork, or continue this thread (or another one) in a different agent CLI, to find or read back an earlier carried conversation, or mentions Constant by name. Do not use for running a second agent in parallel or for general session search unrelated to carrying."
+allowed-tools: Bash(constant --version), Bash(constant --help), Bash(constant doctor:*), Bash(constant sessions:*), Bash(constant ps:*), Bash(constant route:*), Bash(constant recall:*)
 ---
 
 # Constant
