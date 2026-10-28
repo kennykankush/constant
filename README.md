@@ -23,9 +23,11 @@
   <a href="#development">Development</a>
 </p>
 
-Constant is a local-first continuity tool for agent CLIs. Start a thread in
-Codex, carry it to Claude Code or OpenCode, then carry it back without
-re-explaining the work.
+Constant moves a coding agent session from one agent CLI to another and
+resumes it there. Start a thread in Codex, hand it off to Claude Code or
+OpenCode with the full conversation, then hand it back without re-explaining
+the work. It works on each runtime's local session files, with no API proxy
+and no account.
 
 ```text
 Codex changes.

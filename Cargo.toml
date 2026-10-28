@@ -3,11 +3,11 @@ name = "constant"
 version = "0.8.3"
 edition = "2024"
 rust-version = "1.94"
-description = "Switch active agent CLIs mid-conversation without re-explaining the thread"
+description = "Hand off a coding agent session between Codex, Claude Code, and OpenCode and resume it natively"
 license = "MIT"
 repository = "https://github.com/kennykankush/constant"
 readme = "README.md"
-keywords = ["cli", "terminal", "agents", "codex", "claude"]
+keywords = ["agents", "codex", "claude-code", "session", "handoff"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
