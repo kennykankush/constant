@@ -47,7 +47,7 @@ Constant has three surfaces:
 - the record: every carry first writes the distilled conversation as a neutral
   snapshot under `~/.constant/snapshots/`, so any hop can be listed
   (`constant snapshots`), reprinted (`constant restore`), or re-hosted
-  (`constant resume`) — even if the native session files are later deleted.
+  (`constant resume`), even if the native session files are later deleted.
 
 In host mode, the child keeps its normal terminal UI, colors, keybindings, and
 resume behavior. Constant sits outside it, watches for a prefix key, and swaps
@@ -167,14 +167,15 @@ Inside a hosted session, the default prefix is `Ctrl-B`.
 | `Ctrl-B` `X` | Create a new Codex continuation |
 | `Ctrl-B` `o` | Continue in OpenCode |
 | `Ctrl-B` `O` | Create a new OpenCode continuation |
-| `Ctrl-B` `t` | Toggle the cockpit — the chapter graph, with actions: `c`/`x`/`o` switch from inside it, `r` rename |
+| `Ctrl-B` `t` | Toggle the cockpit: the chapter graph. `↑`/`↓` pick a chapter, `Enter` lands in it, `c`/`x`/`o` switch from inside it, `r` renames |
+| `Ctrl-B` `H` | Handover: ask the agent to write a sign-out note, watch it write, then switch (the note rides the carried tail) |
 | `Ctrl-B` `:` | Open the Constant command line (`switch claude`, `rename auth bug`, `quit`; Tab completes, ↑/↓ recall history) |
 | `Ctrl-B` `d` | Quit Constant (the hosted CLI exits with it) |
 | `Ctrl-B` `Ctrl-B` | Send a literal `Ctrl-B` to the child runtime |
 
 A status bar on the bottom row shows the hosted runtime, the thread position
 (`ch04·fix-the-bug`), and the prefix keys. The child is simply told the terminal
-is one row shorter — Constant stays a pass-through proxy, not a compositor.
+is one row shorter; Constant stays a pass-through proxy, not a compositor.
 Disable it with `--no-bar`.
 
 If you are already inside tmux, pick another prefix:
@@ -184,7 +185,7 @@ constant host codex --prefix C-t
 CONSTANT_PREFIX=C-t constant host codex
 ```
 
-Every conversation gets a stable **handle** (`cobalt-37` — one color word + a
+Every conversation gets a stable **handle** (`cobalt-37`: one color word + a
 2-digit tail, pinned in the ledger, collision-proof by registry) and a
 **title** (your `rename` wins forever; otherwise a runtime-generated title is
 harvested when one exists; otherwise the first contentful words). Carries are
@@ -198,20 +199,24 @@ constant resume cobalt-37         # handles are never ambiguous
 Re-host a conversation later, straight from the ledger:
 
 ```bash
-constant resume                 # newest conversation in this directory
-constant resume fix-the-bug     # match by slug or conversation id
+constant resume                 # in a terminal: the interactive picker
+constant resume fix-the-bug     # match by handle, name, or conversation id
 constant resume --list --all    # see everything resumable
 ```
+
+The picker covers every session in scope: type to search, `↑`/`↓` to browse,
+`Tab` toggles this folder or everywhere, `Ctrl-T` narrows to Constant
+conversations, and `Enter` wakes the session hosted.
 
 `resume` wakes the conversation's latest projection live in the harness. If
 every native projection has been deleted, it reprints one from the latest
 record snapshot first.
 
 See every agent conversation alive on the machine right now (any runtime,
-hosted or not — read-only):
+hosted or not; read-only):
 
 ```bash
-constant ps
+constant ps          # --deep adds each agent's chapter and flags double-booked conversations
 # live agent sessions (14):
 #   claude   01-15:29:00   fix-the-bug   fefd68b4-5ee…   ~/dev/fantopy-hadi
 #   codex    01-15:27:35   -             019e9a25-91e…   ~/dev/belvedere
@@ -225,6 +230,9 @@ constant route
 constant trail --all
 ```
 
+In a terminal, `constant trail` opens the explorer: type to search, `Enter`
+zooms into a conversation, then its chapters, then the filed turns verbatim;
+`Esc` backs out and `r` resumes it hosted. `--plain` prints the cards instead.
 `constant trail` shows the current projection per runtime. If the same projection
 was updated multiple times, it is shown as `synced Nx` instead of repeated as a
 new conversation. To inspect the raw append-only switch ledger:
@@ -237,7 +245,7 @@ constant trail --events
 about and labels projections with readable aliases like `codex[1]` and
 `claude[1.1]`.
 
-Move a conversation to another machine — the record travels, native sessions
+Move a conversation to another machine. The record travels; native sessions
 reprint on arrival:
 
 ```bash
@@ -250,7 +258,7 @@ constant resume cobalt-37                # wakes from the record, same handle
 ## The Record
 
 Every carry writes the distilled conversation to
-`~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json` — atomically,
+`~/.constant/snapshots/<conversation>/chNN-from-<runtime>.json`: atomically,
 owner-only, post-redaction, BEFORE the native copy is materialized. The neutral
 snapshot is the durable record; native sessions are reprintable projections of
 it.
@@ -262,10 +270,22 @@ constant restore <snapshot>   # reprint a fresh native session from any hop
 constant restore <snapshot> --to opencode
 ```
 
-`restore` always mints a new session — it never overwrites anything, least of
+`restore` always mints a new session. It never overwrites anything, least of
 all the record. Restores are logged to the trail, so lineage stays joined. If a
 runtime update ever rejects Constant's sessions, or a cleanup deletes them, the
 conversation reprints from its record.
+
+The record always holds the full thread, so a long conversation can travel
+compact. When you switch a long thread, the host asks `[v]erbatim` or
+`[c]ompact`; compact (`--render paged`) lays the projection out as a head card,
+an index, and the recent turns verbatim. Older turns are filed in the record,
+never lost, and read back by address:
+
+```bash
+constant recall cobalt-37 ch04 12      # one filed turn, verbatim
+constant recall cobalt-37 ch04 3-9     # a range
+constant audit cobalt-37               # per chapter: what paged keeps vs files
+```
 
 ## Headless CLI
 
@@ -319,7 +339,10 @@ constant carry --from codex --to opencode --with-tools
 `--with-tools` (also on `host` and `resume`) carries tool calls and results
 across the boundary instead of dropping them. Every string in their payloads is
 redacted, oversized tool outputs are capped, and reasoning is never carried.
-The receipt distinguishes `kept N tool events` from `dropped N tool events`.
+Each result is placed directly after its call, tool input is reshaped to what
+the target's API accepts, and a call that never got a result (a switch while a
+tool was still running) is dropped rather than sent unanswered. The receipt
+distinguishes `kept N tool events` from `dropped N tool events`.
 
 `distill` is kept as an alias for `carry`, but `carry` is the public verb.
 
@@ -347,13 +370,13 @@ Constant currently writes:
 - `~/.codex/session_index.jsonl`
 - `~/.codex/state_5.sqlite`
 - the OpenCode store, via its import command only (`opencode session import`
-  on 2.x, `opencode import` on 1.x — its own supported, validating entry
+  on 2.x, `opencode import` on 1.x, its own supported, validating entry
   point; Constant never writes OpenCode's sqlite directly)
 - `~/.constant/trail.jsonl`, `~/.constant/snapshots/`, `~/.constant/cache/`
 
 Gemini support is currently **read-only**: Constant loads gemini sessions as
 carry sources and never writes into `~/.gemini` (carrying INTO gemini is gated
-until its current session-storage behavior is verified — gemini's own store
+until its current session-storage behavior is verified; gemini's own store
 migration has been observed deleting legacy-format chats, so Constant refuses
 to guess).
 
@@ -405,11 +428,11 @@ Stripped on purpose:
 Not carried:
 
 - tool calls and tool results (unless `--with-tools`)
-- reasoning traces (never — model-internal)
+- reasoning traces (never; they are model-internal)
 - hidden provider state
 - approvals, sandbox state, prompt cache state, or private runtime internals
 
-Every carry prints a receipt of what was kept, dropped, and redacted — the
+Every carry prints a receipt of what was kept, dropped, and redacted. The
 lossiness is declared, never silent.
 
 ## How It Works
@@ -435,28 +458,30 @@ on switch:
 The distillation layer is named `alembic`. It is the part that knows how to load
 each runtime's session format, strip it down to the portable conversation, and
 materialize the target runtime's native session shape. Runtimes plug in as
-codecs around the neutral model — N runtimes mean N codecs, not N² translators.
+codecs around the neutral model: N runtimes mean N codecs, not N² translators.
 
 ## Commands
 
 Public commands:
 
 ```bash
-constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar]
-constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar]
-constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools]
-constant sessions [--from RT] [--all] [--titles] [--json]
+constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar] [--render full|paged]
+constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
+constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged] [--tail CHARS]
+constant sessions [QUERY] [--from RT] [--all] [--titles] [--plain] [--json]
 constant rename [--of HANDLE] NEW NAME...
 constant pack HANDLE [--out FILE]
 constant unpack FILE
-constant ps [--json]
-constant snapshots [--all]
+constant ps [--deep] [--json]
+constant recall HANDLE [chNN] [TURN | A-B]
+constant snapshots [--all] [--full]
+constant audit [HANDLE] [--all] [--json] [--tail CHARS]
 constant restore <snapshot> [--to RT] [--json]
 constant export (--from RT | --session <path-or-id>) [--out FILE]
 constant doctor [--json]
 constant status [--all]
-constant trail [--all] [--events]
-constant route [--all] [--session <path-or-id>]
+constant trail [--all] [--plain] [--full] [--events]
+constant route [--all] [--json] [--session <path-or-id>]
 constant --version
 ```
 
@@ -475,22 +500,22 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume) — validated against `0.162.x`
-- Claude Code: full — validated against `2.1.x` (last checked on 2.1.289)
-- OpenCode: full — validated against `2.0.x` (2.0.28); reads via `opencode
+- Codex CLI: full (host, carry in/out, resume), validated against `0.162.x`
+- Claude Code: full, validated against `2.1.x` (last checked on 2.1.289)
+- OpenCode: full, validated against `2.0.x` (2.0.28); reads via `opencode
   session export`, writes via `opencode session import`, resumes via `opencode
   -s <id>`. Both run `--standalone`, on the store your environment names
   rather than whichever store a running background service was started on.
   OpenCode 1.x (`1.18.x`) still works through its own export shape and
   `opencode import`/`export`
-- Gemini CLI: carry **source** — validated against `0.50.x` (and older
+- Gemini CLI: carry **source**, validated against `0.50.x` (and older
   single-file sessions); gemini conversations load, list, and carry into the
   other runtimes
 
 "Validated" means the target runtime itself resumed a Constant-written session
-and answered from the carried conversation — not just that Constant can read
+and answered from the carried conversation, not just that Constant can read
 back what it wrote. The session formats are private and can change between
-runtime releases; a runtime update can still require a codec refresh — and if
+runtime releases, so a runtime update can still require a codec refresh. If
 one ever rejects Constant's sessions, the conversation reprints from its record
 snapshot.
 
@@ -521,7 +546,7 @@ Project map:
 
 ```text
 src/
-  main.rs              CLI entrypoint (carry, resume, restore, snapshots, …)
+  main.rs              CLI entrypoint (carry, resume, recall, restore, snapshots, …)
   runtime.rs           runtime launch/resume commands
   host.rs              PTY host, prefix handling, status bar, switch orchestration
   trail.rs             Constant-owned lineage ledger + record snapshot paths
