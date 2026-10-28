@@ -2097,7 +2097,16 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 //   it answered the new fact (0.164's thread_history store does not shadow
 //   the rollout). The codex-written thread exported back in order. A real
 //   0.164 rollout with freeform tools carried → claude and was answered.
-pub const SUPPORTED_CODEX: &str = "0.164";
+//
+// 2026-10-28 pass, later the same day:
+// - SUPPORTED_CODEX → 0.165 (0.165.0). No new record types. Same isolated
+//   checks: carry in with tools (planted fact, tool output and failure
+//   answered), refresh carry (new fact answered), codex-written turns
+//   exported back in order, and a real 0.165 rollout with freeform tools
+//   carried → claude (object tool inputs, answered). Note: 0.165's `codex
+//   exec` reads extra input from stdin until EOF, so scripted runs need
+//   `</dev/null`; Constant's host gives the child a PTY and is unaffected.
+pub const SUPPORTED_CODEX: &str = "0.165";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.50";
 pub const SUPPORTED_OPENCODE: &str = "2.0";

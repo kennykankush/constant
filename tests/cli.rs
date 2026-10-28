@@ -74,6 +74,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env_remove("TRANSESSION_CODEX_HOME")
         .env_remove("TRANSESSION_CLAUDE_HOME")
         .env_remove("CONSTANT_GEMINI_HOME")
+        .env_remove("CONSTANT_CLAUDE_MODEL")
         .output()
         .expect("failed to run constant")
 }
@@ -95,6 +96,7 @@ fn run_in(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env_remove("TRANSESSION_CODEX_HOME")
         .env_remove("TRANSESSION_CLAUDE_HOME")
         .env_remove("CONSTANT_GEMINI_HOME")
+        .env_remove("CONSTANT_CLAUDE_MODEL")
         .output()
         .expect("failed to run constant")
 }
@@ -2079,6 +2081,65 @@ fn carry_with_tools_codex_freeform_input_becomes_claude_object() {
             serde_json::json!({ "input": "ls -la" }),
             serde_json::json!({ "input": "not json" }),
         ]
+    );
+}
+
+#[test]
+fn carried_claude_session_resumes_on_the_users_model_not_a_stamped_one() {
+    // Claude Code resumes on the model named by the last assistant record when
+    // it is a full id. A codex thread has no claude model, and a hardcoded one
+    // goes stale (0.8.0 stamped claude-opus-4-8), so carried records carry
+    // claude's own `<synthetic>` marker and the resume follows the user's
+    // default. CONSTANT_CLAUDE_MODEL pins one instead, via `--model`.
+    let dir = tmpdir();
+    let id = "01970000-0000-7000-8000-0000000000f2";
+    let src = dir.join(format!("rollout-2026-06-01T10-00-00-{id}.jsonl"));
+    let lines = [
+        format!(
+            r#"{{"timestamp":"2026-06-01T10:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-06-01T10:00:00.000Z","cwd":"/tmp/constant-cli-proj","originator":"codex-tui","cli_version":"0.165.0","source":"cli"}}}}"#
+        ),
+        r#"{"timestamp":"2026-06-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#.to_string(),
+        r#"{"timestamp":"2026-06-01T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#.to_string(),
+    ];
+    std::fs::write(&src, lines.join("\n") + "\n").unwrap();
+    let carry = ["carry", "--to", "claude", "--session", src.to_str().unwrap()];
+
+    let c = run(&dir, &carry);
+    assert!(c.status.success(), "{}", err(&c));
+    let text = out(&c);
+    let resume = text.lines().find(|l| l.starts_with("resume with:")).unwrap();
+    assert!(!resume.contains("--model"), "{resume}");
+    let sid = resume.split_whitespace().last().unwrap();
+    let path = find_claude_projection(&dir, sid).expect("projection");
+    let mut stamped = 0;
+    for line in std::fs::read_to_string(path).unwrap().lines() {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        if rec["message"]["role"] == "assistant" {
+            assert_eq!(rec["message"]["model"], "<synthetic>", "{line}");
+            stamped += 1;
+        }
+    }
+    assert!(stamped > 0);
+
+    let pinned = Command::new(BIN)
+        .args(carry)
+        .env("HOME", &dir)
+        .env("CODEX_HOME", dir.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env("CONSTANT_NO_UPDATE_CHECK", "1")
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
+        .env("CONSTANT_CLAUDE_MODEL", "sonnet")
+        .output()
+        .unwrap();
+    assert!(pinned.status.success(), "{}", err(&pinned));
+    let hint = out(&pinned);
+    assert!(
+        hint.lines()
+            .any(|l| l.starts_with("resume with: claude -r ") && l.ends_with(" --model sonnet")),
+        "{hint}"
     );
 }
 

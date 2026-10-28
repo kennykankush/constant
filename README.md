@@ -185,6 +185,16 @@ constant host codex --prefix C-t
 CONSTANT_PREFIX=C-t constant host codex
 ```
 
+A conversation carried into Claude Code resumes on your Claude Code default
+model (settings or `/model`), so it moves to new models when Claude Code does.
+To pin a model for the Claude side, set `CONSTANT_CLAUDE_MODEL`; Constant then
+passes `--model` whenever it launches Claude and prints it in the resume
+command:
+
+```bash
+export CONSTANT_CLAUDE_MODEL=sonnet           # or opus, or a full id like claude-opus-5-5
+```
+
 Every conversation gets a stable **handle** (`cobalt-37`: one color word + a
 2-digit tail, pinned in the ledger, collision-proof by registry) and a
 **title** (your `rename` wins forever; otherwise a runtime-generated title is
@@ -500,7 +510,7 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume), validated against `0.164.x`
+- Codex CLI: full (host, carry in/out, resume), validated against `0.165.x`
 - Claude Code: full, validated against `2.1.x` (last checked on 2.1.289)
 - OpenCode: full, validated against `2.0.x` (2.0.28); reads via `opencode
   session export`, writes via `opencode session import`, resumes via `opencode

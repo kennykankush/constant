@@ -1909,7 +1909,7 @@ fn native_resume_cmd(rt: Runtime, id: &str) -> String {
     rt.resume_hint(id)
 }
 
-/// `constant restore <snapshot> [--to codex|claude]`.
+/// `constant restore <snapshot> [--to codex|claude|opencode]`.
 fn run_restore(rest: &[String]) -> Result<()> {
     let mut source: Option<PathBuf> = None;
     let mut to: Option<String> = None;
@@ -2495,7 +2495,7 @@ fn print_help() {
         {dim}Per chapter, what a paged render keeps verbatim vs files (recallable)
         \u{2014} the renderer's instruments, read-only, on real conversations.{reset}
 
-  {bold}constant restore{reset} SNAPSHOT {dim}[--to codex|claude] [--json]{reset}
+  {bold}constant restore{reset} SNAPSHOT {dim}[--to codex|claude|opencode] [--json]{reset}
         {dim}Reprint a fresh native session from any volume. Never overwrites.{reset}
 
 {dim}NAME & MOVE{reset}
@@ -2529,6 +2529,11 @@ fn print_help() {
   {dim}Default Ctrl-B. Inside tmux (which owns Ctrl-B), pick another:{reset}
       constant host codex --prefix C-t
       CONSTANT_PREFIX=C-g constant host codex
+
+{dim}CLAUDE MODEL{reset}
+  {dim}A carried conversation resumes on your Claude Code default model.
+  To pin one (alias or full id), Constant passes --model to claude:{reset}
+      CONSTANT_CLAUDE_MODEL=sonnet constant host codex
 
 {dim}INSIDE A HOSTED SESSION{reset} {dim}(press the prefix, release, then){reset}
   {bold}c{reset} / {bold}C{reset}        {dim}continue in{reset} {claude} {dim}/ new continuation{reset}

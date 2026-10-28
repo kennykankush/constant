@@ -5,7 +5,20 @@ All notable changes to Constant are recorded here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **A carried Claude session resumed on an old model.** Claude Code resumes on
+  the model named in the session's last reply, and Constant wrote a fixed
+  `claude-opus-4-8` on every reply it carried in, so a carry from Codex or
+  OpenCode came back on Opus 4.8 whatever your default was. Carried replies
+  now use Claude Code's own `<synthetic>` marker, and the resume follows your
+  Claude Code default (settings or `/model`), so new models are picked up
+  without a Constant release. To pin one, set `CONSTANT_CLAUDE_MODEL` (an
+  alias such as `sonnet`, or a full id): Constant passes `--model` when it
+  launches Claude and adds it to the printed resume command.
+
 ### Changed
+- **Codex 0.165 validated** (0.165.0, no new record types; same real checks
+  as 0.164 below).
 - **Codex 0.164 validated.** Its new session records are runtime scaffold
   (`world_state`, `additional_tools`) or messages between subagents
   (`agent_message`), and none of them belong to the conversation, so the
