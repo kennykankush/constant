@@ -3,7 +3,7 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.1] - Claude model follows your default; Codex 0.165
 
 ### Fixed
 - **A carried Claude session resumed on an old model.** Claude Code resumes on
