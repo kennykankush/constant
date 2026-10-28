@@ -2086,7 +2086,18 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 //   service, answered the planted fact, the tool output and the failure. A real
 //   2.0 session (reasoning + tools) carried OUT → claude; `claude -p -r
 //   --fork-session` answered its planted fact and file contents.
-pub const SUPPORTED_CODEX: &str = "0.162";
+//
+// 2026-10-28 pass:
+// - SUPPORTED_CODEX → 0.164 (0.164.0). Its new records are scaffold
+//   (`world_state`, `additional_tools`) or subagent traffic (`agent_message`,
+//   only in spawned subagent threads); none carry the conversation. In an
+//   isolated CODEX_HOME: a claude seed with tools (one failed) carried in;
+//   `codex exec resume` answered the planted fact, the tool output and the
+//   failure. A return carry with a changed fact refreshed the same thread and
+//   it answered the new fact (0.164's thread_history store does not shadow
+//   the rollout). The codex-written thread exported back in order. A real
+//   0.164 rollout with freeform tools carried → claude and was answered.
+pub const SUPPORTED_CODEX: &str = "0.164";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.50";
 pub const SUPPORTED_OPENCODE: &str = "2.0";
@@ -3158,6 +3169,46 @@ mod tests {
             _ => None,
         });
         assert_eq!(output, Some(serde_json::json!("alpha\n")));
+    }
+
+    #[test]
+    fn codex_0_164_scaffold_and_subagent_records_stay_out_of_the_thread() {
+        // Shapes trimmed from real 0.164.0 rollouts: `world_state` holds
+        // AGENTS.md and skill bodies, `additional_tools` the tool catalog, and
+        // `agent_message` is subagent traffic. None of it is conversation.
+        let path = unique_tmp()
+            .join("rollout-2026-10-28T03-00-00-01a181e1-d3dc-7c60-93f3-1077e621789c.jsonl");
+        let lines = [
+            r#"{"timestamp":"2026-10-28T03:00:00.000Z","type":"session_meta","payload":{"id":"01a181e1-d3dc-7c60-93f3-1077e621789c","timestamp":"2026-10-28T03:00:00.000Z","cwd":"/tmp/c164","originator":"codex_exec","cli_version":"0.164.0","source":"exec"}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:00.100Z","type":"world_state","payload":{"full":true,"state":{"agents_md":{"directory":"/tmp/c164","text":"SECRET-ISH AGENTS BODY"},"host_skills":{"body":"skill list","includeInstructions":true},"model":"deepseek-flash"}}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:00.200Z","type":"response_item","payload":{"type":"additional_tools","id":"at_1","role":"developer","tools":[{"type":"namespace","name":"mcp","description":"","tools":[]}]}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"the codeword is HERON-41"}]}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:01.500Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:02.000Z","type":"response_item","payload":{"type":"agent_message","id":"am_1","author":"/root","recipient":"/root/helper","content":[{"type":"input_text","text":"SUBAGENT BRIEF"}]}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_x","name":"exec","input":"cat notes.txt"}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_x","output":"alpha"}}"#,
+            r#"{"timestamp":"2026-10-28T03:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"noted HERON-41; notes.txt says alpha"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let session = formats::load_session(&path, SourceFormat::Auto).expect("load 0.164");
+        let kinds: Vec<String> = session
+            .events
+            .iter()
+            .map(|e| match e {
+                SessionEvent::Message(m) => format!("msg:{}", m.role),
+                SessionEvent::ToolCall(c) => format!("call:{}", c.call_id),
+                SessionEvent::ToolResult(r) => format!("result:{}", r.call_id),
+                SessionEvent::Reasoning(_) => "reasoning".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["msg:user", "call:call_x", "result:call_x", "msg:assistant"]
+        );
+        let dump = serde_json::to_string(&session.events).unwrap();
+        assert!(!dump.contains("SUBAGENT BRIEF"), "subagent traffic leaked");
+        assert!(!dump.contains("AGENTS BODY"), "world_state leaked");
     }
 
     #[test]
