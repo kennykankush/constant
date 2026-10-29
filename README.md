@@ -16,7 +16,7 @@
   <a href="#install">Install</a> ·
   <a href="#quickstart">Quickstart</a> ·
   <a href="#the-record">The Record</a> ·
-  <a href="#headless-cli">Headless CLI</a> ·
+  <a href="#carry">Carry</a> ·
   <a href="#for-agents">For Agents</a> ·
   <a href="#trust-boundary">Trust Boundary</a> ·
   <a href="#how-it-works">How It Works</a> ·
@@ -42,19 +42,38 @@ files, so read the trust boundary below before using it on important sessions.
 
 Constant has three surfaces:
 
-- `constant host`: run one agent CLI at a time inside a native PTY and switch the
-  live runtime with a tmux-style prefix key. A persistent status bar shows the
-  active runtime and your place in the thread.
-- `constant carry`: headless carry into a target runtime's native session and
-  print the resume command.
+- `constant carry`: carry a conversation into another runtime's native session
+  and print the command that resumes it there. Agents can run it on their own
+  thread through the bundled skill.
 - the record: every carry first writes the distilled conversation as a neutral
   snapshot under `~/.constant/snapshots/`, so any hop can be listed
   (`constant snapshots`), reprinted (`constant restore`), or re-hosted
   (`constant resume`), even if the native session files are later deleted.
+- `constant host`: to switch without leaving the terminal, run one agent CLI at
+  a time inside a native PTY and swap the live runtime with a tmux-style prefix
+  key. A persistent status bar shows the active runtime and your place in the
+  thread.
 
-In host mode, the child keeps its normal terminal UI, colors, keybindings, and
-resume behavior. Constant sits outside it, watches for a prefix key, and swaps
-the active runtime when you ask.
+```bash
+constant carry --from codex --to claude
+# carried -> claude session <id>
+# carried 14 turns · dropped 6 tool events · 2 redactions
+# resume with: claude -r <id>
+```
+
+The carry is not a pasted summary. Constant reads the source runtime's local
+session, distills it to the conversation, records a snapshot, and writes a
+target-native session that the target runtime resumes with its own command.
+Every carry prints a receipt of what moved:
+
+```text
+cobalt-37 · fix-the-bug · ch02 codex → claude · continue ·
+carried 14 turns · dropped 6 tool events · 2 redactions
+```
+
+In host mode the same carry happens live. The child keeps its normal terminal
+UI, colors, keybindings, and resume behavior; Constant sits outside it, watches
+for a prefix key, and swaps the active runtime when you ask:
 
 ```text
 constant host codex
@@ -63,25 +82,6 @@ you talk to Codex
 Ctrl-B c  ->  Claude Code continues the same thread
 Ctrl-B o  ->  OpenCode continues it
 Ctrl-B x  ->  Codex takes it back
-```
-
-The switch is not a pasted summary. Constant reads the source runtime's local
-session, distills it to the conversation, records a snapshot, writes a
-target-native session, and starts the target runtime with its own resume
-command. Every carry prints a receipt of what moved:
-
-```text
-cobalt-37 · fix-the-bug · ch02 codex → claude · continue ·
-carried 14 turns · dropped 6 tool events · 2 redactions
-```
-
-The same carry path is available without opening a hosted terminal:
-
-```bash
-constant carry --from codex --to claude
-# carried -> claude session <id>
-# carried 14 turns · dropped 6 tool events · 2 redactions
-# resume with: claude -r <id>
 ```
 
 ## Install
@@ -154,7 +154,23 @@ constant doctor
 constant status
 ```
 
-Host Codex:
+Carry the latest Codex session in this directory into Claude Code, then resume
+it there with the command the carry prints:
+
+```bash
+constant carry --from codex --to claude
+claude -r <id>
+```
+
+Or let the agent carry its own thread. Install Constant's skill once, then ask
+in plain words, for example "hand this thread to Claude Code" (see
+[For Agents](#for-agents)):
+
+```bash
+constant integration install all
+```
+
+To switch runtimes live inside one terminal, host the runtime instead:
 
 ```bash
 constant host codex
@@ -300,10 +316,10 @@ constant recall cobalt-37 ch04 3-9     # a range
 constant audit cobalt-37               # per chapter: what paged keeps vs files
 ```
 
-## Headless CLI
+## Carry
 
-Use the headless commands when you want continuity without hosting an interactive
-terminal.
+Everything a carry needs works from the shell: list what can be carried,
+preview it, then carry it.
 
 List carryable sessions:
 
