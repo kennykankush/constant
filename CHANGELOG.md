@@ -3,6 +3,47 @@
 All notable changes to Constant are recorded here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - constant ask, and Codex 0.167
+
+### Fixed
+- **Carried threads resume on Codex 0.167 with any provider.** Codex 0.167
+  refuses to resume a thread whose saved provider differs from the one in use
+  ("This chat uses openai, but your current provider is deepseek"). Constant
+  stamped every carried thread `openai`, so anyone running Codex on another
+  provider could not resume a carry. Carried threads now name no provider and
+  resume on whichever one you run. Carry again to repair a thread written by
+  an older Constant.
+- **Gemini 0.67 history patches are read.** 0.67 records a history sync as a
+  `$patch` record; the reader ignored it, so patched-in replies and tool
+  results were missed. Turns Gemini trims from its own view stay in the carry,
+  as before.
+
+### Validated
+Each target was made to resume a carried session and answer a planted fact,
+a tool output and a tool failure (see the playbook in `src/alembic/mod.rs`).
+- **Codex 0.167** (0.167.0): carry in with tools, a refresh carry with a
+  changed fact, and its own turns read back in order. Two real 0.167 sessions
+  with freeform tools carried into Claude Code. 0.167's client-side tool
+  outputs have no call id; they are dropped and counted in the receipt.
+- **Claude Code 2.1.321**: answered from a Codex-written thread and an
+  OpenCode-written one. Its new `api-request` records are not conversation
+  and are skipped.
+- **OpenCode 2.2** (2.2.6): carry in with tools through `session import`, and
+  a session 2.2.6 wrote itself carried into Codex and Claude Code. `doctor`
+  now accepts the whole `2.x` line.
+- **Gemini 0.67 was not run.** Its format was read from the package source
+  and covered by a fixture. The validated line stays `0.50.x`.
+
+### Added
+- **`constant ask` for agent-to-agent consultation.** An agent can fork its
+  current conversation into Codex or Claude Code, send a question headlessly,
+  and receive the target runtime's answer as text or JSON. The question travels
+  over stdin rather than argv; the source and any existing target projection
+  are never modified. Each ask is a fresh recorded fork, and provider failures
+  return machine-readable JSON in `--json` mode. Checked live against Codex
+  0.167 and Claude Code 2.1.321. Codex only answers inside a git repository
+  or a directory it trusts; elsewhere the ask fails with Codex's own message.
+
 ## [0.8.3] - constant integration install
 
 ### Added

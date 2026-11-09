@@ -40,11 +40,14 @@ files, so read the trust boundary below before using it on important sessions.
 
 ## What It Is
 
-Constant has three surfaces:
+Constant has four surfaces:
 
 - `constant carry`: carry a conversation into another runtime's native session
   and print the command that resumes it there. Agents can run it on their own
   thread through the bundled skill.
+- `constant ask`: let an agent fork its thread into Codex or Claude Code,
+  ask that runtime a question headlessly, and receive the answer as text or
+  JSON. No terminal takeover and no manual resume step.
 - the record: every carry first writes the distilled conversation as a neutral
   snapshot under `~/.constant/snapshots/`, so any hop can be listed
   (`constant snapshots`), reprinted (`constant restore`), or re-hosted
@@ -168,6 +171,13 @@ in plain words, for example "hand this thread to Claude Code" (see
 
 ```bash
 constant integration install all
+```
+
+An agent can also consult another runtime without switching the terminal:
+
+```bash
+constant ask --to claude --session "$CODEX_THREAD_ID" \
+  --question "What are the risks in the current plan?" --json
 ```
 
 To switch runtimes live inside one terminal, host the runtime instead:
@@ -389,14 +399,32 @@ refuses to overwrite the source session.
 
 Constant is built to be driven by the agents themselves, not only by you. An
 agent can carry its own thread to another runtime, fork it, find earlier
-conversations, and read filed turns back. The read commands take `--json`,
-and both Claude Code (`$CLAUDE_CODE_SESSION_ID`) and Codex (`$CODEX_THREAD_ID`)
-tell the agent its own session id:
+conversations, consult another runtime headlessly, and read filed turns back.
+The read commands take `--json`, and both Claude Code
+(`$CLAUDE_CODE_SESSION_ID`) and Codex (`$CODEX_THREAD_ID`) tell the agent its
+own session id:
 
 ```bash
 constant carry --session "$CLAUDE_CODE_SESSION_ID" --to codex --json
 # {"id": "...", "resume": "codex resume ...", "handle": "cobalt-37", "receipt": {...}}
 ```
+
+`ask` completes the agent-side loop without a supervisor or PTY. It always
+creates a new target projection, sends the question over stdin, runs the target
+runtime non-interactively, and returns its answer:
+
+```bash
+constant ask --to codex --session "$CLAUDE_CODE_SESSION_ID" \
+  --question "Review this implementation for concurrency bugs." --json
+# {"ok": true, "answer": "...", "session": "...", "resume": "codex resume ...", ...}
+```
+
+Use `--question -` to read the question from stdin, `--with-tools` to include
+redacted tool history, and `--timeout SECS` to bound the call. `ask` currently
+supports Codex and Claude Code as targets. It invokes the target runtime and may
+consume paid provider usage, so agents should use it only when the user asks or
+authorizes that consultation. The target keeps its own permissions and sandbox
+settings and may inspect or modify the workspace accordingly.
 
 The binary carries its own agent guide, so it always matches the installed
 version. Install it as a skill in each runtime with one command:
@@ -472,6 +500,8 @@ Command write behavior:
 - `constant sessions`: reads session metadata; `--titles` also reads transcripts
 - `constant carry --dry-run`: reads and distills, writes nothing
 - `constant carry`: writes a record snapshot + a target-native projection, updates the trail
+- `constant ask`: runs the same carry write path with a fresh fork, then
+  launches the target runtime non-interactively with the question on stdin
 - `constant restore`: writes a fresh native projection from a record volume
 - `constant resume`: hosts an existing projection; writes only when you switch
 - `constant host`: writes only when you switch runtimes
@@ -537,6 +567,7 @@ Public commands:
 constant host [codex|claude|opencode] [--prefix C-t] [--with-tools] [--no-bar] [--render full|paged]
 constant resume [QUERY] [--in RT] [--list] [--all] [--prefix C-t] [--with-tools] [--no-bar] [--render paged]
 constant carry --to codex|claude|opencode [--from RT | --session <path-or-id>] [--json] [--dry-run] [--debug] [--new] [--with-tools] [--render paged] [--tail CHARS]
+constant ask --to codex|claude (--from RT | --session <path-or-id>) (--question TEXT | TEXT... | --question -) [--json] [--with-tools] [--timeout SECS] [--dry-run]
 constant sessions [QUERY] [--from RT] [--all] [--titles] [--plain] [--json]
 constant rename [--of HANDLE] NEW NAME...
 constant pack HANDLE [--out FILE]
@@ -571,9 +602,9 @@ debugging prefix behavior.
 
 Current support:
 
-- Codex CLI: full (host, carry in/out, resume), validated against `0.165.x`
-- Claude Code: full, validated against `2.1.x` (last checked on 2.1.289)
-- OpenCode: full, validated against `2.0.x` (2.0.28); reads via `opencode
+- Codex CLI: full (host, carry in/out, resume), validated against `0.167.x`
+- Claude Code: full, validated against `2.1.x` (last checked on 2.1.321)
+- OpenCode: full, validated against `2.x` (2.0.28 and 2.2.6); reads via `opencode
   session export`, writes via `opencode session import`, resumes via `opencode
   -s <id>`. Both run `--standalone`, on the store your environment names
   rather than whichever store a running background service was started on.
@@ -582,6 +613,10 @@ Current support:
 - Gemini CLI: carry **source**, validated against `0.50.x` (and older
   single-file sessions); gemini conversations load, list, and carry into the
   other runtimes
+
+`constant ask` currently targets Codex and Claude Code. Their non-interactive
+resume paths are verified against the installed CLI contracts; OpenCode and
+Gemini remain outside that surface until the same command path is validated.
 
 "Validated" means the target runtime itself resumed a Constant-written session
 and answered from the carried conversation, not just that Constant can read
