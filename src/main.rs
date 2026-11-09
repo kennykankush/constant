@@ -5,6 +5,7 @@
 //! the conversation.
 
 mod alembic;
+mod ask;
 mod explorer;
 mod host;
 mod integration;
@@ -23,6 +24,7 @@ fn main() -> Result<()> {
 
     match args.first().map(String::as_str) {
         Some("host") => run_host(&args[1..]),
+        Some("ask") => ask::run(&args[1..]),
         // `carry` is the headless verb; `distill` kept as an alias (alembic's
         // internal step is still called distillation).
         Some("carry") | Some("distill") => run_carry(&args[1..]),
@@ -2489,6 +2491,13 @@ fn print_help() {
         and gemini (source only). --new forks instead of refreshing;
         --with-tools carries tool calls/results (redacted, capped).
         (`distill` is an alias.){reset}
+
+  {bold}constant ask{reset} --to codex|claude {dim}(--from RT | --session PATH_OR_ID){reset}
+        {dim}--question TEXT [--json] [--with-tools] [--timeout SECS] [--dry-run]{reset}
+        {dim}Agent-native consultation: fork the conversation into a new target
+        projection, run that runtime headlessly on the question, and return its
+        answer. No terminal takeover; the source conversation is not modified.
+        Question via stdin with `--question -`; Codex and Claude only for now.{reset}
 
 {dim}THE RECORD{reset}  {dim}\u{2014} every carry snapshots the FULL thread; filed is never lost{reset}
   {bold}constant recall{reset} HANDLE {dim}[chNN] [TURN | A-B]{reset}

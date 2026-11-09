@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use portable_pty::CommandBuilder;
+use std::process::Command;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Runtime {
@@ -91,6 +92,44 @@ impl Runtime {
             .copied()
             .chain(model.iter().map(String::as_str))
             .fold(base, |cmd, flag| format!("{cmd} {flag}"))
+    }
+
+    /// Build the non-interactive resume invocation used by `constant ask`.
+    /// The question itself is sent over stdin by the caller: that keeps it out
+    /// of the process list, avoids argv limits, and lets Codex use its explicit
+    /// stdin prompt marker.
+    pub fn ask_args(self, session_id: &str) -> Result<Vec<String>> {
+        let mut args: Vec<String> = match self {
+            Runtime::Codex => {
+                let mut args = Vec::new();
+                if crate::alembic::codex_supports_no_daemon() {
+                    args.push("--no-daemon".to_string());
+                }
+                args.extend(
+                    ["exec", "resume", session_id, "-"]
+                        .into_iter()
+                        .map(str::to_string),
+                );
+                args
+            }
+            Runtime::Claude => ["-p", "-r", session_id]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Runtime::OpenCode | Runtime::Gemini => {
+                bail!("{} is not a verified headless ask target", self.label())
+            }
+        };
+        args.extend(self.model_flags());
+        Ok(args)
+    }
+
+    /// A process command for asking this runtime to continue `session_id`.
+    pub fn ask_command(self, session_id: &str) -> Result<Command> {
+        let args = self.ask_args(session_id)?;
+        let mut cmd = Command::new(self.bin());
+        cmd.args(args);
+        Ok(cmd)
     }
 
     /// `--model <m>` for claude when `CONSTANT_CLAUDE_MODEL` pins one (an alias
@@ -202,5 +241,27 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("dangerous"))
         );
+    }
+
+    #[test]
+    fn ask_commands_keep_the_question_out_of_argv() {
+        let claude = Runtime::Claude.ask_args("session-1").unwrap();
+        assert_eq!(&claude[..3], &["-p", "-r", "session-1"]);
+
+        let codex = Runtime::Codex.ask_args("session-2").unwrap();
+        let exec = codex
+            .windows(4)
+            .position(|w| w == ["exec", "resume", "session-2", "-"]);
+        assert!(
+            exec.is_some(),
+            "codex ask must resume through exec and read the prompt from stdin: {codex:?}"
+        );
+        assert!(!codex.iter().any(|arg| arg.contains("secret question")));
+    }
+
+    #[test]
+    fn ask_refuses_unverified_headless_targets() {
+        assert!(Runtime::OpenCode.ask_args("id").is_err());
+        assert!(Runtime::Gemini.ask_args("id").is_err());
     }
 }

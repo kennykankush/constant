@@ -414,10 +414,11 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     // leaning on the default. (Paginated threads are never rewritten — see
     // alembic::codex_projection_reusable.)
     session_meta_payload.insert("history_mode".to_string(), "legacy".into());
-    session_meta_payload.insert(
-        "model_provider".to_string(),
-        Value::String(exported_codex_model_provider()),
-    );
+    // No `model_provider` here. Codex 0.167 refuses to resume a thread whose
+    // session_meta names a provider other than the one in use ("This chat uses
+    // openai, but your current provider is deepseek"), and a carried thread
+    // was never any provider's. Left out, the check is skipped and the thread
+    // resumes on whichever provider the user is running.
     // Only a codex source has real base instructions to carry. Anything else
     // gets none, so codex falls back to its own for the model — a placeholder
     // here would be resumed as the system prompt.
@@ -856,9 +857,39 @@ fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> S
     derive_title(session).unwrap_or_else(|| session_id.to_string())
 }
 
-fn exported_codex_model_provider() -> String {
-    // Native value so codex's sqlite backfill keeps the session in /resume.
-    "openai".to_string()
+/// The provider the user's codex runs on by default: the top-level
+/// `model_provider` in `config.toml`, else codex's own default. Used for the
+/// registry row only (the column is NOT NULL); the rollout names no provider.
+pub(crate) fn codex_default_model_provider() -> String {
+    let configured = super::codex_root()
+        .ok()
+        .and_then(|root| std::fs::read_to_string(root.join("config.toml")).ok())
+        .and_then(|config| top_level_model_provider(&config));
+    configured.unwrap_or_else(|| "openai".to_string())
+}
+
+/// `model_provider = "name"` from the part of a config.toml before its first
+/// table header. Keys inside `[tables]` (profiles, provider definitions) are
+/// not the default.
+fn top_level_model_provider(config: &str) -> Option<String> {
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some(rest) = line.strip_prefix("model_provider") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or("").trim();
+        let value = value.trim_matches(|c| c == '"' || c == '\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn exported_codex_collaboration_mode() -> Value {
@@ -1067,3 +1098,18 @@ fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
     }
 }
 
+
+#[cfg(test)]
+mod provider_tests {
+    use super::top_level_model_provider;
+
+    #[test]
+    fn default_provider_is_the_top_level_key_only() {
+        let config = "model = \"x\"\nmodel_provider = \"deepseek\" # mine\n\n[model_providers.deepseek]\nname = \"DeepSeek\"\n";
+        assert_eq!(top_level_model_provider(config).as_deref(), Some("deepseek"));
+        // A provider named only inside a table (a profile) is not the default.
+        let profile_only = "model = \"x\"\n\n[profiles.ds]\nmodel_provider = \"deepseek\"\n";
+        assert_eq!(top_level_model_provider(profile_only), None);
+        assert_eq!(top_level_model_provider("model_providers = 1\n"), None);
+    }
+}
