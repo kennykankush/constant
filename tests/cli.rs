@@ -101,6 +101,74 @@ fn run_in(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
         .expect("failed to run constant")
 }
 
+/// Run `constant ask` with a fake provider first on PATH. The fake records the
+/// argv and stdin it receives, so tests can prove the question is not exposed
+/// in the child process argument list.
+fn run_ask(
+    dir: &Path,
+    args: &[&str],
+    fake_bin: &Path,
+    argv_log: &Path,
+    input_log: &Path,
+    fail: bool,
+) -> Output {
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(BIN)
+        .args(args)
+        .env("HOME", dir)
+        .env("CODEX_HOME", dir.join("codex"))
+        .env("CLAUDE_HOME", dir.join("claude"))
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env("CONSTANT_NO_UPDATE_CHECK", "1")
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
+        .env("PATH", path)
+        .env("CONSTANT_ASK_TEST_ARGV", argv_log)
+        .env("CONSTANT_ASK_TEST_INPUT", input_log)
+        .env("CONSTANT_ASK_TEST_FAIL", if fail { "1" } else { "0" })
+        .env_remove("TRANSESSION_CODEX_HOME")
+        .env_remove("TRANSESSION_CLAUDE_HOME")
+        .env_remove("CONSTANT_GEMINI_HOME")
+        .env_remove("CONSTANT_CLAUDE_MODEL")
+        .output()
+        .expect("failed to run constant ask")
+}
+
+fn install_fake_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '2.1.999\n'
+  exit 0
+fi
+printf '%s\n' "$@" > "$CONSTANT_ASK_TEST_ARGV"
+cat > "$CONSTANT_ASK_TEST_INPUT"
+if [ "$CONSTANT_ASK_TEST_FAIL" = "1" ]; then
+  printf 'fake provider refused the request\n' >&2
+  exit 7
+fi
+printf 'claude answered the carried question\nsecond line\n'
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
 /// `opencode --version`, run against a throwaway store: even `--version`
 /// writes a log line under the data dir, and tests never touch the real one.
 fn opencode_version() -> Option<Output> {
@@ -342,6 +410,36 @@ fn carry_mints_target_and_preserves_source() {
 }
 
 #[test]
+fn carried_codex_thread_names_no_provider() {
+    // Codex 0.167 refuses to resume a thread whose session_meta names another
+    // provider than the one in use. A carried thread names none, so it resumes
+    // on whatever the user runs (here a config that defaults to deepseek).
+    let dir = tmpdir();
+    let fix = ir_fixture(&dir);
+    std::fs::create_dir_all(dir.join("codex")).unwrap();
+    std::fs::write(
+        dir.join("codex").join("config.toml"),
+        "model_provider = \"deepseek\"\n",
+    )
+    .unwrap();
+
+    let o = run(
+        &dir,
+        &["carry", "--to", "codex", "--session", fix.to_str().unwrap(), "--json"],
+    );
+    assert!(o.status.success(), "carry failed: {}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let rollout = std::fs::read_to_string(v["path"].as_str().unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(rollout.lines().next().unwrap()).unwrap();
+    assert_eq!(meta["type"], "session_meta");
+    assert!(
+        meta["payload"].get("model_provider").is_none(),
+        "session_meta must not pin a provider: {}",
+        meta["payload"]
+    );
+}
+
+#[test]
 fn carry_reports_a_receipt() {
     let dir = tmpdir();
     let fix = ir_fixture(&dir);
@@ -379,6 +477,152 @@ fn carry_reports_a_receipt() {
         out(&text).contains("carried 2 turns"),
         "human output missing receipt: {}",
         out(&text)
+    );
+}
+
+#[test]
+fn ask_forks_the_thread_and_returns_the_target_answer() {
+    let dir = tmpdir();
+    let fix = ir_fixture_named(
+        &dir,
+        "ask-fixture.json",
+        "ask-fixture-0001",
+        "review the deployment design",
+    );
+    let source_before = std::fs::read(&fix).unwrap();
+    let fake_bin = install_fake_claude(&dir);
+    let argv_log = dir.join("fake-argv.log");
+    let input_log = dir.join("fake-stdin.log");
+
+    let first = run_ask(
+        &dir,
+        &[
+            "ask",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--question",
+            "What is the largest risk here?",
+            "--json",
+        ],
+        &fake_bin,
+        &argv_log,
+        &input_log,
+        false,
+    );
+    assert!(first.status.success(), "ask failed: {}", err(&first));
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&first)).expect("ask emitted invalid JSON");
+    assert_eq!(v["ok"].as_bool(), Some(true), "{v}");
+    assert_eq!(v["to"].as_str(), Some("claude"));
+    assert_eq!(v["fork"].as_bool(), Some(true));
+    assert_eq!(
+        v["answer"].as_str(),
+        Some("claude answered the carried question\nsecond line")
+    );
+    assert_eq!(v["receipt"]["turns"].as_u64(), Some(2), "{v}");
+    assert!(v["session"].as_str().is_some(), "{v}");
+    assert!(v["resume"].as_str().is_some(), "{v}");
+
+    // The question travels over stdin, not in the provider's argv.
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    assert!(argv.lines().any(|a| a == "-p"), "{argv}");
+    assert!(argv.lines().any(|a| a == "-r"), "{argv}");
+    assert!(
+        !argv.contains("What is the largest risk here?"),
+        "question leaked into argv: {argv}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&input_log).unwrap(),
+        "What is the largest risk here?\n"
+    );
+
+    // The source is still a seed, and a second ask is an independent fork.
+    assert_eq!(source_before, std::fs::read(&fix).unwrap());
+    let second = run_ask(
+        &dir,
+        &[
+            "ask",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "Is there a smaller fix?",
+            "--json",
+        ],
+        &fake_bin,
+        &argv_log,
+        &input_log,
+        false,
+    );
+    assert!(second.status.success(), "{}", err(&second));
+    let second_json: serde_json::Value =
+        serde_json::from_str(&out(&second)).expect("second ask emitted invalid JSON");
+    assert_ne!(
+        v["session"].as_str(),
+        second_json["session"].as_str(),
+        "ask must create a fresh consultation fork"
+    );
+}
+
+#[test]
+fn ask_failure_is_machine_readable() {
+    let dir = tmpdir();
+    let fix = ir_fixture_named(
+        &dir,
+        "ask-failure.json",
+        "ask-failure-0001",
+        "review the failure path",
+    );
+    let fake_bin = install_fake_claude(&dir);
+    let o = run_ask(
+        &dir,
+        &[
+            "ask",
+            "--to",
+            "claude",
+            "--session",
+            fix.to_str().unwrap(),
+            "--question",
+            "Will this fail?",
+            "--json",
+        ],
+        &fake_bin,
+        &dir.join("argv.log"),
+        &dir.join("stdin.log"),
+        true,
+    );
+    assert!(!o.status.success(), "fake provider failure must fail ask");
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&o)).expect("ask failure did not emit JSON");
+    assert_eq!(v["ok"].as_bool(), Some(false), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fake provider refused"),
+        "{v}"
+    );
+}
+
+#[test]
+fn ask_argument_errors_are_json_when_requested() {
+    let dir = tmpdir();
+    let o = run(
+        &dir,
+        &["ask", "--to", "claude", "--from", "codex", "--json"],
+    );
+    assert!(!o.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&out(&o)).expect("ask argument error did not emit JSON");
+    assert_eq!(v["ok"].as_bool(), Some(false), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires a question"),
+        "{v}"
     );
 }
 

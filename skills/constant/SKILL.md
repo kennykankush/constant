@@ -1,7 +1,7 @@
 ---
 name: constant
-description: "Carry a conversation between agent CLIs (Codex, Claude Code, OpenCode; Gemini as a source) with Constant. Use when the user asks to move, hand off, fork, or continue this thread (or another one) in a different agent CLI, to find or read back an earlier carried conversation, or mentions Constant by name. Do not use for running a second agent in parallel or for general session search unrelated to carrying."
-allowed-tools: Bash(constant --version), Bash(constant --help), Bash(constant doctor:*), Bash(constant sessions:*), Bash(constant ps:*), Bash(constant route:*), Bash(constant recall:*)
+description: "Carry or consult a conversation between agent CLIs (Codex, Claude Code, and OpenCode; Gemini as a source) with Constant. Use when the user asks to move, hand off, fork, or continue this thread (or another one) in a different agent CLI, ask another runtime about it, find or read back an earlier carried conversation, or mentions Constant by name. Do not use for general session search unrelated to carrying."
+allowed-tools: Bash(constant --version), Bash(constant --help), Bash(constant doctor:*), Bash(constant sessions:*), Bash(constant ps:*), Bash(constant route:*), Bash(constant recall:*), Bash(constant ask:*)
 ---
 
 # Constant
@@ -78,6 +78,36 @@ Options:
 Carrying again to the same target refreshes that target session in place.
 The source session is never modified.
 
+## Ask another runtime
+
+When the user wants a second runtime's judgment without taking over the
+terminal, ask it headlessly:
+
+| You are running in | Your session id |
+| --- | --- |
+| Claude Code | `$CLAUDE_CODE_SESSION_ID` |
+| Codex | `$CODEX_THREAD_ID` |
+
+```bash
+constant ask --to claude --session "$CODEX_THREAD_ID" \
+  --question "Review the current plan for hidden failure modes." --json
+constant ask --to codex --session "$CLAUDE_CODE_SESSION_ID" \
+  --question - < question.txt --json
+```
+
+`ask` forks the conversation into a new target projection, runs that runtime
+non-interactively, and returns its answer. It does not take over the terminal,
+does not modify the source conversation, and never refreshes an existing target
+projection. The JSON result includes `answer`, `session`, `resume`, `handle`,
+and the carry `receipt`.
+
+The question is sent over stdin, not exposed in the provider's argv. Use
+`--with-tools` to include redacted tool history, and `--timeout SECS` to bound
+the call. Only `codex` and `claude` are verified `ask` targets today. Treat an
+ask as billable provider work: use it only when the user asks or authorizes it.
+The target keeps its own permissions and sandbox settings and may inspect or
+modify the workspace accordingly.
+
 ## Find conversations
 
 ```bash
@@ -104,6 +134,8 @@ constant export --session <id> --out thread.json   # distilled, redacted convers
 - Carry only when the user asks for it. A carry writes a new session into
   the target runtime's store (`~/.codex`, `~/.claude`, or OpenCode through
   its own import command).
+- Ask only when the user asks or authorizes it. An ask carries the thread and
+  invokes the target runtime, which may consume paid provider usage.
 - Do not delete sessions, snapshots, or `~/.constant`. Constant never
   overwrites an original session; keep it that way.
 - Never run the `gemini` binary to inspect sessions. Carry gemini sessions
