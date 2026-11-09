@@ -10,6 +10,8 @@
 //!   `{"$set": {lastUpdated?, messages?}}` patches the session (`messages` =
 //!   gemini rebuilt its history, e.g. after compressing it);
 //!   `{"$rewindTo": id}` deletes that message and everything after it.
+//!   0.67 adds `{"$patch": {id?, content?, toolCalls?, updates?, removeIds?,
+//!   orderIds?}}`: the same history sync as `$set.messages`, sent as a diff.
 //!
 //! Message types: `user` (content = `[{text}|{functionResponse}|{inlineData}]`,
 //! or a string), `gemini` (content = string or part array, plus `thoughts`,
@@ -48,7 +50,8 @@ use crate::alembic::sha256;
 struct GeminiFile {
     header: Value,
     messages: Vec<Value>,
-    /// `$set.messages` rebuilds that dropped turns from gemini's own view.
+    /// `$set.messages` rebuilds or `$patch.removeIds` that dropped turns from
+    /// gemini's own view.
     rebuilds: usize,
 }
 
@@ -105,6 +108,26 @@ fn read_file(path: &Path) -> Result<GeminiFile> {
                     upsert(&mut messages, m.clone());
                 }
             }
+        } else if let Some(patch) = rec.get("$patch") {
+            // 0.67 syncs a rebuilt history as a patch instead of `$set.messages`.
+            if patch.get("id").is_some() {
+                apply_patch(&mut messages, patch);
+            }
+            for update in patch.get("updates").and_then(Value::as_array).into_iter().flatten() {
+                apply_patch(&mut messages, update);
+            }
+            // Trailing removals arrive as `$rewindTo`; `removeIds` is gemini
+            // trimming its own view, so the filed turns stay.
+            let removes_filed = patch
+                .get("removeIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|id| position(&messages, id).is_some());
+            if removes_filed {
+                rebuilds += 1;
+            }
         } else if rec.get("type").is_some() {
             upsert(&mut messages, rec);
         }
@@ -120,6 +143,31 @@ fn position(messages: &[Value], id: &str) -> Option<usize> {
     messages
         .iter()
         .position(|m| m.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// One `$patch` entry, applied the way gemini's own loader does: new `content`
+/// for the message with that id, and a `result` for each named tool call. A
+/// patch for an id that was never read is ignored.
+fn apply_patch(messages: &mut [Value], patch: &Value) {
+    let Some(i) = patch.get("id").and_then(Value::as_str).and_then(|id| position(messages, id))
+    else {
+        return;
+    };
+    let message = &mut messages[i];
+    if let Some(content) = patch.get("content").filter(|c| !c.is_null()) {
+        message["content"] = content.clone();
+    }
+    let Some(calls) = message.get_mut("toolCalls").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for call_patch in patch.get("toolCalls").and_then(Value::as_array).into_iter().flatten() {
+        let (Some(id), Some(result)) = (call_patch.get("id"), call_patch.get("result")) else {
+            continue;
+        };
+        if let Some(call) = calls.iter_mut().find(|c| c.get("id") == Some(id)) {
+            call["result"] = result.clone();
+        }
+    }
 }
 
 /// A record whose id is already folded replaces it in place; a new one appends.

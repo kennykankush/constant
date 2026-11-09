@@ -1,5 +1,5 @@
 pub(crate) mod claude;
-mod codex;
+pub(crate) mod codex;
 pub(crate) mod gemini;
 pub(crate) mod opencode;
 

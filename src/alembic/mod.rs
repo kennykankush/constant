@@ -1074,14 +1074,14 @@ fn upsert_codex_thread(
             (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
              sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
              git_branch, cli_version, first_user_message, memory_mode, preview)
-         VALUES (?1, ?2, ?3, ?4, 'cli', 'openai', ?5, ?6,
+         VALUES (?1, ?2, ?3, ?4, 'cli', ?13, ?5, ?6,
              ?7, ?8, 0, ?9, 0,
              ?10, ?11, ?12, 'enabled', ?6)
          ON CONFLICT(id) DO UPDATE SET
              rollout_path = excluded.rollout_path,
              updated_at = excluded.updated_at,
              source = 'cli',
-             model_provider = 'openai',
+             model_provider = excluded.model_provider,
              cwd = excluded.cwd,
              sandbox_policy = excluded.sandbox_policy,
              approval_mode = excluded.approval_mode,
@@ -1104,7 +1104,8 @@ fn upsert_codex_thread(
             has_user_event,
             session.metadata.git_branch,
             version,
-            first_msg
+            first_msg,
+            formats::codex::codex_default_model_provider()
         ],
     )?;
 
@@ -2106,10 +2107,37 @@ fn list_opencode_sessions(cwd: Option<&Path>) -> Vec<SessionSummary> {
 //   carried → claude (object tool inputs, answered). Note: 0.165's `codex
 //   exec` reads extra input from stdin until EOF, so scripted runs need
 //   `</dev/null`; Constant's host gives the child a PTY and is unaffected.
-pub const SUPPORTED_CODEX: &str = "0.165";
+//
+// 2026-11-10 pass (codex and opencode on deepseek in isolated homes; claude
+// through `claude -p -r --no-session-persistence` in an isolated config dir):
+// - SUPPORTED_CODEX → 0.167 (0.167.0). 0.167 refuses to resume a thread whose
+//   session_meta names a provider other than the one in use, and Constant
+//   stamped every carried thread "openai": on any other provider the resume
+//   failed. The rollout now names no provider (the check is skipped). After
+//   that: a claude seed with tools (one failed) carried in and `codex exec
+//   resume` answered the planted fact, the tool output and the failure; a
+//   return carry with a changed fact refreshed the same thread and it
+//   answered the new fact; codex-written turns exported back in order. Two
+//   real 0.167 rollouts carried → claude (freeform tools as object inputs;
+//   0.167's client-side tool outputs with no call id dropped and declared)
+//   and claude 2.1.321 loaded both.
+// - SUPPORTED_CLAUDE stays 2.1, revalidated on 2.1.321 (its new `api-request`
+//   records are skipped): the codex thread above, with codex's own turns,
+//   carried → claude and it answered the current fact, the retired one and
+//   the tool failure.
+// - SUPPORTED_OPENCODE → 2 (2.2.6, with 2.0.28 from the earlier pass). In an
+//   isolated store: a claude seed with tools carried in through `session
+//   import --standalone` and deepseek answered the planted fact, the tool
+//   output and the failure; the session exported back in order. A session
+//   2.2.6 wrote itself (reasoning + tools, one failed) carried → codex and →
+//   claude, and both answered its planted fact.
+// - SUPPORTED_GEMINI stays 0.50. 0.67 was read from its package source, not
+//   run: its one new record (`$patch`, a history sync sent as a diff) is
+//   folded and covered by a fixture, but no real 0.67 session was exported.
+pub const SUPPORTED_CODEX: &str = "0.167";
 pub const SUPPORTED_CLAUDE: &str = "2.1";
 pub const SUPPORTED_GEMINI: &str = "0.50";
-pub const SUPPORTED_OPENCODE: &str = "2.0";
+pub const SUPPORTED_OPENCODE: &str = "2";
 
 /// Is this installed version one the codec was validated against?
 /// (Prefix match on the validated release line: "0.137" accepts "0.137.4".)
@@ -3029,6 +3057,58 @@ mod tests {
             d.session.metadata.updated_at.map(|t| t.to_rfc3339()),
             Some("2026-09-16T17:50:00+00:00".to_string()),
             "$set.lastUpdated patches the header"
+        );
+    }
+
+    #[test]
+    fn gemini_patch_records_update_in_place_and_never_shred_filed_turns() {
+        // 0.67 sends a history sync as `$patch`: `updates` change content and
+        // fill in tool results; `removeIds` is gemini trimming its own view.
+        let dir = unique_tmp();
+        let path = dir.join("session-2026-11-09T10-00-67aa0001.jsonl");
+        let lines = [
+            r#"{"sessionId":"67aa0001-0000-0000-0000-000000000001","projectHash":"deadbeef","startTime":"2026-11-09T10:00:00.000Z","lastUpdated":"2026-11-09T10:00:00.000Z","kind":"main"}"#,
+            r#"{"id":"m1","timestamp":"2026-11-09T10:00:01.000Z","type":"user","content":[{"text":"first question"}]}"#,
+            r#"{"id":"m2","timestamp":"2026-11-09T10:00:05.000Z","type":"gemini","content":"working","toolCalls":[{"id":"t1","name":"shell","args":{"command":"ls"}}],"model":"gemini-3-pro"}"#,
+            r#"{"id":"m3","timestamp":"2026-11-09T10:00:09.000Z","type":"user","content":[{"text":"second question"}]}"#,
+            r#"{"$patch":{"id":"m2","content":"the reply"}}"#,
+            r#"{"$patch":{"updates":[{"id":"m2","toolCalls":[{"id":"t1","result":[{"functionResponse":{"response":{"output":"notes.txt"}}}]}]},{"id":"never-read","content":"x"}],"removeIds":["m1"],"orderIds":["m2","m3"]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let d = distill_source(&path, true).expect("gemini 0.67 log load");
+        let texts: Vec<(String, String)> = d
+            .session
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Message(m) => Some((
+                    m.role.clone(),
+                    m.blocks.iter().filter_map(|b| b.text.clone()).collect::<String>(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("user".to_string(), "first question".to_string()),
+                ("assistant".to_string(), "the reply".to_string()),
+                ("user".to_string(), "second question".to_string()),
+            ],
+            "content patched in place; the removed turn stays filed; order kept"
+        );
+        let results = d
+            .session
+            .events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolResult(_)))
+            .count();
+        assert_eq!(results, 1, "the patched-in tool result is carried");
+        assert_eq!(
+            d.session.metadata.extra.get("gemini_history_rebuilds"),
+            Some(&serde_json::Value::from(1)),
+            "the trim is declared"
         );
     }
 
